@@ -851,7 +851,7 @@ USER_AGENT = (
 
 # Official Afdian supply channel (single source of truth).
 AFDIAN_URL = "https://afdian.net/a/your-id"  # 想开补给站就换成自己的地址
-AFDIAN_DISPLAY = "67676767AKM7878"
+AFDIAN_DISPLAY = "your-id"
 
 # XOR-encrypted donate QR payload (see make_qr_payload.py).
 # Never written to disk: it is decrypted in RAM only when the dialog opens.
