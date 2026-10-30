@@ -102,7 +102,7 @@ jobs:
           $folder = "release\AKM_Launcher_v$version"
           New-Item -ItemType Directory -Force -Path $folder | Out-Null
           Copy-Item "AKM_Launcher.exe" $folder
-          Copy-Item "README.md" $folder -ErrorAction SilentlyContinue
+          Copy-Item "README_AKM.md" $folder -ErrorAction SilentlyContinue
           Copy-Item "RELEASE_NOTES.txt" $folder -ErrorAction SilentlyContinue
           $exeOnlyHash = (Get-FileHash "$folder\AKM_Launcher.exe" -Algorithm SHA256).Hash
           [System.IO.File]::WriteAllText("$PWD\$folder\AKM_Launcher.exe.sha256",

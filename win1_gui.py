@@ -79,7 +79,7 @@ except Exception:  # pragma: no cover - tkinter always ships with CPython on Win
 # ---------------------------------------------------------------------------
 
 APP_NAME = "AKM Launcher"
-APP_VERSION = "B0.5"
+APP_VERSION = "B0.6"
 
 # ---------------------------------------------------------------------------
 # Internationalisation (zh / en / ja / ru / ar)
@@ -1420,32 +1420,114 @@ def set_global_theme(theme):
 #     gradient.  Everything is plain tkinter Canvas drawing, no extra library.
 # ---------------------------------------------------------------------------
 
-UI_STYLES = ("retro", "vector")
+UI_STYLES = ("retro", "vector", "scifi", "millennium")
 UI_STYLE_LABELS = {
     "retro": "1985 复古",
     "vector": "矢量风（测试）",
+    "scifi": "科幻风（测试）",
+    "millennium": "千禧年（测试）",
 }
 UI_STYLE_HINTS = {
     "retro": "黑边方块 + 纯色标题条，1985 工业味",
     "vector": "圆角卡片 + 渐变横幅 + 无边框按钮（测试样式）",
+    "scifi": "深空底 + 切角 HUD 面板 + 霓虹描边（暗色，测试样式）",
+    "millennium": "钴蓝 + 铬色渐变 + 高光按钮，2000 年数码味（测试样式）",
 }
-# page, surface, secondary, accent, text, muted, outline, shadow
-UI_VECTOR_PALETTES = {
-    "indigo": (
-        "#F1F4FA", "#FFFFFF", "#E9EEF8", "#3B62F6", "#152139",
-        "#7C879B", "#DCE3F0", "#E3E9F5",
-    ),
-    "aurora": (
-        "#F0F8F5", "#FFFFFF", "#E4F1EC", "#0E9F6E", "#0E2A24",
-        "#77968D", "#D5E8E0", "#E0EEE8",
-    ),
-    "sunset": (
-        "#FDF5F1", "#FFFFFF", "#FAE9E0", "#E8590C", "#2A1608",
-        "#A98A7B", "#F0DCD2", "#F7E5DC",
-    ),
+# 每种风格的外观参数。modern = 圆角卡片 / 无边框按钮这一支（原来只有矢量风）
+#   corner : round（圆角）/ chamfer（45° 切角，HUD 味）/ sharp（直角）
+#   banner : band（1985 色条）/ hero（矢量圆角）/ hud（科幻）/ chrome（千禧）
+#   button : bevel（凸起黑边）/ flat（无边框）/ tech（霓虹描边）/ chrome（高光）
+UI_STYLE_SPECS = {
+    "retro": {
+        "modern": False, "radius": 0, "corner": "sharp", "banner": "band",
+        "button": "bevel", "dark": False, "grid": False, "gloss": False,
+    },
+    "vector": {
+        "modern": True, "radius": 14, "corner": "round", "banner": "hero",
+        "button": "flat", "dark": False, "grid": False, "gloss": False,
+    },
+    "scifi": {
+        "modern": True, "radius": 6, "corner": "chamfer", "banner": "hud",
+        "button": "tech", "dark": True, "grid": True, "gloss": False,
+    },
+    "millennium": {
+        "modern": True, "radius": 18, "corner": "round", "banner": "chrome",
+        "button": "chrome", "dark": False, "grid": False, "gloss": True,
+    },
 }
-UI_VECTOR = False
+# page, surface, secondary, accent, text, muted, outline, shadow,
+# accent2（第二亮色 / 渐变末端）, on_accent（压在 accent 上的字色）
+UI_STYLE_PALETTES = {
+    "vector": {
+        "indigo": (
+            "#F1F4FA", "#FFFFFF", "#E9EEF8", "#3B62F6", "#152139",
+            "#7C879B", "#DCE3F0", "#E3E9F5", "#7B9BFF", "#FFFFFF",
+        ),
+        "aurora": (
+            "#F0F8F5", "#FFFFFF", "#E4F1EC", "#0E9F6E", "#0E2A24",
+            "#77968D", "#D5E8E0", "#E0EEE8", "#41C79A", "#FFFFFF",
+        ),
+        "sunset": (
+            "#FDF5F1", "#FFFFFF", "#FAE9E0", "#E8590C", "#2A1608",
+            "#A98A7B", "#F0DCD2", "#F7E5DC", "#FFB27A", "#FFFFFF",
+        ),
+    },
+    # 科幻风：深空底色 + 霓虹描边（整套是暗色）
+    "scifi": {
+        "cobalt": (
+            "#060A14", "#0C1424", "#131E36", "#2F6BFF", "#DCE8FF",
+            "#7E90AD", "#1E3050", "#03060D", "#6AD3FF", "#04101F",
+        ),
+        "neon": (
+            "#050C12", "#0A1520", "#0F2130", "#22D3EE", "#DFF7FB",
+            "#74A0AC", "#17404F", "#03080C", "#7CF2C6", "#04181E",
+        ),
+        "violet": (
+            "#0A0714", "#130F22", "#1B1533", "#8B5CF6", "#EDE7FF",
+            "#9487B5", "#2C2450", "#060310", "#C4A7FF", "#12061F",
+        ),
+    },
+    # 千禧年：铬 / 钴蓝主色 + 浅色高光
+    "millennium": {
+        "cobalt": (
+            "#E8F0FC", "#FFFFFF", "#DCE8FA", "#0047AB", "#0E1A33",
+            "#5C718F", "#C6D8F2", "#C9DCF5", "#7FE3F0", "#FFFFFF",
+        ),
+        "aqua": (
+            "#E6F7FB", "#FFFFFF", "#D6EEF7", "#0095C8", "#062A38",
+            "#5D8695", "#BCDDEA", "#C9E6F0", "#8CE7C0", "#FFFFFF",
+        ),
+        "chrome": (
+            "#EEF1F6", "#FFFFFF", "#E1E6EF", "#3355C8", "#101728",
+            "#6B7688", "#CFD8E6", "#D5DCE8", "#B9C6DC", "#FFFFFF",
+        ),
+    },
+}
+UI_STYLE_DEFAULT_PALETTE = {
+    "retro": "indigo",
+    "vector": "indigo",
+    "scifi": "cobalt",
+    "millennium": "cobalt",
+}
+UI_PALETTE_LABELS = {
+    "indigo": "靛蓝",
+    "aurora": "极光绿",
+    "sunset": "晚霞橙",
+    "cobalt": "钴蓝",
+    "neon": "霓虹青",
+    "violet": "星紫",
+    "aqua": "水蓝",
+    "chrome": "铬银",
+}
+UI_VECTOR = False          # modern 家族（矢量 / 科幻 / 千禧）共用这一支
+UI_STYLE = "retro"
 UI_VECTOR_PALETTE = "indigo"
+UI_ACCENT2 = C_TEAL
+UI_ON_ACCENT = "#FFFFFF"
+UI_CORNER = "sharp"
+UI_DARK = False
+UI_GRID = False
+UI_GLOSS = False
 UI_PAGE = C_WHITE
 UI_MUTED = "#6B7688"
 UI_OUTLINE = "#D8DEE9"
@@ -1453,29 +1535,58 @@ UI_SHADOW = "#E6EAF2"
 UI_CARD_RADIUS = 14
 
 
-def set_ui_style(style, palette="indigo", theme=None):
+def ui_style_spec(style=None):
+    """Appearance spec of a style (defaults to the active one)."""
+    key = str(style or UI_STYLE).strip().lower()
+    return UI_STYLE_SPECS.get(key, UI_STYLE_SPECS["retro"])
+
+
+def ui_palette_options(style=None):
+    """(palette owner, [(key, label), ...]) for the settings palette row."""
+    key = str(style or UI_STYLE).strip().lower()
+    palettes = UI_STYLE_PALETTES.get(key)
+    if not palettes:
+        key = "vector"
+        palettes = UI_STYLE_PALETTES[key]
+    return key, [(name, UI_PALETTE_LABELS.get(name, name)) for name in palettes]
+
+
+def set_ui_style(style, palette=None, theme=None):
     """Apply a UI style to the module-level palette.  Returns (style, palette)."""
     global C_WHITE, C_GRAY, C_TEAL, C_BLACK
-    global UI_VECTOR, UI_VECTOR_PALETTE, UI_PAGE, UI_MUTED, UI_OUTLINE, UI_SHADOW
+    global UI_VECTOR, UI_STYLE, UI_VECTOR_PALETTE, UI_PAGE, UI_MUTED
+    global UI_OUTLINE, UI_SHADOW, UI_ACCENT2, UI_ON_ACCENT
+    global UI_CORNER, UI_DARK, UI_GRID, UI_GLOSS, UI_CARD_RADIUS
     name = str(style or "").strip().lower()
     if name not in UI_STYLES:
         name = "retro"
-    palette = str(palette or "indigo").strip().lower()
-    if palette not in UI_VECTOR_PALETTES:
-        palette = "indigo"
-    UI_VECTOR_PALETTE = palette
-    UI_VECTOR = name == "vector"
+    spec = UI_STYLE_SPECS[name]
+    UI_STYLE = name
+    UI_CORNER = spec["corner"]
+    UI_DARK = bool(spec["dark"])
+    UI_GRID = bool(spec["grid"])
+    UI_GLOSS = bool(spec["gloss"])
+    UI_CARD_RADIUS = int(spec["radius"])
+    UI_VECTOR = bool(spec["modern"])
+    UI_VECTOR_PALETTE = str(palette or "").strip().lower()
     if not UI_VECTOR:
-        # hand the colours back to the classic theme (or the built-in one)
+        # 复古风：颜色交还给经典主题（或内置默认）
+        UI_VECTOR_PALETTE = "indigo"
         set_global_theme(theme if isinstance(theme, dict) else DEFAULT_THEME)
         UI_PAGE = C_WHITE
         UI_MUTED = "#6B7688"
         UI_OUTLINE = "#D8DEE9"
         UI_SHADOW = "#E6EAF2"
-        return "retro", palette
-    page, surface, secondary, accent, text, muted, outline, shadow = (
-        UI_VECTOR_PALETTES[palette]
-    )
+        UI_ACCENT2 = C_TEAL
+        UI_ON_ACCENT = "#FFFFFF"
+        return "retro", UI_VECTOR_PALETTE
+    palettes = UI_STYLE_PALETTES[name]
+    if UI_VECTOR_PALETTE not in palettes:
+        UI_VECTOR_PALETTE = UI_STYLE_DEFAULT_PALETTE.get(name, "indigo")
+    row = palettes[UI_VECTOR_PALETTE]
+    page, surface, secondary, accent, text, muted, outline, shadow = row[:8]
+    accent2 = row[8] if len(row) > 8 else accent
+    on_accent = row[9] if len(row) > 9 else "#FFFFFF"
     C_WHITE = surface.upper()
     C_GRAY = secondary.upper()
     C_TEAL = accent.upper()
@@ -1484,7 +1595,9 @@ def set_ui_style(style, palette="indigo", theme=None):
     UI_MUTED = muted.upper()
     UI_OUTLINE = outline.upper()
     UI_SHADOW = shadow.upper()
-    return "vector", palette
+    UI_ACCENT2 = accent2.upper()
+    UI_ON_ACCENT = on_accent.upper()
+    return name, UI_VECTOR_PALETTE
 
 
 def round_rect_points(x0, y0, x1, y1, radius):
@@ -1518,6 +1631,63 @@ def draw_round_rect(canvas, x0, y0, x1, y1, radius=10, **kwargs):
     return canvas.create_polygon(points, smooth=True, splinesteps=20, **kwargs)
 
 
+def chamfer_rect_points(x0, y0, x1, y1, cut=8):
+    """Corner points for a 45° cut rectangle (HUD style, no smoothing)."""
+    if x1 < x0:
+        x0, x1 = x1, x0
+    if y1 < y0:
+        y0, y1 = y1, y0
+    cut = int(max(0, min(cut, (x1 - x0) // 2, (y1 - y0) // 2)))
+    if cut <= 0:
+        return [x0, y0, x1, y0, x1, y1, x0, y1]
+    return [
+        x0 + cut, y0,
+        x1 - cut, y0,
+        x1, y0 + cut,
+        x1, y1 - cut,
+        x1 - cut, y1,
+        x0 + cut, y1,
+        x0, y1 - cut,
+        x0, y0 + cut,
+    ]
+
+
+def ui_shape_points(x0, y0, x1, y1, radius=None, corner=None):
+    """Points of a panel/banner shape for the active style."""
+    mode = str(corner or UI_CORNER or "round").strip().lower()
+    if radius is None:
+        radius = UI_CARD_RADIUS
+    if mode == "chamfer":
+        return chamfer_rect_points(x0, y0, x1, y1, max(4, int(radius) + 2))
+    if mode == "sharp":
+        return [x0, y0, x1, y0, x1, y1, x0, y1]
+    return round_rect_points(x0, y0, x1, y1, int(radius))
+
+
+def draw_ui_shape(canvas, x0, y0, x1, y1, radius=None, corner=None, **kwargs):
+    """Draw the style's shape: smoothed polygon for round, plain for chamfer."""
+    mode = str(corner or UI_CORNER or "round").strip().lower()
+    points = ui_shape_points(x0, y0, x1, y1, radius, mode)
+    if mode == "round":
+        return canvas.create_polygon(points, smooth=True, splinesteps=20, **kwargs)
+    return canvas.create_polygon(points, **kwargs)
+
+
+def ink_on(color):
+    """Readable ink (#FFFFFF or near black) for text drawn on `color`."""
+    text = str(color or "").strip().lstrip("#")
+    if len(text) != 6:
+        return "#FFFFFF"
+    try:
+        red = int(text[0:2], 16)
+        green = int(text[2:4], 16)
+        blue = int(text[4:6], 16)
+    except ValueError:
+        return "#FFFFFF"
+    luma = red * 299 + green * 587 + blue * 114
+    return "#101820" if luma > 150000 else "#FFFFFF"
+
+
 def blend_color(first, second, ratio):
     """Mix two #RRGGBB colours (ratio 0 -> first, 1 -> second)."""
     try:
@@ -1540,12 +1710,28 @@ UI_FONT_CANDIDATES = {
         "Noto Sans CJK SC",
         "Verdana",
     ),
+    "scifi": (
+        "Cascadia Mono",
+        "Consolas",
+        "Microsoft YaHei UI",
+        "Lucida Console",
+        "Verdana",
+    ),
+    "millennium": (
+        "Verdana",
+        "Tahoma",
+        "Microsoft YaHei UI",
+        "Segoe UI",
+        "Arial",
+    ),
 }
 
 
 def ui_font_for_style(style=None, root=None):
     """First installed family of the style's preference list ('' if none)."""
-    key = "vector" if str(style or "").strip().lower() == "vector" else "retro"
+    key = str(style or "").strip().lower()
+    if key not in UI_FONT_CANDIDATES:
+        key = "retro"
     candidates = UI_FONT_CANDIDATES[key]
     try:
         families = set(tkfont.families(root))
@@ -5056,6 +5242,62 @@ def modrinth_search_page(
     except (TypeError, ValueError):
         total = 0
     return [hit for hit in hits if isinstance(hit, dict)], total
+
+
+# ---------------------------------------------------------------------------
+# Modrinth hot list disk cache: the shelf shows the last good snapshot right
+# away (even with no network) and refreshes in the background afterwards.
+# ---------------------------------------------------------------------------
+
+HOT_CACHE_FILE = "modrinth_hot.json"
+HOT_CACHE_KEYS = 6
+
+
+def hot_cache_path():
+    return os.path.join(icon_cache_dir(), HOT_CACHE_FILE)
+
+
+def hot_cache_key(mc_version, loader):
+    return "{0}_{1}".format(
+        str(mc_version or "any").strip().lower(),
+        str(loader or "any").strip().lower(),
+    )
+
+
+def load_hot_cache():
+    """{cache_key: [hit, ...]} written by the last successful refresh."""
+    try:
+        with open(hot_cache_path(), "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    clean = {}
+    for key, rows in data.items():
+        if isinstance(rows, list):
+            hits = [row for row in rows if isinstance(row, dict)]
+            if hits:
+                clean[str(key)] = hits
+    return clean
+
+
+def save_hot_cache(key, hits):
+    """Remember the newest hot list so the next boot starts with cards."""
+    rows = [row for row in (hits or []) if isinstance(row, dict)]
+    if not rows:
+        return
+    data = load_hot_cache()
+    data[str(key)] = rows
+    while len(data) > HOT_CACHE_KEYS:
+        data.pop(next(iter(data)), None)
+    path = hot_cache_path()
+    try:
+        ensure_dir(os.path.dirname(path))
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False)
+    except Exception:
+        pass
 
 
 def modrinth_search(
@@ -9760,18 +10002,24 @@ class Win1App:
             pass
 
     def _resolve_ui_font(self):
-        """Pick a comfortable family (monospace for 1985, sans for vector)."""
+        """Pick a comfortable family (monospace 1985 / HUD 科幻 / chromium 千禧)."""
         global UI_FONT, FONT_MAIN, FONT_SMALL, FONT_TITLE, FONT_BANNER
         global FONT_BIG, FONT_CODE, FONT_BODY
-        name = ui_font_for_style("vector" if UI_VECTOR else "retro", self.root)
+        name = ui_font_for_style(UI_STYLE, self.root)
         if not name:
             return
         UI_FONT = name
+        banner_size = 13 if UI_VECTOR else 12
+        big_size = 15 if UI_VECTOR else 14
+        if UI_STYLE == "scifi":
+            banner_size, big_size = 12, 14
+        elif UI_STYLE == "millennium":
+            banner_size, big_size = 14, 16
         FONT_MAIN = (UI_FONT, 10)
         FONT_SMALL = (UI_FONT, 9)
         FONT_TITLE = (UI_FONT, 10, "bold")
-        FONT_BANNER = (UI_FONT, 13 if UI_VECTOR else 12, "bold")
-        FONT_BIG = (UI_FONT, 15 if UI_VECTOR else 14, "bold")
+        FONT_BANNER = (UI_FONT, banner_size, "bold")
+        FONT_BIG = (UI_FONT, big_size, "bold")
         FONT_CODE = (UI_FONT, 16, "bold")
         FONT_BODY = (UI_FONT, 10)
 
@@ -9928,33 +10176,50 @@ class Win1App:
 
 
     def _mk_button(self, parent, text, command, font=FONT_MAIN, padx=8, pady=4):
-        if UI_VECTOR:
+        mode = ui_style_spec()["button"]
+        if mode != "bevel":
+            # modern 家族：flat（矢量）/ tech（科幻霓虹描边）/ chrome（千禧高光）
+            base_fg = C_BLACK
+            hover_fg = UI_ON_ACCENT
+            if mode == "tech":
+                base_bg = C_GRAY
+                options = dict(
+                    relief="flat",
+                    bd=0,
+                    highlightthickness=1,
+                    highlightbackground=blend_color(C_TEAL, C_WHITE, 0.55),
+                    highlightcolor=C_TEAL,
+                )
+            elif mode == "chrome":
+                base_bg = C_GRAY
+                base_fg = C_TEAL
+                options = dict(relief="raised", bd=2, highlightthickness=0)
+            else:
+                base_bg = C_WHITE
+                options = dict(relief="flat", bd=0, highlightthickness=0)
             button = tk.Button(
                 parent,
                 text=text,
                 command=command,
                 font=font,
-                bg=C_WHITE,
-                fg=C_BLACK,
+                bg=base_bg,
+                fg=base_fg,
                 activebackground=C_TEAL,
-                activeforeground=C_WHITE,
-                relief="flat",
-                bd=0,
+                activeforeground=hover_fg,
                 padx=padx + 4,
                 pady=pady + 1,
-                highlightthickness=0,
                 takefocus=0,
                 cursor="hand2",
+                **options
             )
-            base_bg = C_WHITE
 
             def on_enter(_event, widget=button):
                 if str(widget.cget("state")) != "disabled":
-                    widget.configure(bg=C_TEAL, fg="#FFFFFF")
+                    widget.configure(bg=C_TEAL, fg=hover_fg)
 
             def on_leave(_event, widget=button):
                 if str(widget.cget("state")) != "disabled":
-                    widget.configure(bg=base_bg, fg=C_BLACK)
+                    widget.configure(bg=base_bg, fg=base_fg)
 
             button.bind("<Enter>", on_enter)
             button.bind("<Leave>", on_leave)
@@ -9990,30 +10255,59 @@ class Win1App:
         return button
 
     def _mk_title(self, parent, text):
-        if UI_VECTOR:
+        label_text = title_text(text)
+        if not UI_VECTOR:
             return tk.Label(
                 parent,
-                text=title_text(text),
+                text=label_text,
+                bg=C_TEAL,
+                fg=C_WHITE,
+                font=FONT_TITLE,
+                anchor="w",
+                padx=6,
+                pady=3,
+                bd=1,
+                relief="solid",
+            )
+        if UI_STYLE == "scifi":
+            # HUD 标题：霓虹箭头 + accent 字，贴在深色底上
+            return tk.Label(
+                parent,
+                text="▸ " + label_text,
                 bg=C_WHITE,
                 fg=C_TEAL,
                 font=FONT_TITLE,
                 anchor="w",
-                padx=2,
+                padx=0,
+                pady=2,
+                bd=0,
+                highlightthickness=0,
+            )
+        if UI_STYLE == "millennium":
+            # 千禧标题：淡蓝药丸底 + 钴蓝粗体字
+            return tk.Label(
+                parent,
+                text="◆ " + label_text,
+                bg=blend_color(C_WHITE, C_TEAL, 0.12),
+                fg=C_TEAL,
+                font=FONT_TITLE,
+                anchor="w",
+                padx=6,
                 pady=2,
                 bd=0,
                 highlightthickness=0,
             )
         return tk.Label(
             parent,
-            text=title_text(text),
-            bg=C_TEAL,
-            fg=C_WHITE,
+            text=label_text,
+            bg=C_WHITE,
+            fg=C_TEAL,
             font=FONT_TITLE,
             anchor="w",
-            padx=6,
-            pady=3,
-            bd=1,
-            relief="solid",
+            padx=2,
+            pady=2,
+            bd=0,
+            highlightthickness=0,
         )
 
     def _build_ui(self):
@@ -10053,7 +10347,7 @@ class Win1App:
         return panels
 
     def _refresh_backdrop_cards(self):
-        """Paint the rounded cards the vector panels sit on (B0.5)."""
+        """Paint the cards / HUD frames the panels sit on (modern family)."""
         canvas = getattr(self, "backdrop", None)
         if canvas is None:
             return
@@ -10063,7 +10357,9 @@ class Win1App:
             return
         if not UI_VECTOR:
             return
-        pad = 4
+        if UI_GRID:
+            self._paint_backdrop_grid(canvas)
+        pad = 6 if UI_STYLE in ("scifi", "millennium") else 4
         for panel in self._ui_card_panels():
             try:
                 x = panel.winfo_x()
@@ -10074,36 +10370,131 @@ class Win1App:
                 continue
             if width < 60 or height < 60:
                 continue
-            x0, y0 = x - pad, y - pad
-            x1, y1 = x + width + pad, y + height + pad
-            try:
-                draw_round_rect(
+            self._paint_panel_card(
+                canvas, x - pad, y - pad, x + width + pad, y + height + pad
+            )
+        try:
+            canvas.tag_lower("ui_card", "wallpaper")
+        except Exception:
+            pass
+
+    def _paint_backdrop_grid(self, canvas):
+        """Faint technical grid behind the HUD cards (sci-fi style)."""
+        try:
+            width = max(
+                int(canvas.winfo_width()), int(self.root.winfo_width()), 640
+            )
+            height = max(
+                int(canvas.winfo_height()), int(self.root.winfo_height()), 480
+            )
+        except Exception:
+            return
+        line = blend_color(UI_PAGE, C_TEAL, 0.14)
+        bright = blend_color(UI_PAGE, C_TEAL, 0.28)
+        step = 48
+        for x in range(step, width, step):
+            color = bright if x % (step * 4) == 0 else line
+            canvas.create_line(x, 0, x, height, fill=color, tags="ui_card")
+        for y in range(step, height, step):
+            color = bright if y % (step * 4) == 0 else line
+            canvas.create_line(0, y, width, y, fill=color, tags="ui_card")
+
+    def _paint_panel_card(self, canvas, x0, y0, x1, y1):
+        """One card: shadow + body + style specific frame details."""
+        radius = UI_CARD_RADIUS
+        shadow_fill = (
+            blend_color(UI_PAGE, "#000000", 0.45) if UI_DARK else UI_SHADOW
+        )
+        if UI_STYLE == "scifi":
+            edge = blend_color(C_TEAL, C_WHITE, 0.55)
+        else:
+            edge = UI_OUTLINE
+        try:
+            draw_ui_shape(
+                canvas,
+                x0 + 1,
+                y0 + 3,
+                x1 + 1,
+                y1 + 3,
+                radius,
+                fill=shadow_fill,
+                outline="",
+                tags="ui_card",
+            )
+            draw_ui_shape(
+                canvas,
+                x0,
+                y0,
+                x1,
+                y1,
+                radius,
+                fill=C_WHITE,
+                outline=edge,
+                width=1,
+                tags="ui_card",
+            )
+            if UI_STYLE == "scifi":
+                draw_ui_shape(
                     canvas,
-                    x0 + 1,
-                    y0 + 3,
-                    x1 + 1,
-                    y1 + 3,
-                    UI_CARD_RADIUS,
-                    fill=UI_SHADOW,
-                    outline="",
-                    tags="ui_card",
-                )
-                draw_round_rect(
-                    canvas,
-                    x0,
-                    y0,
-                    x1,
-                    y1,
-                    UI_CARD_RADIUS,
-                    fill=C_WHITE,
-                    outline=UI_OUTLINE,
+                    x0 + 4,
+                    y0 + 4,
+                    x1 - 4,
+                    y1 - 4,
+                    max(2, radius - 2),
+                    fill="",
+                    outline=blend_color(C_WHITE, C_TEAL, 0.35),
                     width=1,
                     tags="ui_card",
                 )
-            except Exception:
-                continue
-        try:
-            canvas.tag_lower("ui_card", "wallpaper")
+                tick = 12
+                for cx, cy, dx, dy in (
+                    (x0, y0, 1, 1),
+                    (x1, y0, -1, 1),
+                    (x0, y1, 1, -1),
+                    (x1, y1, -1, -1),
+                ):
+                    canvas.create_line(
+                        cx,
+                        cy + dy * tick,
+                        cx,
+                        cy,
+                        cx + dx * tick,
+                        cy,
+                        fill=C_TEAL,
+                        width=2,
+                        tags="ui_card",
+                    )
+            elif UI_STYLE == "millennium":
+                draw_ui_shape(
+                    canvas,
+                    x0 + 1,
+                    y0 + 1,
+                    x1 - 1,
+                    y1 - 1,
+                    max(4, radius - 2),
+                    fill="",
+                    outline=blend_color(C_TEAL, "#FFFFFF", 0.70),
+                    width=1,
+                    tags="ui_card",
+                )
+                canvas.create_line(
+                    x0 + radius,
+                    y0,
+                    x1 - radius,
+                    y0,
+                    fill=C_TEAL,
+                    width=3,
+                    tags="ui_card",
+                )
+                canvas.create_line(
+                    x0 + radius,
+                    y1,
+                    x1 - radius,
+                    y1,
+                    fill=blend_color(C_TEAL, "#FFFFFF", 0.35),
+                    width=2,
+                    tags="ui_card",
+                )
         except Exception:
             pass
 
@@ -10134,12 +10525,40 @@ class Win1App:
             except Exception:
                 klass = ""
             if klass == "Button":
-                if vector:
-                    self._ui_style_mark(
-                        widget, relief="flat", bd=0, highlightthickness=0
+                mode = ui_style_spec()["button"]
+                if mode == "bevel":
+                    options = dict(
+                        relief="solid", bd=1, highlightthickness=0
                     )
+                elif mode == "tech":
+                    options = dict(
+                        relief="flat",
+                        bd=0,
+                        highlightthickness=1,
+                        highlightbackground=blend_color(C_TEAL, C_WHITE, 0.55),
+                        highlightcolor=C_TEAL,
+                    )
+                elif mode == "chrome":
+                    options = dict(relief="raised", bd=2, highlightthickness=0)
                 else:
-                    self._ui_style_mark(widget, relief="solid", bd=1)
+                    options = dict(relief="flat", bd=0, highlightthickness=0)
+                try:
+                    current_bg = str(widget.cget("bg")).upper()
+                except Exception:
+                    current_bg = ""
+                # only re-tint the plain surface buttons, never the inverted
+                # (accent / dark) ones or the hand painted accent buttons
+                if current_bg in (C_WHITE.upper(), C_GRAY.upper()):
+                    options["bg"] = (
+                        C_GRAY if mode in ("tech", "chrome") else C_WHITE
+                    )
+                    if mode == "chrome":
+                        try:
+                            if str(widget.cget("fg")).upper() == C_BLACK.upper():
+                                options["fg"] = C_TEAL
+                        except Exception:
+                            pass
+                self._ui_style_mark(widget, **options)
             elif klass == "Entry":
                 if vector:
                     self._ui_style_mark(
@@ -10223,6 +10642,7 @@ class Win1App:
         if target == self.ui_style and palette == self.ui_palette:
             return
         self._apply_ui_style_live(target, palette)
+        self._refresh_style_buttons()
         try:
             if self._settings_win is not None:
                 self._settings_win.lift()
@@ -10286,21 +10706,99 @@ class Win1App:
         self.say(
             "界面风格已切换 // {0}{1}".format(
                 UI_STYLE_LABELS.get(new_style, new_style),
-                "（测试样式）" if new_style == "vector" else "",
+                ""
+                if new_style == "retro"
+                else "（{0}）".format(
+                    UI_PALETTE_LABELS.get(new_palette, new_palette)
+                ),
             )
         )
 
+    def _refresh_style_buttons(self):
+        """Keep the settings window's style / palette row in sync."""
+        for name, button in getattr(self, "_style_buttons", {}).items():
+            try:
+                if not button.winfo_exists():
+                    continue
+                button.configure(
+                    text="[ {0}{1} ]".format(
+                        UI_STYLE_LABELS.get(name, name),
+                        " *" if self.ui_style == name else "",
+                    )
+                )
+            except Exception:
+                continue
+        self._rebuild_settings_palette_row()
+
+    def _rebuild_settings_palette_row(self):
+        """Rebuild the palette buttons for the style that is active now."""
+        frame = getattr(self, "_style_palette_row", None)
+        if frame is None:
+            return
+        try:
+            if not frame.winfo_exists():
+                return
+            for child in frame.winfo_children():
+                child.destroy()
+        except Exception:
+            return
+        owner, options = ui_palette_options(self.ui_style)
+        try:
+            tk.Label(
+                frame,
+                text="配色（{0}）".format(
+                    UI_STYLE_LABELS.get(owner, owner).replace("（测试）", "")
+                ),
+                bg=C_GRAY,
+                fg=C_BLACK,
+                font=FONT_SMALL,
+            ).pack(side="left", padx=(0, 6))
+            for palette_name, palette_label in options:
+                self._mk_button(
+                    frame,
+                    "[ {0}{1} ]".format(
+                        palette_label,
+                        " *" if self.ui_palette == palette_name else "",
+                    ),
+                    lambda chosen=palette_name: self.on_choose_ui_style(
+                        self.ui_style if UI_VECTOR else "vector", chosen
+                    ),
+                    font=FONT_SMALL,
+                    padx=6,
+                    pady=1,
+                ).pack(side="left", padx=2)
+        except Exception:
+            pass
+
     def _style_panel_frames(self):
-        """Vector style drops the hard frames, retro keeps the 1985 box."""
+        """Frame treatment: retro box / flat card / HUD ring / chrome edge."""
         for panel in self._ui_card_panels():
             try:
-                if UI_VECTOR:
+                if not UI_VECTOR:
                     panel.configure(
-                        bd=0, relief="flat", highlightthickness=0, bg=C_WHITE
+                        bd=1, relief="solid", highlightthickness=0, bg=C_WHITE
+                    )
+                elif UI_STYLE == "scifi":
+                    panel.configure(
+                        bd=0,
+                        relief="flat",
+                        highlightthickness=1,
+                        highlightbackground=blend_color(C_WHITE, C_TEAL, 0.45),
+                        bg=C_WHITE,
+                    )
+                elif UI_STYLE == "millennium":
+                    panel.configure(
+                        bd=0,
+                        relief="flat",
+                        highlightthickness=1,
+                        highlightbackground=blend_color(
+                            C_TEAL, "#FFFFFF", 0.55
+                        ),
+                        bg=C_WHITE,
                     )
                 else:
                     panel.configure(
-                        bd=1, relief="solid", highlightthickness=0, bg=C_WHITE
+                        bd=0, relief="flat", highlightthickness=0, bg=C_WHITE
                     )
             except Exception:
                 pass
@@ -10381,6 +10879,11 @@ class Win1App:
         banner.grid(row=0, column=0, columnspan=2, sticky="ew", padx=14, pady=(12, 0))
         self.banner = banner
         self._banner_sub_text = BANNER_SUBTITLE
+        # 1985 banner has no modern decoration items; clear stale ids from a
+        # previous vector / sci-fi / millennium banner.
+        self.banner_gloss_id = None
+        self.banner_scan_ids = []
+        self.banner_bracket_ids = []
         # vertical gradient + raised bevel (hidden while a wallpaper strip is on)
         self.banner_bands = []
         for color in ("#0A6C6C", "#0C7575", "#0E7E7E", "#0C7575", "#0A6C6C"):
@@ -10442,8 +10945,44 @@ class Win1App:
     def _banner_fill(self):
         return "#FFFFFF" if getattr(self, "_banner_has_image", False) else C_WHITE
 
+    def _banner_palette(self):
+        """Colours of the hero bar for the active modern style."""
+        if UI_STYLE == "scifi":
+            return {
+                "bar": blend_color(C_WHITE, C_TEAL, 0.22),
+                "edge": C_TEAL,
+                "ink": C_TEAL,
+                "sub": blend_color(C_TEAL, C_WHITE, 0.45),
+                "chip": blend_color(C_WHITE, C_TEAL, 0.35),
+                "chip_edge": C_TEAL,
+                "shadow": blend_color(UI_PAGE, "#000000", 0.55),
+                "mark": UI_ACCENT2,
+            }
+        if UI_STYLE == "millennium":
+            return {
+                "bar": C_TEAL,
+                "edge": blend_color(C_TEAL, "#FFFFFF", 0.55),
+                "ink": UI_ON_ACCENT,
+                "sub": blend_color(C_TEAL, "#FFFFFF", 0.72),
+                "chip": blend_color(C_TEAL, "#000000", 0.25),
+                "chip_edge": blend_color(C_TEAL, "#FFFFFF", 0.75),
+                "shadow": UI_SHADOW,
+                "mark": "#FFFFFF",
+            }
+        return {
+            "bar": C_TEAL,
+            "edge": blend_color(C_TEAL, "#FFFFFF", 0.38),
+            "ink": "#FFFFFF",
+            "sub": blend_color(C_TEAL, "#FFFFFF", 0.82),
+            "chip": blend_color(C_TEAL, "#000000", 0.18),
+            "chip_edge": blend_color(C_TEAL, "#FFFFFF", 0.6),
+            "shadow": UI_SHADOW,
+            "mark": "#FFFFFF",
+        }
+
     def _build_vector_banner(self):
-        """Rounded, borderless hero bar for the vector style (B0.5)."""
+        """Hero bar for the modern family: rounded / HUD / chrome band."""
+        palette = self._banner_palette()
         banner = tk.Canvas(
             self.root,
             height=self.BANNER_HEIGHT + 28,
@@ -10462,53 +11001,100 @@ class Win1App:
         self.banner_rule_id = None
         self.banner_divider2_id = None
         self.banner_leader_id = None
-        soft = blend_color(C_TEAL, "#FFFFFF", 0.55)
-        light = blend_color(C_TEAL, "#FFFFFF", 0.82)
-        deep = blend_color(C_TEAL, "#000000", 0.18)
-        self.banner_shadow_id = draw_round_rect(
-            banner, 0, 0, 10, 10, 20, fill=UI_SHADOW, outline=""
+        self.banner_gloss_id = None
+        self.banner_scan_ids = []
+        self.banner_bracket_ids = []
+        self.banner_shadow_id = draw_ui_shape(
+            banner, 0, 0, 10, 10, 20, fill=palette["shadow"], outline=""
         )
-        self.banner_bar_id = draw_round_rect(
+        self.banner_bar_id = draw_ui_shape(
             banner,
             0,
             0,
             10,
             10,
             20,
-            fill=C_TEAL,
-            outline=blend_color(C_TEAL, "#FFFFFF", 0.38),
+            fill=palette["bar"],
+            outline=palette["edge"],
             width=1,
         )
-        self.banner_mark_id = draw_round_rect(
-            banner, 9, 12, 30, 33, 7, outline="#FFFFFF", width=2
+        if UI_STYLE == "millennium":
+            # 铬色高光：上半部分一条浅色弧面
+            self.banner_gloss_id = draw_ui_shape(
+                banner,
+                0,
+                0,
+                10,
+                5,
+                16,
+                fill=blend_color(C_TEAL, "#FFFFFF", 0.42),
+                outline="",
+            )
+        elif UI_STYLE == "scifi":
+            self.banner_scan_ids = [
+                banner.create_line(
+                    0,
+                    0,
+                    10,
+                    0,
+                    fill=blend_color(C_TEAL, C_WHITE, 0.22),
+                    dash=(4, 6),
+                )
+                for _ in range(2)
+            ]
+            self.banner_bracket_ids = [
+                banner.create_line(0, 0, 1, 1, 2, 2, fill=UI_ACCENT2, width=2)
+                for _ in range(4)
+            ]
+        self.banner_mark_id = draw_ui_shape(
+            banner, 9, 12, 30, 33, 7, outline=palette["mark"], width=2
         )
-        self.banner_mark_core_id = draw_round_rect(
-            banner, 15, 18, 24, 27, 3, outline="#FFFFFF", fill="#FFFFFF"
+        self.banner_mark_core_id = draw_ui_shape(
+            banner,
+            15,
+            18,
+            24,
+            27,
+            3,
+            outline=palette["mark"],
+            fill=palette["mark"],
         )
         self.banner_title_id = banner.create_text(
             40,
             20,
             anchor="w",
             text=BANNER_TEXT,
-            fill="#FFFFFF",
+            fill=palette["ink"],
             font=FONT_BANNER,
         )
-        self.banner_divider_id = banner.create_line(120, 12, 120, 28, fill=soft)
-        self.banner_sub_id = banner.create_text(
-            132, 20, anchor="w", text=BANNER_SUBTITLE, fill=light, font=FONT_SMALL
+        self.banner_divider_id = banner.create_line(
+            120, 12, 120, 28, fill=palette["sub"]
         )
-        self.banner_chip_id = draw_round_rect(
+        self.banner_sub_id = banner.create_text(
+            132,
+            20,
+            anchor="w",
+            text=BANNER_SUBTITLE,
+            fill=palette["sub"],
+            font=FONT_SMALL,
+        )
+        self.banner_chip_id = draw_ui_shape(
             banner,
             10,
             11,
             20,
             29,
             11,
-            fill=deep,
-            outline=blend_color(C_TEAL, "#FFFFFF", 0.6),
+            fill=palette["chip"],
+            outline=palette["chip_edge"],
         )
         self.banner_version_id = banner.create_text(
-            10, 20, anchor="e", text=app_version_tag(), fill="#FFFFFF", font=FONT_SMALL
+            10,
+            20,
+            anchor="e",
+            text=app_version_tag(),
+            fill=palette["ink"],
+            font=FONT_SMALL,
         )
         banner.bind("<Configure>", self._layout_banner_text)
         self.banner_sub_label = None
@@ -10526,25 +11112,59 @@ class Win1App:
             top = pad
             bottom = max(top + 34, height - pad - 4)
             radius = min(26, (bottom - top) // 2)
+            if UI_CORNER == "chamfer":
+                radius = 12
             banner.coords(
                 self.banner_shadow_id,
-                *round_rect_points(pad + 2, top + 5, width - pad + 2, bottom + 5, radius)
+                *ui_shape_points(
+                    pad + 2, top + 5, width - pad + 2, bottom + 5, radius
+                )
             )
             banner.coords(
                 self.banner_bar_id,
-                *round_rect_points(pad, top, width - pad, bottom, radius)
+                *ui_shape_points(pad, top, width - pad, bottom, radius)
             )
             center = (top + bottom) // 2
+            if getattr(self, "banner_gloss_id", None) is not None:
+                banner.coords(
+                    self.banner_gloss_id,
+                    *ui_shape_points(pad, top, width - pad, center, radius)
+                )
+            for index, item in enumerate(
+                getattr(self, "banner_scan_ids", []) or []
+            ):
+                y = bottom - 10 - index * 5
+                banner.coords(item, pad + 14, y, width - pad - 14, y)
+            brackets = getattr(self, "banner_bracket_ids", []) or []
+            if brackets:
+                tick = 14
+                for item, spot in zip(
+                    brackets,
+                    (
+                        (pad, top, 1, 1),
+                        (width - pad, top, -1, 1),
+                        (pad, bottom, 1, -1),
+                        (width - pad, bottom, -1, -1),
+                    ),
+                ):
+                    cx, cy, dx, dy = spot
+                    banner.coords(
+                        item, cx, cy + dy * tick, cx, cy, cx + dx * tick, cy
+                    )
             size = 26
             banner.coords(
                 self.banner_mark_id,
-                *round_rect_points(
-                    pad + 16, center - size // 2, pad + 16 + size, center + size // 2, 8
+                *ui_shape_points(
+                    pad + 16,
+                    center - size // 2,
+                    pad + 16 + size,
+                    center + size // 2,
+                    8,
                 )
             )
             banner.coords(
                 self.banner_mark_core_id,
-                *round_rect_points(pad + 24, center - 5, pad + 33, center + 5, 3)
+                *ui_shape_points(pad + 24, center - 5, pad + 33, center + 5, 3)
             )
             banner.coords(self.banner_title_id, pad + 16 + size + 12, center)
             title_box = banner.bbox(self.banner_title_id)
@@ -10557,7 +11177,7 @@ class Win1App:
             if box:
                 banner.coords(
                     self.banner_chip_id,
-                    *round_rect_points(
+                    *ui_shape_points(
                         box[0] - 13, center - 12, box[2] + 13, center + 12, 12
                     )
                 )
@@ -10576,6 +11196,9 @@ class Win1App:
     def _refresh_banner_text_colors(self):
         banner = getattr(self, "banner", None)
         if banner is None:
+            return
+        if UI_VECTOR:
+            self._refresh_modern_banner_colors(banner)
             return
         fill = self._banner_fill()
         photo = bool(getattr(self, "_banner_has_image", False))
@@ -10634,6 +11257,53 @@ class Win1App:
             ):
                 if item is not None:
                     banner.itemconfigure(item, state=state)
+        except Exception:
+            pass
+
+    def _refresh_modern_banner_colors(self, banner):
+        """Hero bar colours for vector / sci-fi / millennium (+ wallpaper strip)."""
+        palette = self._banner_palette()
+        photo = bool(getattr(self, "_banner_has_image", False))
+        ink = "#FFFFFF" if photo else palette["ink"]
+        sub = "#FFFFFF" if photo else palette["sub"]
+        try:
+            for item in (
+                getattr(self, "banner_title_id", None),
+                getattr(self, "banner_version_id", None),
+            ):
+                if item is not None:
+                    banner.itemconfigure(item, fill=ink)
+            if getattr(self, "banner_sub_id", None) is not None:
+                banner.itemconfigure(self.banner_sub_id, fill=sub)
+            mark = "#FFFFFF" if photo else palette["mark"]
+            if getattr(self, "banner_mark_id", None) is not None:
+                banner.itemconfigure(self.banner_mark_id, outline=mark)
+            if getattr(self, "banner_mark_core_id", None) is not None:
+                banner.itemconfigure(
+                    self.banner_mark_core_id, fill=mark, outline=mark
+                )
+            if getattr(self, "banner_divider_id", None) is not None:
+                banner.itemconfigure(self.banner_divider_id, fill=sub)
+            if getattr(self, "banner_bar_id", None) is not None:
+                # 壁纸条时让图片透出来，否则用本风格的主色
+                banner.itemconfigure(
+                    self.banner_bar_id,
+                    fill="" if photo else palette["bar"],
+                    outline="" if photo else palette["edge"],
+                )
+            if getattr(self, "banner_chip_id", None) is not None:
+                banner.itemconfigure(
+                    self.banner_chip_id,
+                    fill="" if photo else palette["chip"],
+                    outline="#FFFFFF" if photo else palette["chip_edge"],
+                )
+            state = "hidden" if photo else "normal"
+            if getattr(self, "banner_gloss_id", None) is not None:
+                banner.itemconfigure(self.banner_gloss_id, state=state)
+            for item in getattr(self, "banner_scan_ids", []) or []:
+                banner.itemconfigure(item, state=state)
+            for item in getattr(self, "banner_bracket_ids", []) or []:
+                banner.itemconfigure(item, state=state)
         except Exception:
             pass
 
@@ -11067,7 +11737,9 @@ class Win1App:
         )
         game_menu.add_cascade(label=tr("game.media"), menu=content_menu)
         game_menu.add_separator()
-        game_menu.add_command(label=tr("game.refresh"), command=self.refresh_hot)
+        game_menu.add_command(
+            label=tr("game.refresh"), command=lambda: self.refresh_hot(True)
+        )
         game_menu.add_command(label=tr("game.clear"), command=self.on_clear_selection)
         menubar.add_cascade(label=tr("menu.game"), menu=game_menu)
 
@@ -14622,7 +15294,7 @@ class Win1App:
         self.btn_search.grid(row=0, column=2, padx=(6, 0))
 
         self.btn_refresh = self._mk_button(
-            search_row, "[ 热门 ]", self.refresh_hot, padx=8
+            search_row, "[ 热门 ]", lambda: self.refresh_hot(True), padx=8
         )
         self.btn_refresh.grid(row=0, column=3, padx=(6, 0))
 
@@ -18771,25 +19443,45 @@ class Win1App:
         )
         self.refresh_hot()
 
-    def refresh_hot(self):
+    def refresh_hot(self, manual=False):
         if self._busy:
             self.say("下载总线占用中，稍后再刷新榜单")
             return
         if time.time() - self._last_hot_refresh < 1.0:
             return
         self._last_hot_refresh = time.time()
-        try:
-            self.count_label.configure(text="ARSENAL LOADING ...")
-        except Exception:
-            pass
+        cache_key = hot_cache_key(self.shelf_mc_version(), self.shelf_loader())
+        cached_shown = False
+        if not manual and not getattr(self, "_hot_cache_shown", False):
+            # 先摆上一份上次成功的榜单，网络慢也不会看到空货架
+            self._hot_cache_shown = True
+            cached = load_hot_cache().get(cache_key) or []
+            if cached:
+                try:
+                    self._populate_hits(
+                        cached,
+                        "HOT {0} // {1} // 缓存 // 正在刷新".format(
+                            len(cached), self._shelf_label_text()
+                        ),
+                    )
+                    cached_shown = True
+                except Exception:
+                    cached_shown = False
+        if not cached_shown:
+            try:
+                self.count_label.configure(text="ARSENAL LOADING ...")
+            except Exception:
+                pass
         self.say(
             "正在拉取 Modrinth 热门榜单 // {0} / {1}".format(
                 self.mc_version, self.mod_loader
             )
         )
-        threading.Thread(target=self._refresh_hot_worker, daemon=True).start()
+        threading.Thread(
+            target=self._refresh_hot_worker, args=(bool(manual),), daemon=True
+        ).start()
 
-    def _refresh_hot_worker(self):
+    def _refresh_hot_worker(self, manual=False):
         settings = self.config.get("modrinth") or {}
         limit = int(settings.get("hot_limit") or 8)
         index = str(settings.get("index") or "downloads")
@@ -18810,21 +19502,19 @@ class Win1App:
                 relaxed = "无记录 // 显示全站热门"
         except Exception as exc:
             log_debug("hot refresh failed:\n" + traceback.format_exc())
-            self.post(self._populate_hits, [], "OFFLINE // 榜单不可用")
-            self.say("热门榜单拉取失败: {0}".format(exc))
-            message = str(exc)
-            self.post(
-                lambda msg=message: messagebox.showwarning(
-                    "Modrinth 不可用",
-                    "{0}\n\n可稍后点击 [刷新热门] 重试。".format(msg),
-                    parent=self.root,
-                )
-            )
+            # keep the cards already on screen (cache / previous search),
+            # only the status line changes; retry scheduling happens on the
+            # UI thread because Tk timers are not thread safe.
+            self.post(self._hot_failed, str(exc), bool(manual))
             return
         if not hits:
             self.post(self._populate_hits, [], "EMPTY // 榜单无记录")
             self.say("热门榜单为空 // Modrinth 未返回匹配记录")
             return
+        try:
+            save_hot_cache(hot_cache_key(mc, loader), hits)
+        except Exception:
+            pass
         note = "HOT {0} // {1}".format(len(hits), scope)
         if relaxed:
             note += " // " + relaxed
@@ -18832,6 +19522,37 @@ class Win1App:
         self.say(
             "战备架已装载 {0} 条热门记录 // {1}".format(len(hits), scope)
         )
+
+    def _hot_failed(self, message, manual):
+        """Shelf failure: keep the visible cards, hand the user a retry path."""
+        try:
+            self.count_label.configure(
+                text="OFFLINE // 榜单不可用 // 点 [ 热门 ] 重试"
+            )
+        except Exception:
+            pass
+        self.say("热门榜单拉取失败: {0}".format(message))
+        if manual:
+            messagebox.showwarning(
+                "Modrinth 不可用",
+                "{0}\n\n可稍后点击 [ 热门 ] 重试。".format(message),
+                parent=self.root,
+            )
+            return
+        if getattr(self, "_hot_retry_pending", False):
+            return
+        self._hot_retry_pending = True
+        try:
+            self.root.after(4000, self._hot_retry)
+        except Exception:
+            self._hot_retry_pending = False
+
+    def _hot_retry(self):
+        self._hot_retry_pending = False
+        try:
+            self.refresh_hot()
+        except Exception:
+            pass
 
     def _search_limit(self):
         settings = self.config.get("modrinth") or {}
@@ -24025,61 +24746,51 @@ class Win1App:
         style_box.pack(fill="x", pady=(0, 6))
         tk.Label(
             style_box,
-            text=title_text("STYLE // 界面风格（矢量风是测试样式）"),
+            text=title_text("STYLE // 界面风格（四种，都能随时互切）"),
             bg=C_GRAY,
             fg=C_BLACK,
             font=FONT_MAIN,
             anchor="w",
         ).pack(fill="x", pady=(0, 4))
-        style_row = tk.Frame(style_box, bg=C_GRAY)
-        style_row.pack(fill="x")
+        style_grid = tk.Frame(style_box, bg=C_GRAY)
+        style_grid.pack(fill="x")
+        self._style_buttons = {}
         for index, style_name in enumerate(UI_STYLES):
-            style_row.columnconfigure(index, weight=1, uniform="style")
-            self._mk_button(
-                style_row,
+            grid_row, grid_column = divmod(index, 2)
+            style_grid.columnconfigure(grid_column, weight=1, uniform="style")
+            style_button = self._mk_button(
+                style_grid,
                 "[ {0}{1} ]".format(
                     UI_STYLE_LABELS.get(style_name, style_name),
                     " *" if self.ui_style == style_name else "",
                 ),
                 lambda chosen=style_name: self.on_choose_ui_style(chosen),
                 font=FONT_SMALL,
-            ).grid(row=0, column=index, sticky="ew", padx=2)
-        palette_row = tk.Frame(style_box, bg=C_GRAY)
-        palette_row.pack(fill="x", pady=(4, 0))
-        tk.Label(
-            palette_row, text="矢量风配色", bg=C_GRAY, fg=C_BLACK, font=FONT_SMALL
-        ).pack(side="left", padx=(0, 6))
-        for palette_name, palette_label in (
-            ("indigo", "靛蓝"),
-            ("aurora", "极光绿"),
-            ("sunset", "晚霞橙"),
-        ):
-            self._mk_button(
-                palette_row,
-                "[ {0}{1} ]".format(
-                    palette_label,
-                    " *" if self.ui_palette == palette_name else "",
-                ),
-                lambda chosen=palette_name: self.on_choose_ui_style(
-                    "vector", chosen
-                ),
-                font=FONT_SMALL,
-                padx=6,
-                pady=1,
-            ).pack(side="left", padx=2)
+            )
+            style_button.grid(
+                row=grid_row, column=grid_column, sticky="ew", padx=2, pady=1
+            )
+            self._style_buttons[style_name] = style_button
+        self._style_palette_row = tk.Frame(style_box, bg=C_GRAY)
+        self._style_palette_row.pack(fill="x", pady=(6, 0))
+        self._rebuild_settings_palette_row()
         tk.Label(
             style_box,
-            text=(
-                "矢量风 = 圆角卡片 + 无边框按钮 + 圆角标题条（B0.5 测试中）；"
-                "配色三选一，随时可以切回 1985 复古。切换后字体族在重启时完全生效。"
-            ),
+            text=" ".join(
+                "{0}＝{1}；".format(
+                    UI_STYLE_LABELS.get(name, name).replace("（测试）", ""),
+                    UI_STYLE_HINTS.get(name, ""),
+                )
+                for name in UI_STYLES
+            )
+            + "切换后字体族要重启一次启动器才完全生效。",
             bg=C_GRAY,
             fg=C_BLACK,
             font=FONT_SMALL,
             anchor="w",
             justify="left",
             wraplength=580,
-        ).pack(fill="x", pady=(4, 0))
+        ).pack(fill="x", pady=(6, 0))
 
         preset_box = tk.Frame(
             wrap, bg=C_GRAY, bd=1, relief="solid", padx=6, pady=6
@@ -24779,6 +25490,17 @@ class Win1App:
 
     def _apply_theme(self, theme):
         normalized = normalize_theme(theme)
+        if UI_VECTOR:
+            # modern 风格（矢量 / 科幻 / 千禧）用自己的配色，主题色先存起来
+            self.theme = normalized
+            self.config["theme"] = dict(normalized)
+            self._save_config()
+            self.say(
+                "主题色已保存 // 当前是 {0}，切回 1985 复古才看得到".format(
+                    UI_STYLE_LABELS.get(UI_STYLE, UI_STYLE)
+                )
+            )
+            return
         mapping = {
             C_WHITE.upper(): normalized["surface"],
             C_GRAY.upper(): normalized["secondary"],

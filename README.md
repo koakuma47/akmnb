@@ -1118,14 +1118,14 @@ There was an error during installation
 弹出的是 1985 Windows 1.0 风格面板：纯白底、1 像素黑实线边框、Courier New
 等宽粗体，底部两个复古方块按钮：
 
-- `[ 🌐 访问爱发电主页 ]` → `https://afdian.net/a/your-id`
+- `[ 🌐 访问爱发电主页 ]` → `https://afdian.com/a/67676767AKM7878`
 - `[ 收到并关闭 ]` → 关闭弹窗
 
 按钮绑定 `<Enter>` / `<Leave>`，鼠标悬停时切换为黑底白字 / 青蓝底白字并改为
 下沉边框，离开后复原。状态栏同时打印：
 
 ```text
->>> [SUPPLY] 已激活官方能量补给通道 (爱发电: your-id)
+>>> [SUPPLY] 已激活官方能量补给通道 (爱发电: 67676767AKM7878)
 ```
 
 ### 收款码的加密与内存解密
