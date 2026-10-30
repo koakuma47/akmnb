@@ -1,7 +1,7 @@
 {
-  "version": "B0.7",
-  "url": "https://raw.githubusercontent.com/<user>/<repo>/main/release/AKM_Launcher_B0.7.zip",
-  "sha256": "CEACCB61DFC6E26967689C69D1B08065C9C560503425E72D8BA15C13FBF6FD5D",
+  "version": "B0.8",
+  "url": "https://raw.githubusercontent.com/<user>/<repo>/main/release/AKM_Launcher_B0.8.zip",
+  "sha256": "66E8029C2561B2A9D5433D53AA04B37255DF03C556E8A49FA6CC737D89630B86",
   "page": "https://github.com/<user>/<repo>/releases",
-  "notes": "B0.7: 矢量风 / 科幻风 / 千禧年 的按钮也换成自绘主题按钮（圆角药丸 / 切角 HUD / 铬色高光），带悬停与禁用态；复古 <-> 现代互切自动重建界面"
+  "notes": "B0.8: 战备架一次 48 个模组、默认矢量风、顶栏换成大按钮、新增 Win7 风与计算器"
 }

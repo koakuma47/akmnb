@@ -79,7 +79,7 @@ except Exception:  # pragma: no cover - tkinter always ships with CPython on Win
 # ---------------------------------------------------------------------------
 
 APP_NAME = "AKM Launcher"
-APP_VERSION = "B0.7"
+APP_VERSION = "B0.8"
 
 # ---------------------------------------------------------------------------
 # Internationalisation (zh / en / ja / ru / ar)
@@ -1333,14 +1333,14 @@ DEFAULT_CONFIG = {
     "download_detail": True,
     "language": "zh",
     "theme": dict(DEFAULT_THEME),
-    "ui_style": "retro",
+    "ui_style": "vector",
     "ui_style_palette": "indigo",
     "wallpaper": "",
     "wallpaper_fit": "cover",
     "wallpaper_dim": 0,
     "panel_alpha": 45,
     "afdian_url": AFDIAN_URL,
-    "modrinth": {"hot_limit": 8, "search_limit": 30, "index": "downloads"},
+    "modrinth": {"hot_limit": 48, "search_limit": 30, "index": "downloads"},
     "mod_filter_loader": "auto",
     "mod_version_bar_open": False,
     "update_url": "",
@@ -1420,18 +1420,20 @@ def set_global_theme(theme):
 #     gradient.  Everything is plain tkinter Canvas drawing, no extra library.
 # ---------------------------------------------------------------------------
 
-UI_STYLES = ("retro", "vector", "scifi", "millennium")
+UI_STYLES = ("retro", "vector", "scifi", "millennium", "win7")
 UI_STYLE_LABELS = {
     "retro": "1985 复古",
     "vector": "矢量风（测试）",
     "scifi": "科幻风（测试）",
     "millennium": "千禧年（测试）",
+    "win7": "Win7 风（测试）",
 }
 UI_STYLE_HINTS = {
     "retro": "黑边方块 + 纯色标题条，1985 工业味",
     "vector": "圆角卡片 + 渐变横幅 + 无边框按钮（测试样式）",
     "scifi": "深空底 + 切角 HUD 面板 + 霓虹描边（暗色，测试样式）",
     "millennium": "钴蓝 + 铬色渐变 + 高光按钮，2000 年数码味（测试样式）",
+    "win7": "浅蓝玻璃底 + 圆角高光按钮 + Aero 标题条（测试样式）",
 }
 # 每种风格的外观参数。modern = 圆角卡片 / 无边框按钮这一支（原来只有矢量风）
 #   corner : round（圆角）/ chamfer（45° 切角，HUD 味）/ sharp（直角）
@@ -1453,6 +1455,10 @@ UI_STYLE_SPECS = {
     "millennium": {
         "modern": True, "radius": 18, "corner": "round", "banner": "chrome",
         "button": "chrome", "dark": False, "grid": False, "gloss": True,
+    },
+    "win7": {
+        "modern": True, "radius": 8, "corner": "round", "banner": "aero",
+        "button": "aero", "dark": False, "grid": False, "gloss": True,
     },
 }
 # page, surface, secondary, accent, text, muted, outline, shadow,
@@ -1502,12 +1508,28 @@ UI_STYLE_PALETTES = {
             "#6B7688", "#CFD8E6", "#D5DCE8", "#B9C6DC", "#FFFFFF",
         ),
     },
+    # Win7 / Aero：浅蓝玻璃底 + 圆角高光按钮
+    "win7": {
+        "aero": (
+            "#EEF4FB", "#FFFFFF", "#E2ECF8", "#2C6FBB", "#0F1E2C",
+            "#6E8095", "#C3D6EA", "#D9E5F3", "#7FB8E8", "#FFFFFF",
+        ),
+        "basic": (
+            "#F0F0F0", "#FFFFFF", "#E5E5E5", "#3C6E9E", "#111111",
+            "#767676", "#C8C8C8", "#DEDEDE", "#9CC3E8", "#FFFFFF",
+        ),
+        "midnight": (
+            "#1B2430", "#232E3C", "#2B3948", "#5AA0E0", "#E7F1FA",
+            "#8B9CB0", "#3A4B60", "#141B24", "#8FD0F5", "#0B131C",
+        ),
+    },
 }
 UI_STYLE_DEFAULT_PALETTE = {
     "retro": "indigo",
     "vector": "indigo",
     "scifi": "cobalt",
     "millennium": "cobalt",
+    "win7": "aero",
 }
 UI_PALETTE_LABELS = {
     "indigo": "靛蓝",
@@ -1518,6 +1540,9 @@ UI_PALETTE_LABELS = {
     "violet": "星紫",
     "aqua": "水蓝",
     "chrome": "铬银",
+    "aero": "玻璃蓝",
+    "basic": "经典灰",
+    "midnight": "午夜蓝",
 }
 UI_VECTOR = False          # modern 家族（矢量 / 科幻 / 千禧）共用这一支
 UI_STYLE = "retro"
@@ -1723,6 +1748,12 @@ UI_FONT_CANDIDATES = {
         "Microsoft YaHei UI",
         "Segoe UI",
         "Arial",
+    ),
+    "win7": (
+        "Segoe UI",
+        "Microsoft YaHei UI",
+        "Tahoma",
+        "Verdana",
     ),
 }
 
@@ -4374,12 +4405,14 @@ class ThemedButton(tk.Canvas):
             elif name == "pady":
                 self._pad_y = int(value)
                 repaint = True
-            elif name in ("bg", "background", "activebackground"):
+            elif name in ("bg", "background"):
                 self._fill_role = self._role_fill(value)
                 repaint = True
-            elif name in ("fg", "foreground", "activeforeground"):
+            elif name in ("fg", "foreground"):
                 self._ink_role = self._role_ink(value)
                 repaint = True
+            elif name in ("activebackground", "activeforeground"):
+                continue
             elif name in _THEMED_IGNORED_OPTIONS:
                 continue
             else:
@@ -4405,9 +4438,19 @@ class ThemedButton(tk.Canvas):
         if name == "font":
             return self._font_spec
         if name in ("fg", "foreground"):
-            return C_TEAL if self._ink_role in ("auto", "accent") else C_BLACK
-        if name == "bg":
-            return C_TEAL if self._fill_role == "accent" else C_WHITE
+            return {
+                "accent": C_TEAL,
+                "text": C_BLACK,
+                "on_accent": UI_ON_ACCENT,
+                "auto": C_BLACK if UI_STYLE == "scifi" else C_TEAL,
+            }.get(self._ink_role, self._ink_role)
+        if name in ("bg", "background"):
+            return {
+                "accent": C_TEAL,
+                "inverted": C_BLACK,
+                "secondary": C_GRAY,
+                "surface": C_WHITE,
+            }.get(self._fill_role, self._fill_role)
         if name == "relief":
             return "flat"
         if name in ("bd", "borderwidth", "highlightthickness"):
@@ -4478,15 +4521,14 @@ class ThemedButton(tk.Canvas):
             body = C_BLACK
             default_ink = C_WHITE
         elif fill_role == "secondary":
-            body = (
-                blend_color(C_GRAY, C_WHITE, 0.45)
-                if UI_STYLE == "millennium"
-                else C_GRAY
-            )
             if UI_STYLE == "scifi":
                 body = blend_color(C_GRAY, C_TEAL, 0.12)
                 default_ink = blend_color(C_TEAL, C_WHITE, 0.55)
+            elif UI_STYLE in ("millennium", "win7"):
+                body = blend_color(C_GRAY, C_WHITE, 0.55)
+                default_ink = C_TEAL if UI_STYLE == "millennium" else C_BLACK
             else:
+                body = C_GRAY
                 default_ink = C_TEAL
         elif fill_role == "surface":
             body = blend_color(
@@ -4516,6 +4558,8 @@ class ThemedButton(tk.Canvas):
         edge = blend_color(C_TEAL, C_WHITE, 0.55)
         if UI_STYLE == "millennium":
             edge = blend_color(C_TEAL, "#FFFFFF", 0.45)
+        elif UI_STYLE == "win7":
+            edge = blend_color(C_TEAL, "#FFFFFF", 0.25)
         elif UI_STYLE == "vector":
             edge = blend_color(C_TEAL, C_WHITE, 0.80)
         if disabled:
@@ -4576,6 +4620,8 @@ class ThemedButton(tk.Canvas):
         span = y1 - y0
         if style == "scifi":
             corner, radius = "chamfer", 5
+        elif style == "win7":
+            corner, radius = "round", max(4, min(8, span // 2))
         elif style == "millennium":
             corner, radius = "round", max(4, min(10, span // 2))
         else:
@@ -4600,16 +4646,17 @@ class ThemedButton(tk.Canvas):
             outline=edge,
             width=2 if style == "millennium" else 1,
         )
-        if style == "millennium" and not colors["disabled"]:
+        if style in ("millennium", "win7") and not colors["disabled"]:
+            gloss = 0.50 if style == "millennium" else 0.62
             draw_ui_shape(
                 self,
-                x0 + 3,
+                x0 + 2 if style == "win7" else x0 + 3,
                 y0 + 2,
-                x1 - 3,
+                x1 - 2 if style == "win7" else x1 - 3,
                 y0 + max(4, span // 2),
-                max(2, radius - 3),
+                max(2, radius - 2 if style == "win7" else radius - 3),
                 corner,
-                fill=blend_color(body, "#FFFFFF", 0.50),
+                fill=blend_color(body, "#FFFFFF", gloss),
                 outline="",
             )
             self.create_line(
@@ -10221,10 +10268,267 @@ class TetrisWindow:
             pass
 
 
+class CalculatorWindow:
+    """四则运算计算器（跟随当前界面风格换皮）。"""
+
+    KEYS = (
+        ("C", "←", "%", "÷"),
+        ("7", "8", "9", "×"),
+        ("4", "5", "6", "−"),
+        ("1", "2", "3", "+"),
+        ("±", "0", ".", "="),
+    )
+    OPS = ("+", "−", "×", "÷")
+
+    def __init__(self, master):
+        self.current = "0"
+        self.pending = None
+        self.pending_op = ""
+        self.fresh = True
+        self.last_result = False
+
+        self.win = tk.Toplevel(master)
+        self.win.title("计算器 // CALC")
+        self.win.configure(bg=C_WHITE)
+        self.win.resizable(False, False)
+        self.win.protocol("WM_DELETE_WINDOW", self.close)
+
+        head = tk.Frame(self.win, bg=C_TEAL, bd=1, relief="solid")
+        head.pack(fill="x", padx=8, pady=(8, 0))
+        tk.Label(
+            head,
+            text=title_text("CALC // 计算器"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=4,
+        ).pack(fill="x")
+
+        self.display_var = tk.StringVar(value="0")
+        self.display = tk.Label(
+            self.win,
+            textvariable=self.display_var,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=(UI_FONT, 24, "bold"),
+            anchor="e",
+            padx=10,
+            pady=10,
+            bd=1,
+            relief="solid" if not UI_VECTOR else "flat",
+            highlightthickness=1 if UI_VECTOR else 0,
+            highlightbackground=UI_OUTLINE,
+        )
+        self.display.pack(fill="x", padx=8, pady=(6, 4))
+
+        self.hint_var = tk.StringVar(value="")
+        tk.Label(
+            self.win,
+            textvariable=self.hint_var,
+            bg=C_WHITE,
+            fg=C_TEAL if UI_VECTOR else C_BLACK,
+            font=FONT_SMALL,
+            anchor="e",
+        ).pack(fill="x", padx=12)
+
+        body = tk.Frame(self.win, bg=C_WHITE)
+        body.pack(fill="both", expand=True, padx=8, pady=(4, 8))
+        key_font = (UI_FONT, 15, "bold")
+        for row_index, row in enumerate(self.KEYS):
+            body.rowconfigure(row_index, weight=1)
+            for col_index, label in enumerate(row):
+                body.columnconfigure(col_index, weight=1, uniform="calc")
+                accent = label in self.OPS or label == "="
+                button = self._make_key(body, label, accent, key_font)
+                button.grid(
+                    row=row_index, column=col_index, sticky="nsew", padx=2, pady=2
+                )
+
+        self.win.bind("<Key-Return>", lambda _e: self.press("="))
+        self.win.bind("<Key-KP_Enter>", lambda _e: self.press("="))
+        self.win.bind("<Escape>", lambda _e: self.close())
+        self.win.bind("<Key-BackSpace>", lambda _e: self.press("←"))
+        self.win.bind("<Key>", self._on_char)
+        self._center(master)
+        try:
+            self.win.focus_force()
+        except Exception:
+            pass
+
+    def _make_key(self, parent, label, accent, font):
+        if UI_VECTOR:
+            return ThemedButton(
+                parent,
+                text=label,
+                command=lambda key=label: self.press(key),
+                font=font,
+                padx=8,
+                pady=10,
+                bg=C_TEAL if accent else C_GRAY,
+                fg=UI_ON_ACCENT if accent else None,
+            )
+        return tk.Button(
+            parent,
+            text=label,
+            command=lambda key=label: self.press(key),
+            font=font,
+            bg=C_TEAL if accent else C_WHITE,
+            fg=C_WHITE if accent else C_BLACK,
+            activebackground=C_TEAL,
+            activeforeground=C_WHITE,
+            relief="solid",
+            bd=1,
+            padx=6,
+            pady=6,
+            cursor="hand2",
+        )
+
+    def _center(self, master):
+        try:
+            self.win.update_idletasks()
+            width = max(300, self.win.winfo_reqwidth())
+            height = max(430, self.win.winfo_reqheight())
+            self.win.geometry("{0}x{1}".format(width, height))
+            pos_x = master.winfo_rootx() + max(
+                0, (master.winfo_width() - width) // 2
+            )
+            pos_y = master.winfo_rooty() + max(
+                0, (master.winfo_height() - height) // 2
+            )
+            self.win.geometry("+{0}+{1}".format(pos_x, pos_y))
+        except Exception:
+            pass
+
+    def _on_char(self, event):
+        char = str(getattr(event, "char", "") or "")
+        if char in "0123456789.":
+            self.press(char)
+        elif char in "+-*/":
+            self.press({"+": "+", "-": "−", "*": "×", "/": "÷"}[char])
+        elif char in "cC":
+            self.press("C")
+        elif char == "%":
+            self.press("%")
+
+    # -- math ----------------------------------------------------------
+    def _number(self):
+        try:
+            return float(str(self.current).replace("−", "-"))
+        except ValueError:
+            return 0.0
+
+    def _format(self, value):
+        if value != value or value in (float("inf"), float("-inf")):
+            return "错误"
+        if abs(value) >= 1e15:
+            return "{0:.6E}".format(value)
+        text = "{0:.10f}".format(value).rstrip("0").rstrip(".")
+        if text in ("", "-", "-0"):
+            text = "0"
+        return text.replace("-", "−")
+
+    def _show(self, text=None):
+        if text is not None:
+            self.current = text
+        self.display_var.set(self.current or "0")
+        if self.pending is not None and self.pending_op:
+            self.hint_var.set(
+                "{0} {1}".format(self._format(self.pending), self.pending_op)
+            )
+        else:
+            self.hint_var.set("")
+
+    def _apply(self, left, right, op):
+        if op == "+":
+            return left + right
+        if op == "−":
+            return left - right
+        if op == "×":
+            return left * right
+        if op == "÷":
+            return float("nan") if right == 0 else left / right
+        return right
+
+    def press(self, key):
+        if key.isdigit():
+            if self.fresh or self.last_result:
+                self.current = key
+                self.fresh = False
+                self.last_result = False
+            else:
+                head = "" if self.current == "0" else self.current
+                self.current = head + key
+            self._show()
+            return
+        if key == ".":
+            if self.fresh or self.last_result:
+                self.current = "0."
+                self.fresh = False
+                self.last_result = False
+            elif "." not in self.current:
+                self.current += "."
+            self._show()
+            return
+        if key in self.OPS:
+            value = self._number()
+            if self.pending is not None and not self.fresh:
+                value = self._apply(self.pending, value, self.pending_op)
+                self.current = self._format(value)
+            self.pending = value
+            self.pending_op = key
+            self.fresh = True
+            self.last_result = False
+            self._show()
+            return
+        if key == "=":
+            value = self._number()
+            if self.pending is not None and self.pending_op:
+                value = self._apply(self.pending, value, self.pending_op)
+            self.pending = None
+            self.pending_op = ""
+            self.fresh = True
+            self.last_result = True
+            self._show(self._format(value))
+            return
+        if key == "C":
+            self.pending = None
+            self.pending_op = ""
+            self.fresh = True
+            self.last_result = False
+            self._show("0")
+            return
+        if key == "←":
+            if self.last_result or self.fresh:
+                self._show("0")
+            else:
+                self._show(self.current[:-1] or "0")
+            return
+        if key == "%":
+            self._show(self._format(self._number() / 100.0))
+            self.fresh = True
+            return
+        if key == "±":
+            text = self.current
+            if text.startswith("−"):
+                self._show(text[1:] or "0")
+            elif text not in ("0", ""):
+                self._show("−" + text)
+            return
+
+    def close(self):
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+
+
 class Win1App:
     def __init__(self):
         self._enable_dpi()
         self.config, self.auth, self.alias = bootstrap_files()
+        self._migrate_defaults()
         set_language(self.config.get("language"))
         self._relaunch_ui = False
         self.theme = set_global_theme(self.config.get("theme"))
@@ -10426,6 +10730,7 @@ class Win1App:
         self._game2048 = None
         self._minesweeper = None
         self._tetris = None
+        self._calc_win = None
         self._snake_prompt_win = None
         self._snake_prompt_at = 0.0
 
@@ -10470,6 +10775,30 @@ class Win1App:
         self.root.after(700, self._tick_download_stats)
 
     # -- window plumbing ----------------------------------------------------
+
+    def _migrate_defaults(self):
+        """B0.8: 战备架一次能摆更多卡片，老配置里的 hot_limit=8 自动抬高。"""
+        changed = False
+        modrinth_conf = self.config.setdefault("modrinth", {})
+        try:
+            limit = int(modrinth_conf.get("hot_limit") or 0)
+        except (TypeError, ValueError):
+            limit = 0
+        if limit < 24:
+            modrinth_conf["hot_limit"] = 48
+            changed = True
+        try:
+            search_limit = int(modrinth_conf.get("search_limit") or 0)
+        except (TypeError, ValueError):
+            search_limit = 0
+        if search_limit < 30:
+            modrinth_conf["search_limit"] = 30
+            changed = True
+        if changed:
+            try:
+                self._save_config()
+            except Exception:
+                pass
 
     def _enable_dpi(self):
         try:
@@ -10656,14 +10985,19 @@ class Win1App:
             self._ui_job = None
 
 
-    def _mk_button(self, parent, text, command, font=FONT_MAIN, padx=8, pady=4):
+    def _mk_button(
+        self, parent, text, command, font=FONT_MAIN, padx=8, pady=4, bg=None,
+        fg=None
+    ):
         mode = ui_style_spec()["button"]
         if mode != "bevel":
-            # modern 家族：Canvas 自绘圆角 / 切角 / 铬色按钮
-            default_bg = (
-                C_GRAY if mode in ("tech", "chrome") else C_WHITE
+            # modern 家族：Canvas 自绘圆角 / 切角 / 铬色 / Aero 玻璃按钮
+            default_bg = bg or (
+                C_GRAY if mode in ("tech", "chrome", "aero") else C_WHITE
             )
-            default_fg = C_BLACK if mode == "tech" else C_TEAL
+            default_fg = fg or (
+                C_TEAL if mode in ("flat", "chrome") else C_BLACK
+            )
             return ThemedButton(
                 parent,
                 text=text,
@@ -10674,13 +11008,15 @@ class Win1App:
                 bg=default_bg,
                 fg=default_fg,
             )
+        base_bg = bg or C_WHITE
+        base_fg = fg or C_BLACK
         button = tk.Button(
             parent,
             text=text,
             command=command,
             font=font,
-            bg=C_WHITE,
-            fg=C_BLACK,
+            bg=base_bg,
+            fg=base_fg,
             activebackground=C_TEAL,
             activeforeground=C_WHITE,
             relief="solid",
@@ -10698,7 +11034,7 @@ class Win1App:
 
         def on_leave(_event, widget=button):
             if str(widget.cget("state")) != "disabled":
-                widget.configure(bg=C_WHITE, fg=C_BLACK)
+                widget.configure(bg=base_bg, fg=base_fg)
 
         button.bind("<Enter>", on_enter)
         button.bind("<Leave>", on_leave)
@@ -10763,11 +11099,12 @@ class Win1App:
     def _build_ui(self):
         self.root.columnconfigure(0, weight=0, minsize=340)
         self.root.columnconfigure(1, weight=1)
-        self.root.rowconfigure(1, weight=1)
-        self.root.rowconfigure(2, minsize=0)
+        self.root.rowconfigure(2, weight=1)
+        self.root.rowconfigure(3, minsize=0)
         self._build_backdrop()
         self._build_menu()
         self._build_banner()
+        self._build_toolbar()
         self._build_left_panel(self.root)
         self._build_desktop_hint(self.root)
         self._build_right_panel(self.root)
@@ -10775,6 +11112,55 @@ class Win1App:
         self._center_window(1040, 640)
         self._style_panel_frames()
         self._schedule_card_refresh(160)
+
+    def _build_toolbar(self):
+        """Big top buttons for the modern styles (the 1985 skin keeps the menu)."""
+        bar = tk.Frame(self.root, bg=UI_PAGE, bd=0)
+        bar.grid(row=1, column=0, columnspan=2, sticky="ew", padx=14, pady=(10, 0))
+        self.toolbar = bar
+        self._tool_buttons = []
+        if not UI_VECTOR:
+            bar.grid_remove()
+            return
+        bar.columnconfigure(6, weight=1)
+        for index, (key, label, menu) in enumerate(getattr(self, "_top_menus", [])):
+            button = self._mk_button(
+                bar,
+                label + " ▾",
+                None,
+                font=(UI_FONT, 12, "bold") if UI_FONT else FONT_BIG,
+                padx=16,
+                pady=10,
+            )
+            button.configure(
+                command=lambda m=menu, w=button: self._popup_top_menu(m, w)
+            )
+            button.grid(row=0, column=index, sticky="w", padx=(0, 6))
+            self._tool_buttons.append((key, button))
+        self._mk_button(
+            bar,
+            "计算器",
+            command=self.on_open_calculator,
+            font=(UI_FONT, 12, "bold") if UI_FONT else FONT_BIG,
+            padx=16,
+            pady=10,
+            bg=C_TEAL,
+            fg=UI_ON_ACCENT,
+        ).grid(row=0, column=7, sticky="e")
+
+    def _popup_top_menu(self, menu, button):
+        """Open a top level menu right below its big button."""
+        try:
+            x = button.winfo_rootx()
+            y = button.winfo_rooty() + button.winfo_height()
+            menu.tk_popup(x, y)
+        except Exception:
+            log_debug("popup menu failed:\n" + traceback.format_exc())
+        finally:
+            try:
+                menu.grab_release()
+            except Exception:
+                pass
 
     def _build_backdrop(self):
         """Whole-window canvas: shows the custom wallpaper behind every panel."""
@@ -10809,7 +11195,7 @@ class Win1App:
             return
         if UI_GRID:
             self._paint_backdrop_grid(canvas)
-        pad = 6 if UI_STYLE in ("scifi", "millennium") else 4
+        pad = 6 if UI_STYLE in ("scifi", "millennium", "win7") else 4
         for panel in self._ui_card_panels():
             try:
                 x = panel.winfo_x()
@@ -10945,6 +11331,28 @@ class Win1App:
                     width=2,
                     tags="ui_card",
                 )
+            elif UI_STYLE == "win7":
+                draw_ui_shape(
+                    canvas,
+                    x0 + 1,
+                    y0 + 1,
+                    x1 - 1,
+                    y1 - 1,
+                    max(4, radius - 2),
+                    fill="",
+                    outline=blend_color(C_TEAL, "#FFFFFF", 0.55),
+                    width=1,
+                    tags="ui_card",
+                )
+                canvas.create_line(
+                    x0 + radius,
+                    y0,
+                    x1 - radius,
+                    y0,
+                    fill=blend_color(C_TEAL, "#FFFFFF", 0.30),
+                    width=2,
+                    tags="ui_card",
+                )
         except Exception:
             pass
 
@@ -10970,6 +11378,9 @@ class Win1App:
                 stack.extend(widget.winfo_children())
             except Exception:
                 pass
+            if isinstance(widget, ThemedButton):
+                # 自绘按钮自己管颜色和边框，别被通用换肤逻辑覆盖
+                continue
             try:
                 klass = widget.winfo_class()
             except Exception:
@@ -10990,6 +11401,14 @@ class Win1App:
                     )
                 elif mode == "chrome":
                     options = dict(relief="raised", bd=2, highlightthickness=0)
+                elif mode == "aero":
+                    options = dict(
+                        relief="flat",
+                        bd=0,
+                        highlightthickness=1,
+                        highlightbackground=blend_color(C_TEAL, C_WHITE, 0.35),
+                        highlightcolor=C_TEAL,
+                    )
                 else:
                     options = dict(relief="flat", bd=0, highlightthickness=0)
                 try:
@@ -11000,7 +11419,9 @@ class Win1App:
                 # (accent / dark) ones or the hand painted accent buttons
                 if current_bg in (C_WHITE.upper(), C_GRAY.upper()):
                     options["bg"] = (
-                        C_GRAY if mode in ("tech", "chrome") else C_WHITE
+                        C_GRAY
+                        if mode in ("tech", "chrome", "aero")
+                        else C_WHITE
                     )
                     if mode == "chrome":
                         try:
@@ -11278,6 +11699,16 @@ class Win1App:
                         ),
                         bg=C_WHITE,
                     )
+                elif UI_STYLE == "win7":
+                    panel.configure(
+                        bd=0,
+                        relief="flat",
+                        highlightthickness=1,
+                        highlightbackground=blend_color(
+                            C_TEAL, "#FFFFFF", 0.35
+                        ),
+                        bg=C_WHITE,
+                    )
                 else:
                     panel.configure(
                         bd=0, relief="flat", highlightthickness=0, bg=C_WHITE
@@ -11317,14 +11748,14 @@ class Win1App:
     def _center_window(self, width, height):
         if UI_VECTOR:
             width = max(width, 1040)
-            height = max(height, 720)
+            height = max(height, 660 if UI_STYLE == "retro" else 780)
         self.root.update_idletasks()
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
         pos_x = max(0, int((screen_w - width) / 2))
         pos_y = max(0, int((screen_h - height) / 2) - 20)
         self.root.geometry("{0}x{1}+{2}+{3}".format(width, height, pos_x, pos_y))
-        self.root.minsize(940, 700 if UI_VECTOR else 660)
+        self.root.minsize(960, 760 if UI_VECTOR else 660)
 
     def _ensure_window_fits(self):
         """Grow the window so the current style is not clipped."""
@@ -11333,8 +11764,8 @@ class Win1App:
             need_w = max(self.root.winfo_reqwidth(), self.root.winfo_width())
             need_h = max(self.root.winfo_reqheight(), self.root.winfo_height())
             if UI_VECTOR:
-                need_h = max(need_h, 720)
-            self.root.minsize(940, 700 if UI_VECTOR else 660)
+                need_h = max(need_h, 780)
+            self.root.minsize(960, 760 if UI_VECTOR else 660)
             if (
                 need_w > self.root.winfo_width()
                 or need_h > self.root.winfo_height()
@@ -11451,6 +11882,17 @@ class Win1App:
                 "shadow": UI_SHADOW,
                 "mark": "#FFFFFF",
             }
+        if UI_STYLE == "win7":
+            return {
+                "bar": blend_color(C_TEAL, "#FFFFFF", 0.18),
+                "edge": blend_color(C_TEAL, "#FFFFFF", 0.62),
+                "ink": "#FFFFFF" if not UI_DARK else UI_ON_ACCENT,
+                "sub": blend_color(C_TEAL, "#FFFFFF", 0.80),
+                "chip": blend_color(C_TEAL, "#000000", 0.22),
+                "chip_edge": blend_color(C_TEAL, "#FFFFFF", 0.80),
+                "shadow": UI_SHADOW,
+                "mark": "#FFFFFF",
+            }
         return {
             "bar": C_TEAL,
             "edge": blend_color(C_TEAL, "#FFFFFF", 0.38),
@@ -11510,6 +11952,18 @@ class Win1App:
                 5,
                 16,
                 fill=blend_color(C_TEAL, "#FFFFFF", 0.42),
+                outline="",
+            )
+        elif UI_STYLE == "win7":
+            # Aero：上半段玻璃反光更亮一点
+            self.banner_gloss_id = draw_ui_shape(
+                banner,
+                0,
+                0,
+                10,
+                5,
+                16,
+                fill=blend_color(palette["bar"], "#FFFFFF", 0.55),
                 outline="",
             )
         elif UI_STYLE == "scifi":
@@ -12144,10 +12598,21 @@ class Win1App:
 
 
     def _build_menu(self):
-        menubar = tk.Menu(self.root, tearoff=0, font=self.menu_font)
-        self.root.configure(menu=menubar)
+        menubar = None
+        if not UI_VECTOR:
+            menubar = tk.Menu(self.root, tearoff=0, font=self.menu_font)
+            self.root.configure(menu=menubar)
+            host = menubar
+        else:
+            # 现代风格不挂系统菜单条：改由顶栏大按钮弹菜单
+            try:
+                self.root.configure(menu="")
+            except Exception:
+                pass
+            host = self.root
 
-        game_menu = tk.Menu(menubar, tearoff=0, font=self.menu_font)
+        self._top_menus = []
+        game_menu = tk.Menu(host, tearoff=0, font=self.menu_font)
         game_menu.add_command(
             label=tr("game.abort"), command=self.on_abort_task
         )
@@ -12223,9 +12688,9 @@ class Win1App:
             label=tr("game.refresh"), command=lambda: self.refresh_hot(True)
         )
         game_menu.add_command(label=tr("game.clear"), command=self.on_clear_selection)
-        menubar.add_cascade(label=tr("menu.game"), menu=game_menu)
+        self._register_top_menu("game", tr("menu.game"), game_menu, menubar)
 
-        account_menu = tk.Menu(menubar, tearoff=0, font=self.menu_font)
+        account_menu = tk.Menu(host, tearoff=0, font=self.menu_font)
         account_menu.add_command(
             label=tr("acc.device"), command=self.on_device_login
         )
@@ -12242,10 +12707,13 @@ class Win1App:
         account_menu.add_separator()
         account_menu.add_command(label=tr("acc.uuid"), command=self.on_copy_uuid)
         account_menu.add_command(label=tr("acc.logout"), command=self.on_logout)
-        menubar.add_cascade(label=tr("menu.account"), menu=account_menu)
+        self._register_top_menu("account", tr("menu.account"), account_menu, menubar)
 
-        tools_menu = tk.Menu(menubar, tearoff=0, font=self.menu_font)
+        tools_menu = tk.Menu(host, tearoff=0, font=self.menu_font)
         tools_menu.add_command(label=tr("tools.toolbox"), command=self.on_open_toolbox)
+        tools_menu.add_command(
+            label="计算器（CALC）", command=self.on_open_calculator
+        )
         links_menu = tk.Menu(tools_menu, tearoff=0, font=self.menu_font)
         for category, name, url, description in TOOLBOX_LINKS:
             links_menu.add_command(
@@ -12270,9 +12738,9 @@ class Win1App:
         tools_menu.add_command(label=tr("tools.game_dir"), command=self.on_open_game_dir)
         tools_menu.add_command(label=tr("tools.mods_dir"), command=self.on_open_mods_dir)
         tools_menu.add_command(label=tr("tools.logs"), command=self.on_open_logs)
-        menubar.add_cascade(label=tr("menu.tools"), menu=tools_menu)
+        self._register_top_menu("tools", tr("menu.tools"), tools_menu, menubar)
 
-        mini_menu = tk.Menu(menubar, tearoff=0, font=self.menu_font)
+        mini_menu = tk.Menu(host, tearoff=0, font=self.menu_font)
         mini_menu.add_command(label=tr("mini.snake"), command=self.on_open_snake)
         mini_menu.add_command(label="2048...", command=self.on_open_2048)
         mini_menu.add_command(label=tr("mini.mines"), command=self.on_open_minesweeper)
@@ -12294,9 +12762,9 @@ class Win1App:
         mini_menu.add_command(
             label=tr("mini.reset"), command=self.on_reset_game_bests
         )
-        menubar.add_cascade(label=tr("menu.minigame"), menu=mini_menu)
+        self._register_top_menu("mini", tr("menu.minigame"), mini_menu, menubar)
 
-        settings_menu = tk.Menu(menubar, tearoff=0, font=self.menu_font)
+        settings_menu = tk.Menu(host, tearoff=0, font=self.menu_font)
         settings_menu.add_command(
             label=tr("set.appearance"), command=self.on_open_settings
         )
@@ -12349,9 +12817,9 @@ class Win1App:
         settings_menu.add_command(
             label=tr("set.open_config"), command=self.on_open_config_file
         )
-        menubar.add_cascade(label=tr("menu.settings"), menu=settings_menu)
+        self._register_top_menu("settings", tr("menu.settings"), settings_menu, menubar)
 
-        about_menu = tk.Menu(menubar, tearoff=0, font=self.menu_font)
+        about_menu = tk.Menu(host, tearoff=0, font=self.menu_font)
         about_menu.add_command(label=tr("about.about"), command=self.on_about)
         about_menu.add_command(label=tr("about.diag"), command=self.on_diag)
         about_menu.add_command(label=tr("about.open"), command=self.on_open_base_dir)
@@ -12366,11 +12834,9 @@ class Win1App:
             command=self.on_install_dependency,
         )
         about_menu.add_command(label=tr("about.quit"), command=self.on_close)
-        menubar.add_cascade(label=tr("menu.about"), menu=about_menu)
-
+        self._register_top_menu("about", tr("menu.about"), about_menu, menubar)
 
         self._all_menus = [
-            menubar,
             game_menu,
             version_menu,
             loader_menu,
@@ -12383,11 +12849,21 @@ class Win1App:
             source_menu,
             about_menu,
         ]
+        if menubar is not None:
+            self._all_menus.insert(0, menubar)
+
+    def _register_top_menu(self, key, label, menu, menubar=None):
+        """Remember a top level menu (toolbar button) and add it to the bar."""
+        if not hasattr(self, "_top_menus"):
+            self._top_menus = []
+        self._top_menus.append((key, label, menu))
+        if menubar is not None:
+            menubar.add_cascade(label=label, menu=menu)
 
 
     def _build_left_panel(self, parent):
         panel = tk.Frame(parent, bg=C_WHITE, bd=1, relief="solid", padx=8, pady=8)
-        panel.grid(row=1, column=0, sticky="new", padx=(14, 6), pady=(10, 0))
+        panel.grid(row=2, column=0, sticky="new", padx=(14, 6), pady=(10, 0))
         panel.columnconfigure(0, weight=1)
         self.left_panel = panel
         self._build_glass_canvas(panel, "left")
@@ -15727,13 +16203,13 @@ class Win1App:
             relief="solid",
             cursor="hand2",
         )
-        hint.grid(row=1, column=0, sticky="sw", padx=(16, 6), pady=(0, 2))
+        hint.grid(row=2, column=0, sticky="sw", padx=(16, 6), pady=(0, 2))
         hint.bind("<Button-1>", lambda _event: self.on_open_settings())
         self.desktop_hint = hint
 
     def _build_right_panel(self, parent):
         panel = tk.Frame(parent, bg=C_WHITE, bd=1, relief="solid", padx=8, pady=8)
-        panel.grid(row=1, column=1, sticky="nsew", padx=(6, 14), pady=(10, 0))
+        panel.grid(row=2, column=1, sticky="nsew", padx=(6, 14), pady=(10, 0))
         panel.columnconfigure(0, weight=1)
         panel.rowconfigure(5, weight=1)
         self.right_panel = panel
@@ -19965,7 +20441,7 @@ class Win1App:
 
     def _refresh_hot_worker(self, manual=False):
         settings = self.config.get("modrinth") or {}
-        limit = int(settings.get("hot_limit") or 8)
+        limit = int(settings.get("hot_limit") or 48)
         index = str(settings.get("index") or "downloads")
         mc = self.shelf_mc_version()
         loader = self.shelf_loader()
@@ -21863,6 +22339,21 @@ class Win1App:
         )
         self.say("小游戏 // 俄罗斯方块已开启（空格硬降）")
         return self._tetris
+
+    def on_open_calculator(self):
+        """打开计算器窗口（跟随当前界面风格）。"""
+        win = self._calc_win
+        if win is not None:
+            try:
+                if win.win.winfo_exists():
+                    win.win.deiconify()
+                    win.win.lift()
+                    return win
+            except Exception:
+                pass
+        self._calc_win = CalculatorWindow(self.root)
+        self.say("工具 // 计算器已打开（数字键 / + - * / / Enter 都支持）")
+        return self._calc_win
 
     def _save_game_best(self, key, value):
         try:
@@ -24464,8 +24955,22 @@ class Win1App:
     def _rebuild_menu(self):
         try:
             self._build_menu()
+            self._rebuild_toolbar()
         except Exception:
             log_debug("rebuild menu failed:\n" + traceback.format_exc())
+
+    def _rebuild_toolbar(self):
+        """Rebuild the big top buttons after the menus were recreated."""
+        bar = getattr(self, "toolbar", None)
+        if bar is not None:
+            try:
+                bar.destroy()
+            except Exception:
+                pass
+        try:
+            self._build_toolbar()
+        except Exception:
+            log_debug("rebuild toolbar failed:\n" + traceback.format_exc())
 
     def on_change_download_source(self, value):
         value = str(value or "mirror").lower()
@@ -26730,7 +27235,7 @@ def run_selftest():
     try:
         hits = modrinth_search(
             "",
-            limit=int((config.get("modrinth") or {}).get("hot_limit") or 8),
+            limit=int((config.get("modrinth") or {}).get("hot_limit") or 48),
             index="downloads",
             mc_version=str(config.get("mc_version") or "1.21.1"),
             loader=str(config.get("loader") or "fabric"),
