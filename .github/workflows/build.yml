@@ -1,0 +1,142 @@
+name: build
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version label (default: read from win1_gui.py)"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller minecraft-launcher-lib
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          $version = "${{ github.event.inputs.version }}"
+          if (-not $version -and "${{ github.ref_type }}" -eq "tag") {
+            $version = "${{ github.ref_name }}".TrimStart("v")
+          }
+          if (-not $version) {
+            $m = Select-String -Path win1_gui.py -Pattern 'APP_VERSION\s*=\s*"([^"]+)"' |
+                 Select-Object -First 1
+            if ($m) { $version = $m.Matches[0].Groups[1].Value }
+          }
+          if (-not $version) { $version = "0.0" }
+          "value=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Regenerate donate payload
+        shell: pwsh
+        run: |
+          if (Test-Path donate.png) { python make_qr_payload.py } else { Write-Host "skip" }
+
+      - name: Build EXE
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed `
+            --name AKM_Launcher `
+            --icon "$PWD\akm_icon.ico" `
+            --add-data "$PWD\akm_icon.ico;." `
+            --distpath "." `
+            --workpath "_build" `
+            --specpath "_build" `
+            --collect-all minecraft-launcher-lib `
+            win1_gui.py
+          if (-not (Test-Path AKM_Launcher.exe)) { throw "build failed" }
+
+      - name: Sign EXE (optional)
+        shell: pwsh
+        env:
+          PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          PFX_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          if (-not $env:PFX_BASE64) {
+            Write-Host "no WINDOWS_CERT_PFX_BASE64 secret - skipping signing"
+            exit 0
+          }
+          $bytes = [Convert]::FromBase64String($env:PFX_BASE64)
+          [System.IO.File]::WriteAllBytes("$PWD\cert.pfx", $bytes)
+          powershell -ExecutionPolicy Bypass -File sign.ps1 `
+            -FilePath "$PWD\AKM_Launcher.exe" `
+            -PfxPath "$PWD\cert.pfx" `
+            -PfxPassword $env:PFX_PASSWORD
+          Remove-Item "$PWD\cert.pfx" -Force
+
+      - name: Frozen selftest
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath ".\AKM_Launcher.exe" -ArgumentList "--selftest" `
+               -WorkingDirectory "$PWD" -Wait -PassThru -WindowStyle Hidden
+          if ($p.ExitCode -ne 0) { throw "selftest failed: $($p.ExitCode)" }
+          Get-Content ".\logs\selftest.log"
+
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.value }}"
+          $folder = "release\AKM_Launcher_v$version"
+          New-Item -ItemType Directory -Force -Path $folder | Out-Null
+          Copy-Item "AKM_Launcher.exe" $folder
+          Copy-Item "README.md" $folder -ErrorAction SilentlyContinue
+          Copy-Item "RELEASE_NOTES.txt" $folder -ErrorAction SilentlyContinue
+          $exeOnlyHash = (Get-FileHash "$folder\AKM_Launcher.exe" -Algorithm SHA256).Hash
+          [System.IO.File]::WriteAllText("$PWD\$folder\AKM_Launcher.exe.sha256",
+            "$exeOnlyHash  AKM_Launcher.exe`r`n")
+          $zip = "release\AKM_Launcher_v$version.zip"
+          Compress-Archive -Path "$folder\*" -DestinationPath $zip
+          $exeHash = (Get-FileHash "$folder\AKM_Launcher.exe" -Algorithm SHA256).Hash
+          $zipHash = (Get-FileHash $zip -Algorithm SHA256).Hash
+          "AKM Launcher v$version - SHA256`r`nAKM_Launcher.exe : $exeHash`r`n$([System.IO.Path]::GetFileName($zip)) : $zipHash`r`n" |
+            Out-File -FilePath "release\SHA256.txt" -Encoding utf8
+          "zip=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "exe_hash=$exeHash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "zip_hash=$zipHash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AKM_Launcher_v${{ steps.version.outputs.value }}
+          path: |
+            release\AKM_Launcher_v${{ steps.version.outputs.value }}.zip
+            release\SHA256.txt
+
+      - name: Publish release
+        if: ${{ github.ref_type == 'tag' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          name: AKM Launcher v${{ steps.version.outputs.value }}
+          body: |
+            AKM Launcher v${{ steps.version.outputs.value }}
+
+            SHA256 (exe): `${{ steps.package.outputs.exe_hash }}`
+            SHA256 (zip): `${{ steps.package.outputs.zip_hash }}`
+
+            EXE 未做代码签名，首次运行若被 SmartScreen 拦截请选择「仍要运行」。
+          files: |
+            release/AKM_Launcher_v${{ steps.version.outputs.value }}.zip
+            release/SHA256.txt

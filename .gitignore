@@ -1,0 +1,61 @@
+# --- 运行期 / 私有数据（绝对不要提交）-------------------------------
+config.json
+auth.json
+launcher.cfg
+launch_log.txt
+installer.log
+logs/
+icons/
+.minecraft/
+_update_download.tmp
+AKM_Launcher.new.exe
+_apply_update.bat
+
+# 补给站收款码（作者私有）
+donate.png
+qr_payload.py
+tubiao.png
+
+# --- 构建产物 ------------------------------------------------------------
+AKM_Launcher.exe
+AKM_Launcher.spec
+build/
+dist/
+_build/
+__pycache__/
+*.pyc
+*.pyo
+
+# --- 本地发布输出 --------------------------------------------------------
+release/
+
+# --- 临时 / 调试文件 -----------------------------------------------------
+_*.txt
+_*.py
+_*.ps1
+!build.ps1
+!sign.ps1
+_*.bat
+_*.png
+_*.jpg
+_*.log
+_*.bak
+_empty/
+_public/
+_updtest/
+_reltest*/
+_ziptest/
+_pubtest/
+_zipverify/
+_contenttest*/
+_contentpipe/
+_contenttest2*/
+
+# --- 证书 / 密钥 ---------------------------------------------------------
+*.pfx
+*.p12
+*.pem
+*.key
+*.jks
+secrets.json
+.env

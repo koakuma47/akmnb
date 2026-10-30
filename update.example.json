@@ -1,0 +1,7 @@
+{
+  "version": "B0.5",
+  "url": "https://raw.githubusercontent.com/<user>/<repo>/main/release/AKM_Launcher_B0.5.zip",
+  "sha256": "BFC0506B91A9ACD70E4AE47478D4BBC1123B01506C089EBFD48795745DD000C2",
+  "page": "https://github.com/<user>/<repo>/releases",
+  "notes": "B0.5: 新增矢量风界面（圆角卡片 + 无边框按钮 + 圆角 hero 条 + 三套配色），设置里可热切换，随时切回 1985 复古"
+}

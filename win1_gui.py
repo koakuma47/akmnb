@@ -1,0 +1,25951 @@
+# -*- coding: utf-8 -*-
+"""
+AKM (Adaptive Kinetic Minecraft) Launcher
+=========================================
+A single-player Minecraft launcher that faithfully mimics the 1985 Windows 1.0
+industrial look: white / light-grey surfaces, 1px black solid borders, EGA teal
+selection bars, Courier New bitmap-ish monospace type and mechanical inverted
+hover feedback.
+
+Design constraints honoured by this file:
+  * GUI: Python standard library ``tkinter`` only (no PyQt / PySide / webview).
+  * Network: ``urllib.request`` inside worker threads, never on the Tk thread.
+  * Downloads: ``concurrent.futures.ThreadPoolExecutor`` (parallel, non-blocking).
+  * Launching: ``minecraft-launcher-lib`` (optional dependency, installed from
+    the in-app [关于] menu). Missing dependency degrades gracefully.
+  * Persistence: ``config.json`` / ``auth.json`` / ``mod_alias.json`` next to
+    this script; everything is created automatically on first start.
+
+Command line:
+    python win1_gui.py              # start the window
+    python win1_gui.py --selftest   # initialise files, run diagnostics, no GUI
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import ctypes
+import hashlib
+import http.client
+import json
+import glob
+import os
+import platform
+import queue
+import random
+import re
+import shutil
+import ssl
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+import webbrowser
+import zipfile
+import zlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
+try:
+    import tomllib  # python 3.11+ // used for Forge mods.toml
+except Exception:  # noqa: BLE001
+    tomllib = None
+
+try:
+    import tkinter as tk
+    from tkinter import colorchooser
+    from tkinter import filedialog
+    from tkinter import font as tkfont
+    from tkinter import messagebox
+    from tkinter import simpledialog
+except Exception:  # pragma: no cover - tkinter always ships with CPython on Windows
+    tk = None
+    colorchooser = None
+    filedialog = None
+    tkfont = None
+    messagebox = None
+    simpledialog = None
+
+# ---------------------------------------------------------------------------
+# 0. Identity constants
+# ---------------------------------------------------------------------------
+
+APP_NAME = "AKM Launcher"
+APP_VERSION = "B0.5"
+
+# ---------------------------------------------------------------------------
+# Internationalisation (zh / en / ja / ru / ar)
+# ---------------------------------------------------------------------------
+LANGUAGE_CHOICES = [
+    ("zh", "简体中文"),
+    ("en", "English"),
+    ("ja", "日本語"),
+    ("ru", "Русский"),
+    ("ar", "العربية"),
+]
+LANGUAGE_ORDER = [code for code, _label in LANGUAGE_CHOICES]
+_LANG_INDEX = {code: index for index, (code, _label) in enumerate(LANGUAGE_CHOICES)}
+_CURRENT_LANGUAGE = "zh"
+
+_UI_TEXT = {
+    # -- menubar ----------------------------------------------------------
+    "menu.game": ("游戏", "Game", "ゲーム", "Игра", "اللعبة"),
+    "menu.account": ("账号", "Account", "アカウント", "Аккаунт", "الحساب"),
+    "menu.tools": ("工具", "Tools", "ツール", "Инструменты", "الأدوات"),
+    "menu.minigame": ("小游戏", "Mini games", "ミニゲーム", "Мини-игры", "ألعاب مصغرة"),
+    "menu.settings": ("设置", "Settings", "設定", "Настройки", "الإعدادات"),
+    "menu.about": ("关于", "About", "情報", "О программе", "حول"),
+    "game.abort": (
+        "终止当前任务（下载 / 启动）...",
+        "Abort current task (download / launch)...",
+        "現在のタスクを中止（ダウンロード / 起動）...",
+        "Прервать текущую задачу (загрузка / запуск)...",
+        "إيقاف المهمة الحالية (تنزيل / تشغيل)...",
+    ),
+    "game.detail": (
+        "下载详情窗口（看正在下什么）...",
+        "Download details window...",
+        "ダウンロード詳細ウィンドウ...",
+        "Окно подробностей загрузки...",
+        "نافذة تفاصيل التنزيل...",
+    ),
+    "game.install": (
+        "下载 / 安装游戏（原版 + 加载器）...",
+        "Download / install game (vanilla + loader)...",
+        "ゲームをダウンロード / インストール（バニラ + ローダー）...",
+        "Скачать / установить игру (ванилла + загрузчик)...",
+        "تنزيل / تثبيت اللعبة (الأصلية + المحمّل)...",
+    ),
+    "game.loader_adv": (
+        "单独安装模组加载器（高级）...",
+        "Install mod loader only (advanced)...",
+        "モッドローダーのみインストール（上級）...",
+        "Установить только загрузчик (дополнительно)...",
+        "تثبيت محمّل المودات فقط (متقدم)...",
+    ),
+    "game.java": (
+        "Java 运行时管理...",
+        "Java runtime manager...",
+        "Java ランタイム管理...",
+        "Управление Java...",
+        "إدارة Java...",
+    ),
+    "game.import": (
+        "导入整合包...",
+        "Import modpack...",
+        "MODパックをインポート...",
+        "Импорт сборки...",
+        "استيراد حزمة مودات...",
+    ),
+    "game.instances": (
+        "实例管理（卡片墙）...",
+        "Instances (card wall)...",
+        "インスタンス管理...",
+        "Экземпляры...",
+        "إدارة النسخ...",
+    ),
+    "game.mod_update": (
+        "模组更新检测...",
+        "Check mod updates...",
+        "MOD更新チェック...",
+        "Проверить обновления модов...",
+        "فحص تحديثات المودات...",
+    ),
+    "game.version": ("游戏版本", "Game version", "ゲームバージョン", "Версия игры", "إصدار اللعبة"),
+    "game.loader": ("模组加载器", "Mod loader", "モッドローダー", "Загрузчик модов", "محمّل المودات"),
+    "game.media": ("光影 / 材质", "Shaders / packs", "シェーダー / パック", "Шейдеры / паки", "الشيدرز والحزم"),
+    "game.shader": (
+        "光影下载...",
+        "Download shaders...",
+        "シェーダーをダウンロード...",
+        "Скачать шейдеры...",
+        "تنزيل الشيدرز...",
+    ),
+    "game.pack": (
+        "材质包下载...",
+        "Download resource packs...",
+        "リソースパックをダウンロード...",
+        "Скачать ресурспаки...",
+        "تنزيل حزم الموارد...",
+    ),
+    "game.open_shaderpacks": (
+        "打开 shaderpacks 目录",
+        "Open shaderpacks folder",
+        "シェーダーフォルダを開く",
+        "Открыть папку shaderpacks",
+        "فتح مجلد shaderpacks",
+    ),
+    "game.open_resourcepacks": (
+        "打开 resourcepacks 目录",
+        "Open resourcepacks folder",
+        "リソースパックフォルダを開く",
+        "Открыть папку resourcepacks",
+        "فتح مجلد resourcepacks",
+    ),
+    "game.refresh": (
+        "刷新热门战备榜",
+        "Refresh popular mods",
+        "人気MODを更新",
+        "Обновить популярные моды",
+        "تحديث المودات الشائعة",
+    ),
+    "game.clear": ("清空列表选择", "Clear selection", "選択を解除", "Снять выделение", "إلغاء التحديد"),
+    # -- account menu ------------------------------------------------------
+    "acc.device": (
+        "微软设备代码登录（推荐）",
+        "Microsoft device-code login (recommended)",
+        "Microsoft デバイスコードでログイン（推奨）",
+        "Вход Microsoft по коду (рекомендуется)",
+        "تسجيل الدخول برمز Microsoft (موصى به)",
+    ),
+    "acc.saved": ("已记住账号...", "Saved accounts...", "保存済みアカウント...", "Сохранённые аккаунты...", "الحسابات المحفوظة..."),
+    "acc.browser": (
+        "浏览器联动登录（备用）",
+        "Browser login (fallback)",
+        "ブラウザでログイン（予備）",
+        "Вход через браузер (резерв)",
+        "تسجيل الدخول عبر المتصفح (بديل)",
+    ),
+    "acc.refresh": (
+        "静默刷新正版令牌",
+        "Refresh token silently",
+        "トークンを静かに更新",
+        "Обновить токен",
+        "تحديث الرمز بهدوء",
+    ),
+    "acc.offline": (
+        "切换离线模式",
+        "Switch to offline mode",
+        "オフラインモードに切り替え",
+        "Перейти в офлайн-режим",
+        "التبديل إلى وضع عدم الاتصال",
+    ),
+    "acc.uuid": ("复制角色 UUID", "Copy player UUID", "UUID をコピー", "Скопировать UUID", "نسخ معرّف اللاعب"),
+    "acc.logout": ("清除本地授权", "Clear local credentials", "ローカル認証を削除", "Очистить локальные данные", "مسح بيانات الدخول"),
+    # -- tools menu --------------------------------------------------------
+    "tools.toolbox": ("打开工具箱页面...", "Open toolbox...", "ツールボックスを開く...", "Открыть инструменты...", "فتح صندوق الأدوات..."),
+    "tools.links": ("常用网站", "Useful sites", "よく使うサイト", "Полезные сайты", "مواقع مفيدة"),
+    "tools.online": (
+        "联机教程（虚拟局域网）...",
+        "Multiplayer guide...",
+        "マルチプレイガイド...",
+        "Гайд по сетевой игре...",
+        "دليل اللعب الجماعي...",
+    ),
+    "tools.ip": ("复制本机 IP 地址", "Copy local IP", "ローカル IP をコピー", "Скопировать IP", "نسخ عنوان IP"),
+    "tools.saves": ("存档管理（备份 / 打开）...", "Worlds (backup / open)...", "ワールド管理...", "Миры (резерв / открыть)...", "إدارة العوالم..."),
+    "tools.crash": ("崩溃报告分析...", "Crash report analysis...", "クラッシュ解析...", "Анализ краша...", "تحليل تقرير الأعطال"),
+    "tools.game_dir": ("打开 Minecraft 目录", "Open Minecraft folder", "Minecraft フォルダを開く", "Открыть папку Minecraft", "فتح مجلد Minecraft"),
+    "tools.mods_dir": ("打开 mods 目录", "Open mods folder", "mods フォルダを開く", "Открыть папку mods", "فتح مجلد mods"),
+    "tools.logs": ("打开日志目录", "Open logs folder", "ログフォルダを開く", "Открыть папку логов", "فتح مجلد السجلات"),
+    # -- mini games --------------------------------------------------------
+    "mini.snake": ("经典贪吃蛇...", "Classic Snake...", "クラシック・スネーク...", "Классическая змейка...", "الثعبان الكلاسيكي..."),
+    "mini.mines": ("扫雷...", "Minesweeper...", "マインスイーパー...", "Сапёр...", "كانسة الألغام..."),
+    "mini.tetris": ("俄罗斯方块...", "Tetris...", "テトリス...", "Тетрис...", "تتريس..."),
+    "mini.info": (
+        "最高分 / 玩法...",
+        "High scores / how to play...",
+        "最高スコア / 遊び方...",
+        "Рекорды / правила...",
+        "أفضل النتائج / طريقة اللعب...",
+    ),
+    "mini.toggle": (
+        "下载 / 启动时提示小游戏",
+        "Offer mini games while downloading or launching",
+        "ダウンロード・起動時にミニゲームを提案",
+        "Предлагать мини-игры при загрузке",
+        "اقتراح ألعاب مصغرة أثناء التنزيل",
+    ),
+    "mini.close": ("关闭提示窗口", "Close prompt window", "プロンプトを閉じる", "Закрыть окно", "إغلاق النافذة"),
+    "mini.reset": ("重置最高分", "Reset high scores", "最高スコアをリセット", "Сбросить рекорды", "إعادة تعيين أفضل النتائج"),
+    # -- settings menu -----------------------------------------------------
+    "set.appearance": (
+        "外观 / 背景 / 内存...",
+        "Appearance / wallpaper / memory...",
+        "外観 / 背景 / メモリ...",
+        "Оформление / фон / память...",
+        "المظهر / الخلفية / الذاكرة...",
+    ),
+    "set.wallpaper": ("导入背景图片...", "Import wallpaper...", "背景画像をインポート...", "Импорт фона...", "استيراد خلفية..."),
+    "set.clear_wallpaper": ("清除背景图片", "Remove wallpaper", "背景画像を削除", "Удалить фон", "إزالة الخلفية"),
+    "set.source": ("下载源", "Download source", "ダウンロード元", "Источник загрузки", "مصدر التنزيل"),
+    "set.language": ("语言", "Language", "言語", "Язык", "اللغة"),
+    "set.reset_theme": ("恢复默认主题", "Reset theme", "テーマを初期化", "Сбросить тему", "إعادة تعيين السمة"),
+    "set.update": ("检查更新...", "Check for updates...", "アップデートを確認...", "Проверить обновления...", "البحث عن تحديثات..."),
+    "set.update_settings": (
+        "自动更新设置...",
+        "Auto-update settings...",
+        "自動更新の設定...",
+        "Настройки автообновления...",
+        "إعدادات التحديث التلقائي...",
+    ),
+    "set.reload": ("重新读取配置文件", "Reload config", "設定を再読み込み", "Перечитать конфиг", "إعادة تحميل الإعدادات"),
+    "set.open_config": ("打开 config.json", "Open config.json", "config.json を開く", "Открыть config.json", "فتح config.json"),
+    # -- about menu --------------------------------------------------------
+    "about.about": ("关于 AKM Launcher", "About AKM Launcher", "AKM Launcher について", "О AKM Launcher", "حول AKM Launcher"),
+    "about.diag": ("运行环境自检", "Run diagnostics", "動作環境チェック", "Диагностика", "فحص البيئة"),
+    "about.open": ("打开程序目录", "Open program folder", "プログラムフォルダを開く", "Открыть папку программы", "فتح مجلد البرنامج"),
+    "about.donate": ("补给赞助（收款码）...", "Support this project...", "支援（寄付）...", "Поддержать проект...", "دعم المشروع..."),
+    "about.afdian": ("打开爱发电主页", "Open Afdian page", "愛発電ページを開く", "Открыть Afdian", "فتح صفحة Afdian"),
+    "about.dep": (
+        "安装 / 更新 minecraft-launcher-lib",
+        "Install / update minecraft-launcher-lib",
+        "minecraft-launcher-lib を導入・更新",
+        "Установить / обновить minecraft-launcher-lib",
+        "تثبيت / تحديث minecraft-launcher-lib",
+    ),
+    "about.quit": ("退出 AKM", "Quit AKM", "AKM を終了", "Выйти из AKM", "الخروج من AKM"),
+    # -- main window -------------------------------------------------------
+    "ui.control": ("启动控制", "Launch control", "起動コントロール", "Управление запуском", "لوحة التحكم"),
+    "ui.offline": ("本地访客", "Local guest", "ローカルゲスト", "Локальный гость", "زائر محلي"),
+    "ui.login": ("[ 微软登录 ]", "[ Microsoft ]", "[ ログイン ]", "[ Вход ]", "[ دخول ]"),
+    "ui.refresh": ("[ 刷新 ]", "[ Refresh ]", "[ 更新 ]", "[ Обновить ]", "[ تحديث ]"),
+    "ui.browse": ("[ 浏览 ]", "[ Browse ]", "[ 参照 ]", "[ Обзор ]", "[ استعراض ]"),
+    "ui.isolation": ("版本隔离", "Version isolation", "バージョン分離", "Изоляция версий", "عزل الإصدارات"),
+    "ui.logout": ("[ 注销/离线 ]", "[ Sign out ]", "[ ログアウト ]", "[ Выйти ]", "[ خروج ]"),
+    "ui.sponsor": ("[ 赞助 ]", "[ Support ]", "[ 支援 ]", "[ Поддержать ]", "[ دعم ]"),
+    "ui.install_btn": ("[ 下载 / 安装 ]", "[ Download ]", "[ インストール ]", "[ Установить ]", "[ تثبيت ]"),
+    "ui.loader_btn": ("[ 模组加载器 ]", "[ Mod loader ]", "[ ローダー ]", "[ Загрузчик ]", "[ المحمّل ]"),
+    "ui.ignite": ("[  点火起飞  ]", "[  IGNITE  ]", "[  起動する  ]", "[  ЗАПУСК  ]", "[  تشغيل  ]"),
+    # -- installer dialog --------------------------------------------------
+    "inst.title": (
+        "下载并安装游戏（原版 + 模组加载器）",
+        "Download and install the game (vanilla + mod loader)",
+        "ゲームをダウンロードしてインストール（バニラ + モッドローダー）",
+        "Скачать и установить игру (ванилла + загрузчик)",
+        "تنزيل وتثبيت اللعبة (الأصلية + محمّل المودات)",
+    ),
+    "inst.source": ("下载源", "Download source", "ダウンロード元", "Источник загрузки", "مصدر التنزيل"),
+    "inst.target": (
+        "版本号（可直接输入）",
+        "Version (type or pick)",
+        "バージョン（直接入力可）",
+        "Версия (можно ввести)",
+        "الإصدار (اكتب أو اختر)",
+    ),
+    "inst.content": (
+        "安装内容（原版 + 加载器一次装完，不用下两次）",
+        "What to install (vanilla + loader in one go)",
+        "インストール内容（バニラ + ローダーを一度に）",
+        "Что установить (ванилла + загрузчик сразу)",
+        "ما الذي تثبته (الأصلية + المحمّل دفعة واحدة)",
+    ),
+    "inst.only_vanilla": ("仅原版", "Vanilla only", "バニラのみ", "Только ванилла", "الأصلية فقط"),
+    "inst.loader_none": (
+        "只安装原版，不会安装任何加载器",
+        "Vanilla only, no mod loader",
+        "バニラのみ、ローダーなし",
+        "Только ванилла, без загрузчика",
+        "الأصلية فقط بدون محمّل",
+    ),
+    "inst.refresh": ("[ 刷新清单 ]", "[ Refresh list ]", "[ リスト更新 ]", "[ Обновить ]", "[ تحديث القائمة ]"),
+    "inst.start": ("[ 开始安装 ]", "[ Install ]", "[ インストール ]", "[ Установить ]", "[ تثبيت ]"),
+    "inst.cancel": ("[ 取消下载 ]", "[ Cancel ]", "[ 中止 ]", "[ Отмена ]", "[ إلغاء ]"),
+    "inst.close": ("[ 关闭 ]", "[ Close ]", "[ 閉じる ]", "[ Закрыть ]", "[ إغلاق ]"),
+    "inst.detail": ("[ 下载详情 ]", "[ Details ]", "[ 詳細 ]", "[ Подробности ]", "[ التفاصيل ]"),
+    # -- download detail ---------------------------------------------------
+    "dl.title": ("下载详情", "Download details", "ダウンロード詳細", "Подробности загрузки", "تفاصيل التنزيل"),
+    "dl.copy": ("[ 复制清单 ]", "[ Copy list ]", "[ コピー ]", "[ Копировать ]", "[ نسخ القائمة ]"),
+}
+
+
+def shape_arabic(text):
+    """Shape Arabic letters and reorder them for an LTR renderer (Tk)."""
+    text = str(text or "")
+    if not any(_is_arabic_char(char) for char in text):
+        return text
+
+    chars = list(text)
+    shaped = []
+    index = 0
+    total = len(chars)
+    while index < total:
+        char = chars[index]
+        forms = _ARABIC_FORMS.get(char)
+        if forms is None:
+            shaped.append(char)
+            index += 1
+            continue
+        previous = chars[index - 1] if index > 0 else ""
+        following = chars[index + 1] if index + 1 < total else ""
+        prev_join = bool(previous) and _joins_previous(previous)
+        next_join = bool(following) and _joins_next(following)
+
+        if char == "\u0644" and following in _LAM_ALEF:
+            isolated, final = _LAM_ALEF[following]
+            shaped.append(final if prev_join else isolated)
+            index += 2
+            continue
+
+        if len(forms) == 4:
+            if prev_join and next_join:
+                shaped.append(forms[3])
+            elif prev_join:
+                shaped.append(forms[1])
+            elif next_join:
+                shaped.append(forms[2])
+            else:
+                shaped.append(forms[0])
+        elif len(forms) == 2:
+            shaped.append(forms[1] if prev_join else forms[0])
+        else:
+            shaped.append(forms[0])
+        index += 1
+
+    return _visual_order("".join(shaped))
+
+
+def _is_ltr_char(char):
+    code = ord(char)
+    return (
+        0x20 <= code <= 0x7E
+        or char in "\u2010\u2013\u2014"
+        or "\u00a0" <= char <= "\u00bf"
+    )
+
+
+def _visual_order(text):
+    """Reverse an Arabic run for LTR renderers while keeping Latin runs intact."""
+    chars = list(text)
+    total = len(chars)
+    runs = []
+    index = 0
+    while index < total:
+        if _is_ltr_char(chars[index]):
+            start = index
+            while index < total and _is_ltr_char(chars[index]):
+                index += 1
+            runs.append((start, index))
+        else:
+            index += 1
+    ordered = chars[::-1]
+    for start, end in runs:
+        length = end - start
+        new_start = total - end
+        ordered[new_start:new_start + length] = ordered[
+            new_start:new_start + length
+        ][::-1]
+    return "".join(ordered).translate(_ARABIC_MIRROR)
+
+
+def _exe_lang_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.join(os.path.dirname(sys.executable), "lang")
+    return os.path.join(BASE_DIR, "lang")
+
+
+def _bundled_lang_dir():
+    bundled = getattr(sys, "_MEIPASS", "")
+    return os.path.join(bundled, "lang") if bundled else ""
+
+
+def lang_pack_dir():
+    """Folder holding the editable language packs (next to the exe first)."""
+    for path in (_exe_lang_dir(), _bundled_lang_dir()):
+        if path and os.path.isdir(path) and glob.glob(os.path.join(path, "*.json")):
+            return path
+    return _exe_lang_dir()
+
+
+def ensure_lang_dir():
+    """Copy the bundled packs next to the exe so users can edit them."""
+    target = _exe_lang_dir()
+    if glob.glob(os.path.join(target, "*.json")):
+        return target
+    bundled = _bundled_lang_dir()
+    if not bundled or not os.path.isdir(bundled):
+        return target
+    try:
+        ensure_dir(target)
+        for name in glob.glob(os.path.join(bundled, "*.json")):
+            shutil.copy2(name, os.path.join(target, os.path.basename(name)))
+        return target
+    except Exception:
+        log_debug("copy language packs failed:\n" + traceback.format_exc())
+        return bundled
+
+
+def load_language_packs(force=False):
+    """Read lang/*.json into memory; safe to call repeatedly."""
+    if _LANG_STATE["loaded"] and not force:
+        return dict(_LANG_PACKS)
+    packs = {}
+    errors = []
+    folder = ensure_lang_dir()
+    for path in sorted(glob.glob(os.path.join(folder, "*.json"))):
+        if ".template." in os.path.basename(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            code = str(data.get("code") or os.path.splitext(os.path.basename(path))[0])
+            packs[code.lower()] = data
+        except Exception as exc:
+            errors.append("{0}: {1}".format(os.path.basename(path), exc))
+    _LANG_STATE["dir"] = folder
+    _LANG_STATE["loaded"] = len(packs)
+    _LANG_STATE["errors"] = errors
+    _LANG_PACKS.clear()
+    _LANG_PACKS.update(packs)
+    return dict(packs)
+
+
+def language_pack_info():
+    return dict(_LANG_STATE)
+
+
+def set_language_phrases(code):
+    """Prepare the phrase table + placeholder templates for one language."""
+    global _LANG_PHRASES, _LANG_TEMPLATES
+    pack = _LANG_PACKS.get(code) or {}
+    phrases = pack.get("phrases") or {}
+    _LANG_PHRASES = {
+        str(key): str(value) for key, value in phrases.items() if value
+    }
+    templates = []
+    for key, value in _LANG_PHRASES.items():
+        if "{" not in key:
+            continue
+        slot_names = re.findall(r"\{(\d+)\}", key)
+        if not slot_names:
+            continue
+        pattern = re.escape(key)
+        for slot in sorted(set(slot_names), key=int):
+            pattern = pattern.replace(
+                r"\{" + slot + r"\}", "(?P<g" + slot + r">.+?)"
+            )
+        try:
+            templates.append((re.compile("^" + pattern + "$"), value))
+        except re.error:
+            continue
+    templates.sort(key=lambda item: -len(item[0].pattern))
+    _LANG_TEMPLATES = templates
+    return len(_LANG_PHRASES)
+
+
+def translate_ui(text):
+    """Translate any UI caption: zh strips English prefixes, others use packs."""
+    if not isinstance(text, str) or not text:
+        return text
+    if _CURRENT_LANGUAGE == "zh":
+        return title_text(text)
+    table = _LANG_PHRASES
+    if not table:
+        return text
+    if text in table:
+        return table[text]
+    stripped = text.strip()
+    if stripped in table:
+        return table[stripped]
+    # Bilingual captions ("JAVA RUNTIME // 内置 Java"): translate each half.
+    if " // " in stripped:
+        left, right = stripped.split(" // ", 1)
+        left_tr = table.get(left.strip(), "")
+        right_tr = table.get(right.strip(), "")
+        if left_tr or right_tr:
+            return "{0} // {1}".format(left_tr or left.strip(), right_tr or right.strip())
+    # Tolerate ellipsis / trailing punctuation differences.
+    variants = [
+        stripped.rstrip(".．。：:!！"),
+        stripped.replace("...", "\u2026"),
+        stripped.replace("\u2026", "..."),
+    ]
+    for variant in variants:
+        candidate = variant.strip()
+        if candidate and candidate in table:
+            return table[candidate]
+    for pattern, value in _LANG_TEMPLATES:
+        match = pattern.match(stripped)
+        if not match:
+            continue
+        groups = match.groupdict()
+        try:
+            return value.format(
+                *[groups.get("g{0}".format(slot), "") for slot in range(0, 10)]
+            )
+        except Exception:
+            return value
+    return text
+
+
+def ui_text(text):
+    """Full pipeline used by the Tk hooks: translate, then shape for Arabic."""
+    result = translate_ui(text)
+    if _CURRENT_LANGUAGE == "ar":
+        return shape_arabic(result)
+    return result
+
+
+def set_language(code):
+    """Activate one UI language; unknown codes fall back to Chinese."""
+    global _CURRENT_LANGUAGE
+    code = str(code or "").strip().lower()
+    if code not in _LANG_INDEX:
+        code = "zh"
+    _CURRENT_LANGUAGE = code
+    try:
+        load_language_packs()
+        set_language_phrases(code)
+    except Exception:
+        log_debug("language pack load failed:\n" + traceback.format_exc())
+    return code
+
+
+def current_language():
+    return _CURRENT_LANGUAGE
+
+
+def language_label(code):
+    code = str(code or "").strip().lower()
+    for item, label in LANGUAGE_CHOICES:
+        if item == code:
+            return label
+    return LANGUAGE_CHOICES[0][1]
+
+
+def tr(key, **kwargs):
+    """Translate one UI key for the active language (falls back to Chinese)."""
+    row = _UI_TEXT.get(key)
+    pack = _LANG_PACKS.get(_CURRENT_LANGUAGE) or {}
+    packed = (pack.get("strings") or {}).get(key)
+    text = ""
+    if packed:
+        text = str(packed)
+    elif row:
+        index = _LANG_INDEX.get(_CURRENT_LANGUAGE, 0)
+        text = row[index] if 0 <= index < len(row) and row[index] else row[0]
+    if not text:
+        return str(key)
+    if kwargs:
+        try:
+            text = text.format(**kwargs)
+        except Exception:
+            pass
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Language packs (lang/*.json), runtime translation and Arabic shaping
+# ---------------------------------------------------------------------------
+_LANG_PACKS = {}
+_LANG_PHRASES = {}
+_LANG_TEMPLATES = []
+_LANG_STATE = {"dir": "", "loaded": 0, "errors": []}
+
+# Arabic contextual forms: base letter -> (isolated, final, initial, medial)
+_ARABIC_FORMS = {
+    "\u0621": ("\ufe80",),
+    "\u0622": ("\ufe81", "\ufe82"),
+    "\u0623": ("\ufe83", "\ufe84"),
+    "\u0624": ("\ufe85", "\ufe86"),
+    "\u0625": ("\ufe87", "\ufe88"),
+    "\u0626": ("\ufe89", "\ufe8a", "\ufe8b", "\ufe8c"),
+    "\u0627": ("\ufe8d", "\ufe8e"),
+    "\u0628": ("\ufe8f", "\ufe90", "\ufe91", "\ufe92"),
+    "\u0629": ("\ufe93", "\ufe94"),
+    "\u062a": ("\ufe95", "\ufe96", "\ufe97", "\ufe98"),
+    "\u062b": ("\ufe99", "\ufe9a", "\ufe9b", "\ufe9c"),
+    "\u062c": ("\ufe9d", "\ufe9e", "\ufe9f", "\ufea0"),
+    "\u062d": ("\ufea1", "\ufea2", "\ufea3", "\ufea4"),
+    "\u062e": ("\ufea5", "\ufea6", "\ufea7", "\ufea8"),
+    "\u062f": ("\ufea9", "\ufeaa"),
+    "\u0630": ("\ufeab", "\ufeac"),
+    "\u0631": ("\ufead", "\ufeae"),
+    "\u0632": ("\ufeaf", "\ufeb0"),
+    "\u0633": ("\ufeb1", "\ufeb2", "\ufeb3", "\ufeb4"),
+    "\u0634": ("\ufeb5", "\ufeb6", "\ufeb7", "\ufeb8"),
+    "\u0635": ("\ufeb9", "\ufeba", "\ufebb", "\ufebc"),
+    "\u0636": ("\ufebd", "\ufebe", "\ufebf", "\ufec0"),
+    "\u0637": ("\ufec1", "\ufec2", "\ufec3", "\ufec4"),
+    "\u0638": ("\ufec5", "\ufec6", "\ufec7", "\ufec8"),
+    "\u0639": ("\ufec9", "\ufeca", "\ufecb", "\ufecc"),
+    "\u063a": ("\ufecd", "\ufece", "\ufecf", "\ufed0"),
+    "\u0641": ("\ufed1", "\ufed2", "\ufed3", "\ufed4"),
+    "\u0642": ("\ufed5", "\ufed6", "\ufed7", "\ufed8"),
+    "\u0643": ("\ufed9", "\ufeda", "\ufedb", "\ufedc"),
+    "\u0644": ("\ufedd", "\ufede", "\ufedf", "\ufee0"),
+    "\u0645": ("\ufee1", "\ufee2", "\ufee3", "\ufee4"),
+    "\u0646": ("\ufee5", "\ufee6", "\ufee7", "\ufee8"),
+    "\u0647": ("\ufee9", "\ufeea", "\ufeeb", "\ufeec"),
+    "\u0648": ("\ufeed", "\ufeee"),
+    "\u0649": ("\ufeef", "\ufef0"),
+    "\u064a": ("\ufef1", "\ufef2", "\ufef3", "\ufef4"),
+}
+_LAM_ALEF = {
+    "\u0622": ("\ufef5", "\ufef6"),
+    "\u0623": ("\ufef7", "\ufef8"),
+    "\u0625": ("\ufef9", "\ufefa"),
+    "\u0627": ("\ufefb", "\ufefc"),
+}
+_ARABIC_MIRROR = {
+    ord("("): ")",
+    ord(")"): "(",
+    ord("["): "]",
+    ord("]"): "[",
+    ord("{"): "}",
+    ord("}"): "{",
+    ord("<"): ">",
+    ord(">"): "<",
+    ord("\u00ab"): "\u00bb",
+    ord("\u00bb"): "\u00ab",
+}
+
+
+def _is_arabic_char(char):
+    return "\u0600" <= char <= "\u06ff" or "\ufb50" <= char <= "\ufeff"
+
+
+def _joins_previous(char):
+    """Letter that can connect to the following character (dual joining)."""
+    forms = _ARABIC_FORMS.get(char)
+    return bool(forms) and len(forms) == 4
+
+
+def _joins_next(char):
+    """Letter that can connect to the previous character."""
+    return bool(_ARABIC_FORMS.get(char)) and char != "\u0621"
+
+
+def title_text(text):
+    """Drop a leading `ENGLISH // ` prefix while the UI is Chinese.
+
+    Chinese mode shows Chinese only, e.g. `JAVA RUNTIME // 内置 Java` becomes
+    `内置 Java`; every other language keeps the original bilingual caption.
+    """
+    text = str(text or "")
+    if _CURRENT_LANGUAGE != "zh" or " // " not in text:
+        return text
+    left, right = text.split(" // ", 1)
+    if not left.strip() or not right.strip():
+        return text
+    if all(ord(char) < 128 for char in left):
+        return right
+    return text
+
+
+def install_ui_translation():
+    """Route every Tk caption through translate_ui/ui_text.
+
+    Called once after tkinter is available. Patching the widget constructors
+    (instead of 1200 call sites) means every existing and future dialog is
+    translated automatically, including message boxes.
+    """
+    if getattr(install_ui_translation, "_done", False) or tk is None:
+        return
+    install_ui_translation._done = True
+
+    def wrap_widget(cls, keys):
+        original = cls.__init__
+
+        def patched(self, master=None, cnf=None, **kw):
+            for key in keys:
+                value = kw.get(key)
+                if isinstance(value, str):
+                    kw[key] = ui_text(value)
+            if cnf is None:
+                return original(self, master, **kw)
+            return original(self, master, cnf, **kw)
+
+        patched.__name__ = getattr(original, "__name__", "init")
+        cls.__init__ = patched
+
+    for cls in (tk.Label, tk.Button, tk.Checkbutton, tk.Radiobutton, tk.LabelFrame):
+        wrap_widget(cls, ("text",))
+
+    def wrap_menu(method_name):
+        original = getattr(tk.Menu, method_name)
+
+        def patched(self, cnf=None, **kw):
+            label = kw.get("label")
+            if isinstance(label, str):
+                kw["label"] = ui_text(label)
+            if cnf is None:
+                return original(self, **kw)
+            return original(self, cnf, **kw)
+
+        patched.__name__ = method_name
+        setattr(tk.Menu, method_name, patched)
+
+    for name in (
+        "add_command",
+        "add_cascade",
+        "add_checkbutton",
+        "add_radiobutton",
+    ):
+        try:
+            wrap_menu(name)
+        except Exception:
+            pass
+
+    for cls in (tk.Tk, tk.Toplevel):
+        original_title = cls.title
+
+        def patched_title(self, text=None, _original=original_title):
+            if text is not None:
+                text = ui_text(str(text))
+            return _original(self, text)
+
+        patched_title.__name__ = "title"
+        cls.title = patched_title
+
+    if messagebox is not None:
+        def wrap_box(name):
+            original = getattr(messagebox, name)
+
+            def patched(title=None, message=None, **kw):
+                return original(ui_text(str(title or "")), ui_text(str(message or "")), **kw)
+
+            patched.__name__ = name
+            setattr(messagebox, name, patched)
+
+        for name in (
+            "showinfo",
+            "showwarning",
+            "showerror",
+            "askyesno",
+            "askokcancel",
+            "askquestion",
+            "askretrycancel",
+        ):
+            try:
+                wrap_box(name)
+            except Exception:
+                pass
+
+
+install_ui_translation()
+
+
+def restart_launcher():
+    """Start a fresh launcher process so a new language applies everywhere."""
+    try:
+        if getattr(sys, "frozen", False):
+            args = [sys.executable] + list(sys.argv[1:])
+        else:
+            args = [sys.executable] + list(sys.argv)
+        subprocess.Popen(
+            args,
+            cwd=BASE_DIR,
+            close_fds=True,
+            creationflags=0x08000000 if os.name == "nt" else 0,
+        )
+        return True
+    except Exception:
+        log_debug("restart launcher failed:\n" + traceback.format_exc())
+        return False
+
+BANNER_TEXT = "AKM LAUNCHER"
+BANNER_SUBTITLE = "MINECRAFT 启动器 // 1985 风格控制台"
+USER_AGENT = (
+    "AKM-Launcher/1.0 (Windows 10; +https://github.com/akm-launcher) "
+    "python-urllib/3"
+)
+
+# Official Afdian supply channel (single source of truth).
+AFDIAN_URL = "https://afdian.net/a/your-id"  # 想开补给站就换成自己的地址
+AFDIAN_DISPLAY = "67676767AKM7878"
+
+# XOR-encrypted donate QR payload (see make_qr_payload.py).
+# Never written to disk: it is decrypted in RAM only when the dialog opens.
+try:
+    from qr_payload import QR_CIPHER_KEY, ENCRYPTED_QR_DATA
+except ImportError:
+    QR_CIPHER_KEY, ENCRYPTED_QR_DATA = None, None
+try:
+    from qr_payload import QR_PAYLOAD_SHA256
+except Exception:
+    QR_PAYLOAD_SHA256 = ""
+
+
+if getattr(sys, "frozen", False):
+    # PyInstaller one-file build: keep config / auth / game data next to the EXE,
+    # never inside the temporary _MEIPASS extraction directory.
+    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+AUTH_PATH = os.path.join(BASE_DIR, "auth.json")
+ALIAS_PATH = os.path.join(BASE_DIR, "mod_alias.json")
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+APP_ICON_NAME = "akm_icon.ico"
+
+
+def resource_path(*parts):
+    """Resolve a bundled resource (PyInstaller onefile unpacks to _MEIPASS)."""
+    base = getattr(sys, "_MEIPASS", None) or BASE_DIR
+    candidate = os.path.join(base, *parts)
+    if os.path.exists(candidate):
+        return candidate
+    return os.path.join(BASE_DIR, *parts)
+
+
+
+def _default_minecraft_dir():
+    """Keep every downloaded version next to the launcher: <app>/.minecraft."""
+    return os.path.join(BASE_DIR, ".minecraft")
+
+C_WHITE = "#FFFFFF"
+C_GRAY = "#D4D0C8"
+C_TEAL = "#008080"
+C_BLACK = "#000000"
+
+DEFAULT_THEME = {
+    "surface": "#FFFFFF",
+    "secondary": "#D4D0C8",
+    "accent": "#008080",
+    "text": "#000000",
+}
+
+THEME_PRESETS = [
+    (
+        "经典青蓝",
+        {
+            "surface": "#FFFFFF",
+            "secondary": "#D4D0C8",
+            "accent": "#008080",
+            "text": "#000000",
+        },
+    ),
+    (
+        "EGA 蓝",
+        {
+            "surface": "#FFFFFF",
+            "secondary": "#D4D0C8",
+            "accent": "#0000A8",
+            "text": "#000000",
+        },
+    ),
+    (
+        "琥珀橙",
+        {
+            "surface": "#FFFDF5",
+            "secondary": "#E8DFC8",
+            "accent": "#A05200",
+            "text": "#1A1200",
+        },
+    ),
+    (
+        "森林绿",
+        {
+            "surface": "#FFFFFF",
+            "secondary": "#DCE6DA",
+            "accent": "#006B3C",
+            "text": "#001A0C",
+        },
+    ),
+    (
+        "酒红",
+        {
+            "surface": "#FFFFFF",
+            "secondary": "#E6D8DA",
+            "accent": "#800020",
+            "text": "#1A0006",
+        },
+    ),
+    (
+        "石板灰",
+        {
+            "surface": "#FFFFFF",
+            "secondary": "#D4D0C8",
+            "accent": "#4A4A4A",
+            "text": "#000000",
+        },
+    ),
+    (
+        "深夜蓝",
+        {
+            "surface": "#16181D",
+            "secondary": "#22252C",
+            "accent": "#4E9BD6",
+            "text": "#E6E9EF",
+        },
+    ),
+    (
+        "暗夜青",
+        {
+            "surface": "#0F1A1C",
+            "secondary": "#172A2D",
+            "accent": "#27B39B",
+            "text": "#E3F3F0",
+        },
+    ),
+    (
+        "午夜紫",
+        {
+            "surface": "#17131F",
+            "secondary": "#241E31",
+            "accent": "#9B7BFF",
+            "text": "#EAE4F5",
+        },
+    ),
+    (
+        "石墨黑",
+        {
+            "surface": "#1B1B1B",
+            "secondary": "#2A2A2A",
+            "accent": "#B0B0B0",
+            "text": "#EDEDED",
+        },
+    ),
+]
+
+# 深色预设（设置页里单独一栏，方便一键切换）
+DARK_THEME_NAMES = ("深夜蓝", "暗夜青", "午夜紫", "石墨黑")
+
+TOOLBOX_LINKS = [
+    (
+        "百科",
+        "MC百科",
+        "https://www.mcmod.cn/",
+        "中文 Minecraft 模组百科、教程与下载索引",
+    ),
+    (
+        "百科",
+        "Minecraft Wiki 中文",
+        "https://zh.minecraft.wiki/",
+        "方块、机制、版本与命令资料库",
+    ),
+    (
+        "模组",
+        "Modrinth",
+        "https://modrinth.com/mods",
+        "模组、整合包、资源包与光影下载",
+    ),
+    (
+        "模组",
+        "CurseForge",
+        "https://www.curseforge.com/minecraft/mc-mods",
+        "大型 Minecraft 模组与整合包平台",
+    ),
+    (
+        "整合包",
+        "Modrinth Modpacks",
+        "https://modrinth.com/modpacks",
+        "Modrinth 整合包分类",
+    ),
+    (
+        "整合包",
+        "CurseForge Modpacks",
+        "https://www.curseforge.com/minecraft/modpacks",
+        "CurseForge 整合包分类",
+    ),
+    (
+        "官方",
+        "Minecraft 官网",
+        "https://www.minecraft.net/zh-hans",
+        "Minecraft 官方新闻与版本信息",
+    ),
+    (
+        "官方",
+        "Minecraft 官方下载",
+        "https://www.minecraft.net/zh-hans/download",
+        "正版游戏与官方启动器下载",
+    ),
+    (
+        "加载器",
+        "Forge",
+        "https://files.minecraftforge.net/",
+        "Forge 模组加载器官方下载",
+    ),
+    (
+        "加载器",
+        "NeoForge",
+        "https://neoforged.net/",
+        "NeoForge 官网与版本下载",
+    ),
+    (
+        "加载器",
+        "Fabric",
+        "https://fabricmc.net/",
+        "Fabric 加载器与 API",
+    ),
+    (
+        "加载器",
+        "Quilt",
+        "https://quiltmc.org/",
+        "Quilt 加载器与工具链",
+    ),
+    (
+        "工具",
+        "OptiFine",
+        "https://optifine.net/",
+        "OptiFine 高清修复与光影支持",
+    ),
+    (
+        "社区",
+        "Planet Minecraft",
+        "https://www.planetminecraft.com/",
+        "地图、皮肤、建筑与社区作品",
+    ),
+    (
+        "社区",
+        "MineBBS",
+        "https://www.minebbs.com/",
+        "中文 Minecraft 社区与资源",
+    ),
+    (
+        "官方",
+        "Mojang",
+        "https://www.mojang.com/",
+        "Mojang 官方网站",
+    ),
+]
+
+ONLINE_GUIDE_TEXT = """\
+====================================================================
+  AKM 联机教程 // 蓝盾虚拟局域网 + 局域网开房
+====================================================================
+
+【一、联机前的准备】
+1. 双方使用完全一致的游戏版本 + 加载器（例如都是 26.3 + Forge）。
+2. 模组列表保持一致：多一个少一个都可能显示 "Incompatible mod set"。
+3. 正版与离线：正版账号用 [身份] -> [微软设备代码登录]；
+   离线模式只能连「关闭了在线验证」的服务器/局域网房间。
+4. 首次启动时 Windows 防火墙弹窗请点「允许访问」，否则好友连不进来。
+
+【二、方案 A：蓝盾虚拟局域网（不会端口映射也推荐）】
+蓝盾的作用是把两台电脑"放进同一个局域网"，之后按局域网联机即可，
+不需要公网 IP，也不需要改路由器。
+（本启动器不内置蓝盾，也不提供下载链接，请通过其官方渠道获取。）
+
+第 1 步  房主和好友都安装并登录蓝盾，进入同一个网络/房间：
+         - 房主：创建网络，把「网络号 / 邀请码」发给好友
+         - 好友：输入该网络号 / 邀请码加入
+第 2 步  双方确认蓝盾显示「已连接」，并记下分配给本机的虚拟 IP。
+         在启动器顶部 [联机教程] -> [复制本机 IP 地址] 可快速复制。
+第 3 步  房主启动游戏 -> 进入存档 -> 按 ESC -> 点「对局域网开放」，
+         选择生存/创造与是否允许作弊。
+第 4 步  聊天栏会出现：
+         "本地游戏已在端口 5xxxx 开放"
+         记下这个端口号（每次开房端口可能不同）。
+第 5 步  好友启动同版本游戏 -> 多人游戏 -> 直接连接，
+         地址填：<房主蓝盾虚拟IP>:<端口>
+         例如：10.10.0.5:51234
+第 6 步  连上之后即可一起玩；房主退出世界 = 房间关闭。
+
+【三、方案 B：有公网 IP / 已做端口映射】
+- 房主同样「对局域网开放」，记下端口
+- 在路由器把该端口映射到房主电脑的内网 IP
+- 好友用「公网 IP:端口」连接
+- 家宽大多是大内网（没有公网 IP），这种情况请直接用方案 A
+
+【四、常见问题】
+- 好友看不到房间 / 连接超时
+  -> 检查是否同一蓝盾网络、虚拟 IP 是否填对、防火墙是否放行 javaw.exe
+- "Unknown host"
+  -> IP 打错，或蓝盾尚未连接
+- "Incompatible mod set" / 进服闪退
+  -> 双方模组不一致，请导入同一个整合包
+- "You are not whitelisted"
+  -> 服务器开启白名单，需要房主添加
+- "Connection refused"
+  -> 端口填错，或房主没有点「对局域网开放」
+- 端口每次都变
+  -> 每次开房后重新复制聊天栏提示的端口；也可用固定端口工具
+- 离线玩家进不去正版服务器
+  -> 正版验证开启时会被拒绝，需要正版账号
+
+【五、安全提示】
+- 只和认识的人联机；不要在陌生网络里暴露端口或分享 IP
+- 蓝盾等虚拟局域网属于第三方工具，请从官方渠道获取并留意隐私条款
+- 不要运行来历不明的整合包 / 模组，必要时用杀毒软件扫描
+
+====================================================================
+"""
+# Fonts: Consolas keeps the ASCII columns aligned (the 1985 look) but is much
+# easier on the eyes than bold Courier. Body text is no longer bold.
+UI_FONT = "Consolas"
+FONT_MAIN = (UI_FONT, 10)
+FONT_SMALL = (UI_FONT, 9)
+FONT_TITLE = (UI_FONT, 10, "bold")
+FONT_BANNER = (UI_FONT, 12, "bold")
+FONT_BIG = (UI_FONT, 14, "bold")
+FONT_CODE = (UI_FONT, 16, "bold")
+FONT_BODY = (UI_FONT, 10)
+# Tk's native menu widget parses -font as a Tcl font pattern, so a plain tuple or
+# the string "Courier New 9 bold" is unsafe there. The app creates a named
+# tkinter.font.Font after the root exists and hands that to every tk.Menu.
+
+MC_VERSION_CHOICES = [
+    "1.21.4",
+    "1.21.1",
+    "1.21",
+    "1.20.6",
+    "1.20.4",
+    "1.20.1",
+    "1.19.4",
+    "1.18.2",
+    "1.16.5",
+]
+LOADER_CHOICES = [
+    ("Fabric", "fabric"),
+    ("Quilt", "quilt"),
+    ("Forge", "forge"),
+    ("NeoForge", "neoforge"),
+    ("原版 Vanilla", "vanilla"),
+]
+LOADER_LABELS = {
+    "fabric": "Fabric",
+    "quilt": "Quilt",
+    "forge": "Forge",
+    "neoforge": "NeoForge",
+}
+LOADER_INSTALL_ORDER = ["forge", "neoforge", "fabric", "quilt"]
+# Official download pages: always available even when a metadata API is blocked.
+LOADER_HOME = {
+    "forge": "https://files.minecraftforge.net/",
+    "neoforge": "https://neoforged.net/",
+    "fabric": "https://fabricmc.net/use/installer/",
+    "quilt": "https://quiltmc.org/",
+}
+FORGE_PROMOS_URL = (
+    "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json"
+)
+# Offline fallback when maven.neoforged.net is unreachable (China/ISP blocks).
+NEOFORGE_FALLBACK_MC = [
+    "1.21.5",
+    "1.21.4",
+    "1.21.3",
+    "1.21.1",
+    "1.21",
+    "1.20.6",
+    "1.20.4",
+    "1.20.2",
+]
+LOADER_META_TIMEOUT = 25
+
+# NeoForge: BMCLAPI mirrors maven.neoforged.net (metadata + installer jars), so a
+# blocked / slow maven host no longer hides the version list.
+NEOFORGE_OFFICIAL_MAVEN = (
+    "https://maven.neoforged.net/releases/net/neoforged/neoforge"
+)
+
+# Bundled Java runtimes (Temurin JRE) downloaded into <game>/runtime/akm-java-*.
+JAVA_RUNTIME_MAJORS = (8, 11, 17, 21, 25)
+JAVA_RUNTIME_PREFIX = "akm-java-"
+JAVA_RUNTIME_SIZES = {8: "≈ 41 MB", 11: "≈ 44 MB", 17: "≈ 45 MB", 21: "≈ 47 MB", 25: "≈ 48 MB"}
+JAVA_RUNTIME_TARGETS = {
+    8: "MC 1.6 ~ 1.16.5 // 旧版 Forge / 老模组",
+    11: "MC 1.16.5 ~ 1.17.1 // 过渡版本",
+    17: "MC 1.18 ~ 1.20.4 // Forge 1.20.x / NeoForge 20.x",
+    21: "MC 1.20.5 ~ 1.21.x // NeoForge 21.x 必需",
+    25: "MC 1.21.9+ / 新快照 // 可选",
+}
+TUNA_ADOPTIUM_BASE = "https://mirrors.tuna.tsinghua.edu.cn/Adoptium"
+ADOPTIUM_BINARY_API = (
+    "https://api.adoptium.net/v3/binary/latest/{0}/ga/windows/x64/jre/hotspot/normal/eclipse"
+)
+JAVA_RUNTIME_TIMEOUT = 25
+
+MS_ENTRA_DEVICE_URL = (
+    "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode"
+)
+MS_ENTRA_TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
+MS_LIVE_DEVICE_URL = "https://login.live.com/oauth20_connect.srf"
+MS_LIVE_AUTH_URL = "https://login.live.com/oauth20_authorize.srf"
+MS_LIVE_TOKEN_URL = "https://login.live.com/oauth20_token.srf"
+MS_REDIRECT_URI = "https://login.live.com/oauth20_desktop.srf"
+# Azure/Entra public client scope (used with a custom device_client_id).
+MS_SCOPE = "XboxLive.signin offline_access"
+# Legacy Xbox Live (login.live.com + client 00000000402b5328) requires the RPS
+# scope; requesting XboxLive.signin there fails at token time with
+# "must sign in again / grant access to the requested scope".
+MS_LIVE_SCOPE = "service::user.auth.xboxlive.com::MBI_SSL"
+MS_DEFAULT_CLIENT_ID = "00000000402b5328"
+DEVICE_LOGIN_TIMEOUT = 3600
+
+MODRINTH_API = "https://api.modrinth.com/v2"
+CURSEFORGE_WIDGET_API = "https://api.cfwidget.com"
+FABRIC_META = "https://meta.fabricmc.net/v2/versions/loader"
+BMCLAPI_BASE = "https://bmclapi2.bangbang93.com"
+NEOFORGE_MIRROR_LIST = BMCLAPI_BASE + "/neoforge/list/{0}"
+NEOFORGE_MIRROR_METADATA = (
+    BMCLAPI_BASE + "/maven/net/neoforged/neoforge/maven-metadata.xml"
+)
+NEOFORGE_MIRROR_MAVEN = BMCLAPI_BASE + "/maven/net/neoforged"
+OFFICIAL_MANIFEST_URL = (
+    "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json"
+)
+MIRROR_MANIFEST_URL = BMCLAPI_BASE + "/mc/game/version_manifest_v2.json"
+OFFICIAL_LIBRARIES_BASE = "https://libraries.minecraft.net"
+OFFICIAL_RESOURCES_BASE = "https://resources.download.minecraft.net"
+VANILLA_SOURCE_CHOICES = [
+    ("镜像优先（推荐）", "mirror"),
+    ("自动", "auto"),
+    ("官方优先", "official"),
+]
+VANILLA_SOURCE_LABELS = {
+    "mirror": "BMCLAPI MIRROR",
+    "auto": "AUTO / MIRROR FIRST",
+    "official": "OFFICIAL MOJANG",
+}
+# Parallel workers for the vanilla installer (higher = faster on mirror links).
+LIBRARY_WORKERS = 12
+ASSET_WORKERS = 32
+# Per-file socket timeouts: a stalled mirror must not pin a worker for a minute.
+ASSET_TIMEOUT = 25
+LIBRARY_TIMEOUT = 60
+CLIENT_TIMEOUT = 90
+VANILLA_PHASE_LABELS = {
+    "manifest": "VERSION MANIFEST",
+    "version_json": "VERSION JSON",
+    "client": "CLIENT JAR",
+    "libraries": "LIBRARIES",
+    "assets": "ASSETS",
+    "logging": "LOGGING CONFIG",
+    "complete": "COMPLETE",
+}
+
+TAG_PERF = "[\u26a1 PERF]"
+TAG_SHDR = "[\U0001f3a8 SHDR]"
+TAG_CORE = "[\u2699\ufe0f CORE]"
+TAG_GAME = "[\U0001f4e6 GAME]"
+
+XSTS_ERRORS = {
+    2148916233: "该微软账户尚未创建 Xbox 档案，请先访问 xbox.com 创建档案。",
+    2148916235: "该微软账户所在区域被 Xbox Live 限制，无法完成登录。",
+    2148916236: "该微软账户需要完成 Xbox Live 成人验证。",
+    2148916237: "该微软账户需要完成 Xbox Live 成人验证。",
+    2148916238: "未成年账户必须由家庭组管理员添加到 Microsoft 家庭。",
+}
+
+DEFAULT_CONFIG = {
+    "minecraft_dir": _default_minecraft_dir(),
+    "launch_version": "",
+    "mc_version": "1.21.1",
+    "loader": "fabric",
+    "loader_version": "",
+    "java": "",
+    "memory": {"min": "1024M", "max": "4096M"},
+    "window": {"width": 854, "height": 480},
+    "client_id": MS_DEFAULT_CLIENT_ID,
+    "device_client_id": "",
+    "auth_flow": "live",
+    "download_source": "mirror",
+    "download_detail": True,
+    "language": "zh",
+    "theme": dict(DEFAULT_THEME),
+    "ui_style": "retro",
+    "ui_style_palette": "indigo",
+    "wallpaper": "",
+    "wallpaper_fit": "cover",
+    "wallpaper_dim": 0,
+    "panel_alpha": 45,
+    "afdian_url": AFDIAN_URL,
+    "modrinth": {"hot_limit": 8, "search_limit": 30, "index": "downloads"},
+    "mod_filter_loader": "auto",
+    "mod_version_bar_open": False,
+    "update_url": "",
+    "update_check": True,
+    "version_isolation": False,
+    "jvm_args": "",
+    "instances": {},
+    "mini_game_prompt": True,
+    "snake_best": 0,
+    "game_2048_best": 0,
+    "minesweeper_best": 0,
+    "tetris_best": 0,
+    "user_agent": USER_AGENT,
+}
+
+# 常用 JVM 参数预设（设置页一键填入，来源：社区常用 G1 调优参数）
+JVM_PRESETS = (
+    (
+        "G1 平衡（推荐）",
+        "-XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200 "
+        "-XX:+UnlockExperimentalVMOptions -XX:+DisableExplicitGC "
+        "-XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 "
+        "-XX:G1HeapRegionSize=8M -XX:G1ReservePercent=20 "
+        "-XX:G1HeapWastePercent=5 -XX:G1MixedGCCountTarget=4 "
+        "-XX:InitiatingHeapOccupancyPercent=15 "
+        "-XX:G1MixedGCLiveThresholdPercent=90 "
+        "-XX:G1RSetUpdatingPauseTimePercent=5 -XX:SurvivorRatio=32 "
+        "-XX:+PerfDisableSharedMem -XX:MaxTenuringThreshold=1",
+    ),
+    (
+        "低配 / 4G 以下",
+        "-XX:+UseSerialGC -XX:MaxGCPauseMillis=100 -XX:+DisableExplicitGC",
+    ),
+    ("清空", ""),
+)
+
+DEFAULT_AUTH = {
+    "mode": "offline",
+    "flow": "live",
+    "username": "Steve",
+    "uuid": "",
+    "access_token": "",
+    "refresh_token": "",
+    "ms_uuid": "",
+    "ms_refresh_token": "",
+    "expires_at": 0,
+    "ms_name": "",
+    "last_login": "",
+    "accounts": [],
+}
+
+
+def normalize_theme(theme):
+    result = dict(DEFAULT_THEME)
+    if isinstance(theme, dict):
+        for key in result:
+            value = str(theme.get(key) or "").strip()
+            if re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+                result[key] = value.upper()
+    return result
+
+
+def set_global_theme(theme):
+    global C_WHITE, C_GRAY, C_TEAL, C_BLACK
+    normalized = normalize_theme(theme)
+    C_WHITE = normalized["surface"]
+    C_GRAY = normalized["secondary"]
+    C_TEAL = normalized["accent"]
+    C_BLACK = normalized["text"]
+    return normalized
+
+
+# ---------------------------------------------------------------------------
+# 0a-3. UI styles (B0.5, beta): 1985 retro (default) vs vector / flat
+#     The vector style swaps the palette, drops every hard 1px black frame,
+#     paints rounded "cards" behind the panels and gives the banner a rounded
+#     gradient.  Everything is plain tkinter Canvas drawing, no extra library.
+# ---------------------------------------------------------------------------
+
+UI_STYLES = ("retro", "vector")
+UI_STYLE_LABELS = {
+    "retro": "1985 复古",
+    "vector": "矢量风（测试）",
+}
+UI_STYLE_HINTS = {
+    "retro": "黑边方块 + 纯色标题条，1985 工业味",
+    "vector": "圆角卡片 + 渐变横幅 + 无边框按钮（测试样式）",
+}
+# page, surface, secondary, accent, text, muted, outline, shadow
+UI_VECTOR_PALETTES = {
+    "indigo": (
+        "#F1F4FA", "#FFFFFF", "#E9EEF8", "#3B62F6", "#152139",
+        "#7C879B", "#DCE3F0", "#E3E9F5",
+    ),
+    "aurora": (
+        "#F0F8F5", "#FFFFFF", "#E4F1EC", "#0E9F6E", "#0E2A24",
+        "#77968D", "#D5E8E0", "#E0EEE8",
+    ),
+    "sunset": (
+        "#FDF5F1", "#FFFFFF", "#FAE9E0", "#E8590C", "#2A1608",
+        "#A98A7B", "#F0DCD2", "#F7E5DC",
+    ),
+}
+UI_VECTOR = False
+UI_VECTOR_PALETTE = "indigo"
+UI_PAGE = C_WHITE
+UI_MUTED = "#6B7688"
+UI_OUTLINE = "#D8DEE9"
+UI_SHADOW = "#E6EAF2"
+UI_CARD_RADIUS = 14
+
+
+def set_ui_style(style, palette="indigo", theme=None):
+    """Apply a UI style to the module-level palette.  Returns (style, palette)."""
+    global C_WHITE, C_GRAY, C_TEAL, C_BLACK
+    global UI_VECTOR, UI_VECTOR_PALETTE, UI_PAGE, UI_MUTED, UI_OUTLINE, UI_SHADOW
+    name = str(style or "").strip().lower()
+    if name not in UI_STYLES:
+        name = "retro"
+    palette = str(palette or "indigo").strip().lower()
+    if palette not in UI_VECTOR_PALETTES:
+        palette = "indigo"
+    UI_VECTOR_PALETTE = palette
+    UI_VECTOR = name == "vector"
+    if not UI_VECTOR:
+        # hand the colours back to the classic theme (or the built-in one)
+        set_global_theme(theme if isinstance(theme, dict) else DEFAULT_THEME)
+        UI_PAGE = C_WHITE
+        UI_MUTED = "#6B7688"
+        UI_OUTLINE = "#D8DEE9"
+        UI_SHADOW = "#E6EAF2"
+        return "retro", palette
+    page, surface, secondary, accent, text, muted, outline, shadow = (
+        UI_VECTOR_PALETTES[palette]
+    )
+    C_WHITE = surface.upper()
+    C_GRAY = secondary.upper()
+    C_TEAL = accent.upper()
+    C_BLACK = text.upper()
+    UI_PAGE = page.upper()
+    UI_MUTED = muted.upper()
+    UI_OUTLINE = outline.upper()
+    UI_SHADOW = shadow.upper()
+    return "vector", palette
+
+
+def round_rect_points(x0, y0, x1, y1, radius):
+    """Corner points for a rounded rectangle (use with smooth=True)."""
+    if x1 < x0:
+        x0, x1 = x1, x0
+    if y1 < y0:
+        y0, y1 = y1, y0
+    radius = int(max(0, min(radius, (x1 - x0) // 2, (y1 - y0) // 2)))
+    if radius <= 0:
+        return [x0, y0, x1, y0, x1, y1, x0, y1]
+    return [
+        x0 + radius, y0,
+        x1 - radius, y0,
+        x1, y0,
+        x1, y0 + radius,
+        x1, y1 - radius,
+        x1, y1,
+        x1 - radius, y1,
+        x0 + radius, y1,
+        x0, y1,
+        x0, y1 - radius,
+        x0, y0 + radius,
+        x0, y0,
+    ]
+
+
+def draw_round_rect(canvas, x0, y0, x1, y1, radius=10, **kwargs):
+    """Draw an anti-aliased-ish rounded rectangle on a Canvas."""
+    points = round_rect_points(x0, y0, x1, y1, radius)
+    return canvas.create_polygon(points, smooth=True, splinesteps=20, **kwargs)
+
+
+def blend_color(first, second, ratio):
+    """Mix two #RRGGBB colours (ratio 0 -> first, 1 -> second)."""
+    try:
+        a = [int(str(first).lstrip("#")[i : i + 2], 16) for i in (0, 2, 4)]
+        b = [int(str(second).lstrip("#")[i : i + 2], 16) for i in (0, 2, 4)]
+    except (ValueError, IndexError):
+        return first
+    ratio = max(0.0, min(1.0, float(ratio)))
+    return "#{0:02X}{1:02X}{2:02X}".format(
+        *[int(round(a[i] + (b[i] - a[i]) * ratio)) for i in range(3)]
+    )
+
+
+UI_FONT_CANDIDATES = {
+    "retro": ("Consolas", "Cascadia Mono", "Lucida Console", "DejaVu Sans Mono"),
+    "vector": (
+        "Microsoft YaHei UI",
+        "Microsoft YaHei",
+        "Segoe UI",
+        "Noto Sans CJK SC",
+        "Verdana",
+    ),
+}
+
+
+def ui_font_for_style(style=None, root=None):
+    """First installed family of the style's preference list ('' if none)."""
+    key = "vector" if str(style or "").strip().lower() == "vector" else "retro"
+    candidates = UI_FONT_CANDIDATES[key]
+    try:
+        families = set(tkfont.families(root))
+    except Exception:
+        return ""
+    for name in candidates:
+        if name in families:
+            return name
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# 0b. Custom wallpaper (pure stdlib: GDI+ through ctypes + a tiny PNG writer)
+#     Any format Windows can decode (png / jpg / bmp / gif / webp / tiff) is
+#     cover-cropped and bicubic-scaled, then handed to Tk as a base64 PNG.
+#     Nothing is written to disk and no third party module is required.
+# ---------------------------------------------------------------------------
+
+WALLPAPER_EXTENSIONS = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".bmp",
+    ".gif",
+    ".webp",
+    ".tif",
+    ".tiff",
+    ".ico",
+)
+WALLPAPER_MAX_SIDE = 2600
+PIXEL_FORMAT_32BPP_ARGB = 0x0026200A
+# GDI+ is started/stopped per render; keep renders from overlapping threads.
+_WALLPAPER_RENDER_LOCK = threading.Lock()
+
+# --- 账号头像 ---------------------------------------------------------------
+AVATAR_SOURCES = (
+    "https://mc-heads.net/avatar/{0}/64",
+    "https://crafatar.com/avatars/{0}?size=64&overlay",
+    "https://minotar.net/helm/{0}/64.png",
+)
+AVATAR_SIZE = 64
+AVATAR_DEFAULT_COLORS = (
+    (198, 142, 110),
+    (176, 120, 92),
+    (232, 195, 158),
+    (86, 62, 48),
+    (46, 38, 34),
+    (60, 120, 180),
+    (200, 200, 200),
+)
+
+
+def instance_thumb_png(seed, size=96):
+    """Deterministic 'block' thumbnail for an instance card (no files needed)."""
+    block_palette = (
+        (94, 157, 52),    # grass
+        (134, 96, 67),    # dirt
+        (127, 127, 127),  # stone
+        (86, 130, 190),   # water
+        (219, 200, 148),  # sand
+        (60, 88, 60),     # dark grass
+        (40, 44, 52),     # deepslate
+    )
+    digest = hashlib.sha256(str(seed or "instance").encode("utf-8")).digest()
+    cells = 8
+    cell = max(1, size // cells)
+    rows = []
+    for row in range(cells):
+        pixels = bytearray()
+        for col in range(cells):
+            value = digest[(row * cells + col) % len(digest)]
+            base = block_palette[value % len(block_palette)]
+            # subtle per-cell shading so it reads as blocks, not noise
+            shade = 1.0 + ((value >> 4) % 5 - 2) * 0.06
+            color = tuple(min(255, max(0, int(channel * shade))) for channel in base)
+            pixels += bytes(color) * cell
+        line = bytes(pixels)
+        for _ in range(cell):
+            rows.append(line)
+    width = cell * cells
+    return base64.b64encode(encode_png_rgb(width, width, rows)).decode("ascii")
+
+
+def modrinth_version_files(hashes, update=False, loaders=None, game_versions=None, timeout=30):
+    """Modrinth hash lookup: installed jar -> project/version (or newest build)."""
+    hashes = [str(item) for item in (hashes or []) if item]
+    if not hashes:
+        return {}
+    payload = {"hashes": hashes[:500], "algorithm": "sha1"}
+    if update:
+        if loaders:
+            payload["loaders"] = list(loaders)
+        if game_versions:
+            payload["game_versions"] = list(game_versions)
+        url = "https://api.modrinth.com/v2/version_files/update"
+    else:
+        url = "https://api.modrinth.com/v2/version_files"
+    data = http_json(url, payload, method="POST", timeout=timeout)
+    return data if isinstance(data, dict) else {}
+
+
+def fallback_avatar_png(seed, size=AVATAR_SIZE):
+    """Deterministic 8x8 pixel face from a name/UUID (no network needed)."""
+    digest = hashlib.sha256(str(seed or "steve").encode("utf-8")).digest()
+    grid = []
+    for row in range(8):
+        line = []
+        for col in range(4):
+            index = digest[(row * 4 + col) % len(digest)] % len(AVATAR_DEFAULT_COLORS)
+            line.append(AVATAR_DEFAULT_COLORS[index])
+        grid.append(line + list(reversed(line)))
+    for col in (2, 5):
+        grid[3][col] = (30, 30, 34)
+        grid[4][col] = (30, 30, 34)
+    for col in range(2, 6):
+        grid[6][col] = (120, 70, 60)
+    block = max(1, size // 8)
+    rows = []
+    for row in grid:
+        pixels = bytearray()
+        for color in row:
+            pixels += bytes((color[0], color[1], color[2])) * block
+        line = bytes(pixels)
+        for _ in range(block):
+            rows.append(line)
+    return base64.b64encode(encode_png_rgb(size, size, rows)).decode("ascii")
+
+
+def fetch_avatar_text(key, timeout=8):
+    """Download a 64x64 skin head as base64 PNG text; '' when unavailable."""
+    token = str(key or "").strip().replace("-", "")
+    if not token:
+        return ""
+    for template in AVATAR_SOURCES:
+        url = template.format(token)
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read(512 * 1024)
+            if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+                return base64.b64encode(raw).decode("ascii")
+        except Exception:
+            continue
+    return ""
+
+
+# --- 下载测速（所有 download_file 共享一个计数器） --------------------------
+_DOWNLOAD_LOCK = threading.Lock()
+_DOWNLOAD_TOTAL = {"bytes": 0}
+
+
+def record_download_bytes(count):
+    try:
+        count = int(count)
+    except (TypeError, ValueError):
+        return
+    if count <= 0:
+        return
+    with _DOWNLOAD_LOCK:
+        _DOWNLOAD_TOTAL["bytes"] += count
+
+
+def downloaded_bytes():
+    with _DOWNLOAD_LOCK:
+        return int(_DOWNLOAD_TOTAL["bytes"])
+
+
+def format_speed(bytes_per_second):
+    value = float(bytes_per_second or 0)
+    if value <= 0:
+        return ""
+    if value >= 1024 * 1024:
+        return "{0:.1f} MB/s".format(value / (1024 * 1024))
+    if value >= 1024:
+        return "{0:.0f} KB/s".format(value / 1024)
+    return "{0:.0f} B/s".format(value)
+
+
+def format_playtime(seconds):
+    try:
+        total = int(seconds or 0)
+    except (TypeError, ValueError):
+        total = 0
+    if total <= 0:
+        return ""
+    hours, rest = divmod(total, 3600)
+    minutes = rest // 60
+    if hours:
+        return "{0}h{1:02d}m".format(hours, minutes)
+    if minutes:
+        return "{0}m".format(minutes)
+    return "<1m"
+
+
+def format_clock(seconds):
+    """mm:ss for in-game timers."""
+    try:
+        total = max(0, int(seconds or 0))
+    except (TypeError, ValueError):
+        total = 0
+    return "{0:02d}:{1:02d}".format(total // 60, total % 60)
+
+
+def relative_time(epoch):
+    try:
+        epoch = int(epoch or 0)
+    except (TypeError, ValueError):
+        return ""
+    if epoch <= 0:
+        return ""
+    delta = max(0, int(time.time() - epoch))
+    if delta < 60:
+        return "刚刚"
+    if delta < 3600:
+        return "{0} 分钟前".format(delta // 60)
+    if delta < 86400:
+        return "{0} 小时前".format(delta // 3600)
+    if delta < 86400 * 30:
+        return "{0} 天前".format(delta // 86400)
+    return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d")
+
+
+def crash_report_paths(game_dir):
+    """crash-reports/*.txt, newest first."""
+    paths = []
+    folder = os.path.join(game_dir, "crash-reports")
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return paths
+    for name in names:
+        if name.lower().endswith(".txt"):
+            candidate = os.path.join(folder, name)
+            try:
+                paths.append((os.path.getmtime(candidate), candidate))
+            except OSError:
+                continue
+    paths.sort(reverse=True)
+    return [item[1] for item in paths]
+
+
+CRASH_RULES = (
+    (
+        "内存不足 (OutOfMemoryError)",
+        (
+            "OutOfMemoryError // Memory",
+            "游戏堆内存不够：到 设置 -> 外观 / 背景 / 内存 把 -Xmx 调大（例如 6G / 8G），"
+            "并关掉占内存的后台程序。",
+        ),
+    ),
+    (
+        "Java 版本不匹配",
+        (
+            "UnsupportedClassVersionError // requires Java",
+            "模组或游戏要求的 Java 版本更高：用 游戏 -> Java 运行时管理 装 Java 17/21 再启动。",
+        ),
+    ),
+    (
+        "缺少前置模组 / 类缺失",
+        (
+            "NoClassDefFoundError // ClassNotFoundException",
+            "多半是缺前置模组：看日志里第一个 ClassNotFoundException 的包名，"
+            "补装对应前置（Fabric API / Cloth Config / Kotlin 等）。",
+        ),
+    ),
+    (
+        "模组之间冲突（Mixin）",
+        (
+            "Mixin apply failed // MixinTransformerError // MixinApplyError",
+            "Mixin 冲突：常见于同时装了两个功能重叠的模组，"
+            "把最近装的模组先移出 mods 再试。",
+        ),
+    ),
+    (
+        "重复的模组",
+        (
+            "DuplicateModsFoundException // duplicate mod",
+            "mods 目录里有重复模组（同一模组两个版本），删掉旧的那个。",
+        ),
+    ),
+    (
+        "显卡 / OpenGL 问题",
+        (
+            "Pixel format not accelerated // GLFW error // OpenGL",
+            "显卡驱动太旧或没有硬件加速：更新显卡驱动，或换一个带显卡加速的 Java。",
+        ),
+    ),
+)
+
+
+def analyze_crash_text(text):
+    """Return (suggestions, key lines, mod hints) for a crash report."""
+    body = str(text or "")
+    lowered = body.lower()
+    suggestions = []
+    for _label, (needle, advice) in CRASH_RULES:
+        for token in needle.split(" // "):
+            if token.lower() in lowered:
+                suggestions.append(advice)
+                break
+    key_lines = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if (
+            stripped.startswith("Caused by:")
+            or "Exception" in stripped
+            or "Error" in stripped
+        ):
+            if stripped not in key_lines:
+                key_lines.append(stripped[:160])
+        if len(key_lines) >= 6:
+            break
+    mods = []
+    for line in body.splitlines():
+        lowered_line = line.lower()
+        if ("mod id" in lowered_line or "modid" in lowered_line) and ":" in line:
+            entry = line.strip()[:80]
+            if entry not in mods:
+                mods.append(entry)
+        if len(mods) >= 5:
+            break
+    return suggestions, key_lines, mods
+
+
+
+def wallpaper_supported(path):
+    """Cheap pre-check so the file dialog can reject non images early."""
+    name = str(path or "").strip()
+    if not name or not os.path.isfile(name):
+        return False
+    if os.path.splitext(name)[1].lower() not in WALLPAPER_EXTENSIONS:
+        return False
+    try:
+        return os.path.getsize(name) > 0
+    except OSError:
+        return False
+
+
+def encode_png_rgb(width, height, rows, level=3):
+    """Encode raw RGB rows (3 bytes per pixel, top down) into PNG bytes."""
+
+    def chunk(tag, payload):
+        return (
+            struct.pack(">I", len(payload))
+            + tag
+            + payload
+            + struct.pack(">I", binascii.crc32(tag + payload) & 0xFFFFFFFF)
+        )
+
+    body = bytearray()
+    for row in rows:
+        body.append(0)  # filter type 0 // none
+        body += row
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(bytes(body), level))
+        + chunk(b"IEND", b"")
+    )
+
+def _hex_to_argb(color):
+    text = str(color or "#FFFFFF").strip().lstrip("#")
+    if len(text) != 6:
+        text = "FFFFFF"
+    try:
+        red = int(text[0:2], 16)
+        green = int(text[2:4], 16)
+        blue = int(text[4:6], 16)
+    except ValueError:
+        red, green, blue = 255, 255, 255
+    return 0xFF000000 | (red << 16) | (green << 8) | blue
+
+
+def _render_wallpaper_png(
+    source_path,
+    width,
+    height,
+    darken=0.0,
+    fit="cover",
+    bg_color="#FFFFFF",
+    white=0.0,
+    frame=None,
+    src_box=None,
+):
+    """Scale an image to width x height (PNG bytes).
+
+    fit="cover"  -> fill the box, crop the overflowing axis (no distortion)
+    fit="contain" -> whole image visible, letterboxed with bg_color
+    darken       -> 0.0 .. 0.9 black veil over the result
+    white        -> 0.0 .. 0.85 white veil (frosted glass panels)
+    frame        -> (w, h) of the whole window, only with src_box
+    src_box      -> (x0, y0, x1, y1) fractions of that window: render only
+                    the wallpaper region sitting behind that rectangle, so a
+                    semi transparent panel lines up with the desktop below it
+    """
+    if os.name != "nt":
+        raise LauncherError("自定义背景仅支持 Windows（GDI+ 解码）")
+    path = os.path.abspath(str(source_path or ""))
+    if not wallpaper_supported(path):
+        raise LauncherError("不是可用的图片文件: {0}".format(path))
+    width = max(8, min(int(width), WALLPAPER_MAX_SIDE))
+    height = max(8, min(int(height), WALLPAPER_MAX_SIDE))
+    factor = max(0.0, min(0.9, float(darken or 0.0)))
+    glow = max(0.0, min(0.85, float(white or 0.0)))
+    fit = str(fit or "cover").lower()
+    if fit not in ("cover", "contain"):
+        fit = "cover"
+    box = None
+    if frame and src_box:
+        try:
+            ref_w = max(8, min(int(frame[0]), WALLPAPER_MAX_SIDE))
+            ref_h = max(8, min(int(frame[1]), WALLPAPER_MAX_SIDE))
+            x0, y0, x1, y1 = (max(0.0, min(1.0, float(v))) for v in src_box)
+        except (TypeError, ValueError, IndexError):
+            box, ref_w, ref_h = None, 0, 0
+        else:
+            if (x1 - x0) >= 0.004 and (y1 - y0) >= 0.004:
+                box = (x0, y0, x1, y1)
+
+    class _StartupInput(ctypes.Structure):
+        _fields_ = [
+            ("GdiplusVersion", ctypes.c_uint32),
+            ("DebugEventCallback", ctypes.c_void_p),
+            ("SuppressBackgroundThread", ctypes.c_int),
+            ("SuppressExternalCodecs", ctypes.c_int),
+        ]
+
+    class _Rect(ctypes.Structure):
+        _fields_ = [
+            ("X", ctypes.c_int),
+            ("Y", ctypes.c_int),
+            ("Width", ctypes.c_int),
+            ("Height", ctypes.c_int),
+        ]
+
+    class _BitmapData(ctypes.Structure):
+        _fields_ = [
+            ("Width", ctypes.c_uint32),
+            ("Height", ctypes.c_uint32),
+            ("Stride", ctypes.c_int),
+            ("PixelFormat", ctypes.c_int32),
+            ("Scan0", ctypes.c_void_p),
+            ("Reserved", ctypes.c_size_t),
+        ]
+
+    try:
+        gdiplus = ctypes.WinDLL("gdiplus")
+    except OSError as exc:
+        raise LauncherError("GDI+ 不可用: {0}".format(exc)) from None
+
+    gdiplus.GdiplusStartup.restype = ctypes.c_int
+    gdiplus.GdiplusStartup.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(_StartupInput),
+        ctypes.c_void_p,
+    ]
+    gdiplus.GdipCreateBitmapFromFile.restype = ctypes.c_int
+    gdiplus.GdipCreateBitmapFromFile.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    gdiplus.GdipGetImageWidth.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    gdiplus.GdipGetImageHeight.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    gdiplus.GdipCreateBitmapFromScan0.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int32,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    gdiplus.GdipGetImageGraphicsContext.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    gdiplus.GdipSetInterpolationMode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    gdiplus.GdipSetPixelOffsetMode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    gdiplus.GdipDrawImageRectRectI.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    gdiplus.GdipBitmapLockBits.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_Rect),
+        ctypes.c_uint32,
+        ctypes.c_int32,
+        ctypes.POINTER(_BitmapData),
+    ]
+    gdiplus.GdipBitmapUnlockBits.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_BitmapData),
+    ]
+    gdiplus.GdipDisposeImage.argtypes = [ctypes.c_void_p]
+    gdiplus.GdipDeleteGraphics.argtypes = [ctypes.c_void_p]
+    gdiplus.GdipGraphicsClear.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    gdiplus.GdiplusShutdown.argtypes = [ctypes.c_void_p]
+    token = ctypes.c_void_p()
+    startup = _StartupInput(1, None, 0, 0)
+    if gdiplus.GdiplusStartup(ctypes.byref(token), ctypes.byref(startup), None):
+        raise LauncherError("GDI+ 启动失败")
+
+    image = ctypes.c_void_p()
+    bitmap = ctypes.c_void_p()
+    graphics = ctypes.c_void_p()
+    locked = _BitmapData()
+    buffer = b""
+    stride = 0
+    try:
+        if gdiplus.GdipCreateBitmapFromFile(
+            ctypes.c_wchar_p(path), ctypes.byref(image)
+        ):
+            raise LauncherError("无法读取图片 // 格式不支持或文件已损坏")
+        src_w = ctypes.c_uint32()
+        src_h = ctypes.c_uint32()
+        gdiplus.GdipGetImageWidth(image, ctypes.byref(src_w))
+        gdiplus.GdipGetImageHeight(image, ctypes.byref(src_h))
+        src_w, src_h = int(src_w.value), int(src_h.value)
+        if src_w <= 0 or src_h <= 0:
+            raise LauncherError("图片尺寸无效")
+
+        # cover: fill the box and crop; contain: whole image, letterboxed
+        if box is not None:
+            # slice of the window sized backdrop: reuse the same cover crop so
+            # the panel matches the wallpaper region behind it
+            win_ratio = ref_w / float(ref_h)
+            if (src_w / float(src_h)) > win_ratio:
+                ref_crop_h = src_h
+                ref_crop_w = max(1, int(round(src_h * win_ratio)))
+            else:
+                ref_crop_w = src_w
+                ref_crop_h = max(1, int(round(src_w / win_ratio)))
+            ref_x = (src_w - ref_crop_w) // 2
+            ref_y = (src_h - ref_crop_h) // 2
+            x0, y0, x1, y1 = box
+            src_x = ref_x + int(round(x0 * ref_crop_w))
+            src_y = ref_y + int(round(y0 * ref_crop_h))
+            crop_w = int(round((x1 - x0) * ref_crop_w))
+            crop_h = int(round((y1 - y0) * ref_crop_h))
+            src_x = max(0, min(src_w - 1, src_x))
+            src_y = max(0, min(src_h - 1, src_y))
+            crop_w = max(1, min(crop_w, src_w - src_x))
+            crop_h = max(1, min(crop_h, src_h - src_y))
+            draw_x, draw_y, draw_w, draw_h = 0, 0, width, height
+        elif fit == "contain":
+            scale = min(width / float(src_w), height / float(src_h))
+            draw_w = max(1, int(round(src_w * scale)))
+            draw_h = max(1, int(round(src_h * scale)))
+            draw_x = (width - draw_w) // 2
+            draw_y = (height - draw_h) // 2
+            src_x, src_y, crop_w, crop_h = 0, 0, src_w, src_h
+        else:
+            box_ratio = width / float(height)
+            if (src_w / float(src_h)) > box_ratio:
+                crop_h = src_h
+                crop_w = max(1, int(round(src_h * box_ratio)))
+            else:
+                crop_w = src_w
+                crop_h = max(1, int(round(src_w / box_ratio)))
+            src_x = (src_w - crop_w) // 2
+            src_y = (src_h - crop_h) // 2
+            draw_x, draw_y, draw_w, draw_h = 0, 0, width, height
+
+        if gdiplus.GdipCreateBitmapFromScan0(
+            width, height, 0, PIXEL_FORMAT_32BPP_ARGB, None, ctypes.byref(bitmap)
+        ):
+            raise LauncherError("创建画布失败")
+        if gdiplus.GdipGetImageGraphicsContext(bitmap, ctypes.byref(graphics)):
+            raise LauncherError("创建绘图上下文失败")
+        gdiplus.GdipGraphicsClear(graphics, _hex_to_argb(bg_color))
+        gdiplus.GdipSetInterpolationMode(graphics, 7)  # HighQualityBicubic
+        gdiplus.GdipSetPixelOffsetMode(graphics, 2)  # HighQuality
+        if gdiplus.GdipDrawImageRectRectI(
+            graphics,
+            image,
+            draw_x,
+            draw_y,
+            draw_w,
+            draw_h,
+            src_x,
+            src_y,
+            crop_w,
+            crop_h,
+            2,  # UnitPixel
+            None,
+            None,
+            None,
+        ):
+            raise LauncherError("图片缩放失败")
+        rect = _Rect(0, 0, width, height)
+        if gdiplus.GdipBitmapLockBits(
+            bitmap,
+            ctypes.byref(rect),
+            1,  # ImageLockModeRead
+            PIXEL_FORMAT_32BPP_ARGB,
+            ctypes.byref(locked),
+        ):
+            raise LauncherError("图片读取失败")
+        try:
+            stride = int(locked.Stride)
+            buffer = ctypes.string_at(locked.Scan0, abs(stride) * height)
+        finally:
+            gdiplus.GdipBitmapUnlockBits(bitmap, ctypes.byref(locked))
+    finally:
+        try:
+            if graphics.value:
+                gdiplus.GdipDeleteGraphics(graphics)
+            if bitmap.value:
+                gdiplus.GdipDisposeImage(bitmap)
+            if image.value:
+                gdiplus.GdipDisposeImage(image)
+        except Exception:
+            pass
+        try:
+            gdiplus.GdiplusShutdown(token)
+        except Exception:
+            pass
+
+    tables = []
+    if factor > 0:
+        tables.append(bytes(int(value * (1.0 - factor)) for value in range(256)))
+    if glow > 0:
+        tables.append(
+            bytes(int(round(value + (255 - value) * glow)) for value in range(256))
+        )
+    stride_abs = abs(stride) or width * 4
+    rows = []
+    for index in range(height):
+        chunk = buffer[index * stride_abs : index * stride_abs + width * 4]
+        blue = chunk[0::4]
+        green = chunk[1::4]
+        red = chunk[2::4]
+        for table in tables:
+            red = red.translate(table)
+            green = green.translate(table)
+            blue = blue.translate(table)
+        row = bytearray(width * 3)
+        row[0::3] = red
+        row[1::3] = green
+        row[2::3] = blue
+        rows.append(row)
+    if stride < 0:  # bottom-up DIB -> flip back
+        rows.reverse()
+    return encode_png_rgb(width, height, rows)
+
+
+def render_wallpaper_png(
+    source_path, width, height, darken=0.0, fit="cover", bg_color="#FFFFFF", **extra
+):
+    """Thread safe wrapper: GDI+ is started and stopped inside every call.
+
+    The settings preview renders on the UI thread while a background refresh
+    may still be running, and two overlapping GdiplusStartup/Shutdown pairs
+    can take the whole process down, so all renders are serialised here.
+    """
+    with _WALLPAPER_RENDER_LOCK:
+        return _render_wallpaper_png(
+            source_path, width, height, darken, fit, bg_color, **extra
+        )
+
+
+def wallpaper_photo_data(
+    source_path,
+    width,
+    height,
+    darken=0.0,
+    fit="cover",
+    bg_color="#FFFFFF",
+    white=0.0,
+    frame=None,
+    src_box=None,
+):
+    """Render the wallpaper and return base64 PNG text for tk.PhotoImage(data=)."""
+    png = render_wallpaper_png(
+        source_path,
+        width,
+        height,
+        darken,
+        fit,
+        bg_color,
+        white=white,
+        frame=frame,
+        src_box=src_box,
+    )
+    return base64.b64encode(png).decode("ascii")
+
+
+def photo_pixel_rgb(photo, x, y):
+    """(r, g, b) of one PhotoImage pixel, or None when it cannot be read."""
+    try:
+        value = photo.get(x, y)
+    except Exception:
+        return None
+    if isinstance(value, str):
+        parts = value.replace("{", "").replace("}", "").split()
+    else:
+        try:
+            parts = [str(item) for item in value]
+        except TypeError:
+            parts = str(value).split()
+    try:
+        red, green, blue = (int(float(part)) for part in parts[:3])
+    except (TypeError, ValueError):
+        return None
+    return red, green, blue
+
+
+def photo_average_color(photo):
+    """Average RGB of a small PhotoImage (tints the frosted glass panels)."""
+    red_total = green_total = blue_total = count = 0
+    try:
+        width = int(photo.width())
+        height = int(photo.height())
+    except Exception:
+        return C_WHITE
+    for y in range(height):
+        for x in range(width):
+            pixel = photo_pixel_rgb(photo, x, y)
+            if pixel is None:
+                continue
+            red_total += pixel[0]
+            green_total += pixel[1]
+            blue_total += pixel[2]
+            count += 1
+    if not count:
+        return C_WHITE
+    return "#{0:02X}{1:02X}{2:02X}".format(
+        red_total // count, green_total // count, blue_total // count
+    )
+
+
+# ---------------------------------------------------------------------------
+# 0c. Project thumbnails + icon grid (mods / resource packs / shaders)
+# ---------------------------------------------------------------------------
+
+ICON_SIZE = 48
+ICON_CACHE_LIMIT = 400
+
+
+def shorten_text(text, limit):
+    """Trim a label to ``limit`` characters with a tilde (1985 style)."""
+    value = str(text or "").strip()
+    if limit <= 0:
+        return ""
+    if len(value) <= limit:
+        return value
+    return value[: max(1, limit - 1)] + "~"
+
+
+def wrap_card_title(text, per_line=14, lines=2):
+    """Break a project name into 2 tidy lines (space first, then camelCase)."""
+    value = " ".join(str(text or "").split())
+    if not value:
+        return ""
+    if len(value) <= per_line:
+        return value
+    words = value.split(" ")
+    if len(words) > 1:
+        for index in range(len(words) - 1, 0, -1):
+            head = " ".join(words[:index])
+            tail = " ".join(words[index:])
+            if len(head) <= per_line and len(tail) <= per_line:
+                return head + "\n" + tail
+    for index in range(per_line // 2, min(len(value) - 1, per_line) + 1):
+        if value[index].isupper() and not value[index - 1].isupper():
+            return value[:index] + "\n" + shorten_text(value[index:], per_line)
+    if lines < 2:
+        return shorten_text(value, per_line)
+    return shorten_text(value[:per_line], per_line) + "\n" + shorten_text(
+        value[per_line:], per_line
+    )
+
+
+def icon_cache_dir():
+    """Per-user folder for project thumbnails (falls back when read only)."""
+    cached = globals().get("_ICON_CACHE_DIR")
+    if cached:
+        return cached
+    for path in (
+        os.path.join(BASE_DIR, "icons"),
+        os.path.join(os.path.expanduser("~"), ".akm_launcher_icons"),
+    ):
+        try:
+            ensure_dir(path)
+            probe = os.path.join(path, ".probe")
+            with open(probe, "wb") as handle:
+                handle.write(b"1")
+            os.remove(probe)
+            globals()["_ICON_CACHE_DIR"] = path
+            return path
+        except OSError:
+            continue
+    fallback = tempfile.gettempdir()
+    globals()["_ICON_CACHE_DIR"] = fallback
+    return fallback
+
+
+def icon_cache_path(slug, key_extra="", size=ICON_SIZE):
+    key = hashlib.sha1(
+        "{0}|{1}|{2}".format(slug, key_extra, size).encode("utf-8", "ignore")
+    ).hexdigest()[:16]
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(slug or "project"))[:48] or "project"
+    return os.path.join(icon_cache_dir(), "{0}-{1}.png".format(safe, key))
+
+
+def project_icon_urls(project_id, icon_url):
+    """Small variants first: the search API hands out ``..._96.webp`` (5-35 KB).
+
+    ``icon.png`` is a real PNG but is the *original* upload (often 100 KB-9 MB),
+    and it 400s for projects whose icon was uploaded in another format, so it
+    becomes the fallback. WebP is decoded through the Windows shell thumbnailer.
+    """
+    urls = []
+    fallback = str(icon_url or "").strip()
+    if fallback:
+        urls.append(fallback)
+    project_id = str(project_id or "").strip()
+    if project_id:
+        png_alias = "https://cdn.modrinth.com/data/{0}/icon.png".format(project_id)
+        if png_alias not in urls:
+            urls.append(png_alias)
+    return urls
+
+
+def _icon_bytes_supported(raw):
+    """True when GDI+ can decode these bytes (PNG / JPEG / BMP / GIF / TIFF)."""
+    if not raw:
+        return False
+    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+        return True
+    if raw[:2] == b"\xff\xd8":
+        return True
+    if raw[:6] in (b"GIF87a", b"GIF89a"):
+        return True
+    if raw[:2] == b"BM":
+        return True
+    if raw[:4] in (b"II*\x00", b"MM\x00*"):
+        return True
+    return False
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_uint32),
+        ("Data2", ctypes.c_uint16),
+        ("Data3", ctypes.c_uint16),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+class _POINT_SIZE(ctypes.Structure):
+    _fields_ = [("cx", ctypes.c_long), ("cy", ctypes.c_long)]
+
+
+class _BITMAP(ctypes.Structure):
+    _fields_ = [
+        ("bmType", ctypes.c_long),
+        ("bmWidth", ctypes.c_long),
+        ("bmHeight", ctypes.c_long),
+        ("bmWidthBytes", ctypes.c_long),
+        ("bmPlanes", ctypes.c_ushort),
+        ("bmBitsPixel", ctypes.c_ushort),
+        ("bmBits", ctypes.c_void_p),
+    ]
+
+
+class _BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize", ctypes.c_uint32),
+        ("biWidth", ctypes.c_int32),
+        ("biHeight", ctypes.c_int32),
+        ("biPlanes", ctypes.c_uint16),
+        ("biBitCount", ctypes.c_uint16),
+        ("biCompression", ctypes.c_uint32),
+        ("biSizeImage", ctypes.c_uint32),
+        ("biXPelsPerMeter", ctypes.c_int32),
+        ("biYPelsPerMeter", ctypes.c_int32),
+        ("biClrUsed", ctypes.c_uint32),
+        ("biClrImportant", ctypes.c_uint32),
+    ]
+
+
+class _BITMAPINFO(ctypes.Structure):
+    _fields_ = [("bmiHeader", _BITMAPINFOHEADER), ("bmiColors", ctypes.c_uint32 * 3)]
+
+
+# IShellItemImageFactory {BCC18B79-BA16-442F-80C4-8A59C30C463B} + IShellItem
+_IID_IMAGE_FACTORY = bytes(
+    (
+        0x79, 0x8B, 0xC1, 0xBC, 0x16, 0xBA, 0x2F, 0x44,
+        0x80, 0xC4, 0x8A, 0x59, 0xC3, 0x0C, 0x46, 0x3B,
+    )
+)
+_IID_SHELL_ITEM = bytes(
+    (
+        0x1E, 0x6D, 0x82, 0x43, 0x18, 0xE7, 0xEE, 0x42,
+        0xBC, 0x55, 0xA1, 0xE2, 0x61, 0xC3, 0x7B, 0xFE,
+    )
+)
+
+
+def _guid_from_bytes(values):
+    guid = _GUID()
+    guid.Data1 = struct.unpack("<I", bytes(values[0:4]))[0]
+    guid.Data2 = struct.unpack("<H", bytes(values[4:6]))[0]
+    guid.Data3 = struct.unpack("<H", bytes(values[6:8]))[0]
+    for index in range(8):
+        guid.Data4[index] = values[8 + index]
+    return guid
+
+
+def _vtable_call(pointer, index, restype, *argtypes):
+    table = ctypes.cast(
+        pointer, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+    ).contents
+    prototype = ctypes.WINFUNCTYPE(restype, *argtypes)
+    return prototype(table[index])
+
+
+def _hbitmap_to_png(hbitmap, size):
+    """HBITMAP -> 32bpp DIB -> scaled RGB rows -> PNG bytes."""
+    gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    bitmap = _BITMAP()
+    gdi32.GetObjectW(hbitmap, ctypes.sizeof(_BITMAP), ctypes.byref(bitmap))
+    width = int(bitmap.bmWidth)
+    height = int(bitmap.bmHeight)
+    if width <= 0 or height <= 0:
+        raise LauncherError("thumbnail size invalid")
+    info = _BITMAPINFO()
+    info.bmiHeader.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+    info.bmiHeader.biWidth = width
+    info.bmiHeader.biHeight = -height  # top-down rows
+    info.bmiHeader.biPlanes = 1
+    info.bmiHeader.biBitCount = 32
+    info.bmiHeader.biCompression = 0
+    buffer = ctypes.create_string_buffer(width * height * 4)
+    device = user32.GetDC(None)
+    try:
+        lines = gdi32.GetDIBits(
+            device, hbitmap, 0, height, buffer, ctypes.byref(info), 0
+        )
+    finally:
+        user32.ReleaseDC(None, device)
+    if not lines:
+        raise LauncherError("GetDIBits failed")
+    rows = []
+    for index in range(height):
+        chunk = buffer.raw[index * width * 4 : (index + 1) * width * 4]
+        row = bytearray(width * 3)
+        row[0::3] = chunk[2::4]  # BGRA -> RGB
+        row[1::3] = chunk[1::4]
+        row[2::3] = chunk[0::4]
+        rows.append(row)
+    if width != size or height != size:
+        picks_x = [min(width - 1, int(i * width / float(size))) for i in range(size)]
+        picks_y = [min(height - 1, int(i * height / float(size))) for i in range(size)]
+        scaled = []
+        for row_index in picks_y:
+            source = rows[row_index]
+            row = bytearray(size * 3)
+            for target_index, source_index in enumerate(picks_x):
+                row[target_index * 3 : target_index * 3 + 3] = source[
+                    source_index * 3 : source_index * 3 + 3
+                ]
+            scaled.append(row)
+        rows = scaled
+    return encode_png_rgb(size, size, rows)
+
+
+# ---------------------------------------------------------------------------
+# 0d. Mod jar audit: "does this mod have a build for MC 1.21?"
+# ---------------------------------------------------------------------------
+
+
+def _mc_tuple(text):
+    match = re.search(r"(\d+(?:\.\d+)*)", str(text or ""))
+    if not match:
+        return ()
+    try:
+        return tuple(int(part) for part in match.group(1).split("."))
+    except ValueError:
+        return ()
+
+
+def _mc_compare(left, right):
+    size = max(len(left), len(right))
+    left = tuple(left) + (0,) * (size - len(left))
+    right = tuple(right) + (0,) * (size - len(right))
+    if left == right:
+        return 0
+    return 1 if left > right else -1
+
+
+def mc_same_family(target, candidate, allow_patch=True):
+    """1.21 matches 1.21 and (optionally) 1.21.1 - but never 1.22."""
+    base = _mc_tuple(target)
+    other = _mc_tuple(candidate)
+    if not base or not other:
+        return False
+    if base == other:
+        return True
+    if allow_patch and len(base) == 2 and len(other) == 3 and other[:2] == base:
+        return True
+    return False
+
+
+def _mc_clause(clause, target, allow_patch=True):
+    """One predicate clause: 1.21 / >=1.20 / <1.22 / ~1.21 / [1.20,1.22)."""
+    text = str(clause or "").strip()
+    if not text or text in {"*", "x", "X", "any", "-"}:
+        return True
+    match = re.match(r"^(>=|<=|>|<|=|~|\^)?\s*[vV]?(\d+(?:\.\d+)*(?:\.[xX*])?)$", text)
+    if match:
+        operator = match.group(1) or ""
+        raw = match.group(2)
+        wildcard = raw.lower().endswith((".x", ".*"))
+        base = _mc_tuple(raw)
+        if not base:
+            return True
+        if wildcard:
+            return tuple(target[: len(base)]) == base
+        if operator in ("", "="):
+            if _mc_compare(target, base) == 0:
+                return True
+            return bool(
+                allow_patch
+                and len(base) == 3
+                and len(target) == 2
+                and base[:2] == target
+            )
+        if operator == ">=":
+            return _mc_compare(target, base) >= 0
+        if operator == ">":
+            return _mc_compare(target, base) > 0
+        if operator == "<=":
+            return _mc_compare(target, base) <= 0
+        if operator == "<":
+            return _mc_compare(target, base) < 0
+        if operator == "~":
+            return _mc_compare(target, base) >= 0 and target[:2] == base[:2]
+        if operator == "^":
+            return _mc_compare(target, base) >= 0 and target[:1] == base[:1]
+        return True
+    match = re.match(r"^([\[\(])\s*([^,]*?)\s*,\s*([^\]\)]*?)\s*([\]\)])$", text)
+    if match:
+        lower_open, low, high, upper_open = match.groups()
+        if low:
+            base = _mc_tuple(low)
+            compare = _mc_compare(target, base)
+            if compare < 0 or (lower_open == "(" and compare == 0):
+                return False
+        if high:
+            base = _mc_tuple(high)
+            compare = _mc_compare(target, base)
+            if compare > 0 or (upper_open == ")" and compare == 0):
+                return False
+        return True
+    return True
+
+
+def mc_predicate_ok(predicate, target, allow_patch=True):
+    """True when the declared MC dependency admits ``target``."""
+    if isinstance(predicate, (list, tuple)):
+        return all(mc_predicate_ok(item, target, allow_patch) for item in predicate)
+    text = str(predicate or "").strip()
+    if not text:
+        return True
+    base = _mc_tuple(target)
+    if not base:
+        return True
+    clauses = [item for item in re.split(r"\s+", text) if item]
+    return all(_mc_clause(clause, base, allow_patch) for clause in clauses)
+
+
+def jar_mc_hint(filename):
+    """Pull a version such as 1.21 out of ``sodium-fabric-0.5.8+mc1.21.jar``."""
+    text = str(filename or "")
+    for pattern in (
+        r"[+_-]mc(\d+\.\d+(?:\.\d+)?)",
+        r"[+_-](1\.(?:[7-9]|1\d|2\d)(?:\.\d+)?)[+_-]",
+        r"[+_-](\d+\.\d+\.\d+)\+",
+        r"-(1\.\d+(?:\.\d+)?)\.jar$",
+    ):
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            candidate = match.group(1)
+            value = _mc_tuple(candidate)
+            if value and value[0] == 1 and len(value) >= 2:
+                return candidate
+    return ""
+
+
+def _parse_toml_meta(text, meta):
+    """Tiny mods.toml reader (tomllib when available, regex otherwise)."""
+    if tomllib is not None:
+        try:
+            data = tomllib.loads(text)
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            mods = data.get("mods") or []
+            first = mods[0] if mods and isinstance(mods[0], dict) else {}
+            meta["modid"] = str(first.get("modId") or "")
+            meta["version"] = str(first.get("version") or "")
+            meta["title"] = str(first.get("displayName") or meta["modid"])
+            dependencies = data.get("dependencies") or {}
+            if isinstance(dependencies, dict):
+                for entries in dependencies.values():
+                    for entry in entries or []:
+                        if (
+                            isinstance(entry, dict)
+                            and str(entry.get("modId") or "").lower() == "minecraft"
+                        ):
+                            meta["predicate"] = entry.get("versionRange") or ""
+                            return
+    match = re.search(r'modId\s*=\s*"([^"]+)"', text)
+    if match and not meta["modid"]:
+        meta["modid"] = match.group(1)
+    match = re.search(r'displayName\s*=\s*"([^"]+)"', text)
+    if match and not meta["title"]:
+        meta["title"] = match.group(1)
+    match = re.search(r'version\s*=\s*"([^"]+)"', text)
+    if match and not meta["version"]:
+        meta["version"] = match.group(1)
+    match = re.search(
+        r'modId\s*=\s*"minecraft"[\s\S]{0,240}?versionRange\s*=\s*"([^"]+)"', text
+    )
+    if match:
+        meta["predicate"] = match.group(1)
+
+
+def jar_local_meta(path):
+    """Read the mod loader metadata inside a jar (no network needed)."""
+    name = os.path.basename(path)
+    meta = {
+        "file": name,
+        "path": path,
+        "title": "",
+        "modid": "",
+        "version": "",
+        "loader": "",
+        "predicate": "",
+        "mc_hint": jar_mc_hint(name),
+        "error": "",
+    }
+    try:
+        with zipfile.ZipFile(path) as bundle:
+            names = set(bundle.namelist())
+            if "fabric.mod.json" in names:
+                data = json.loads(
+                    bundle.read("fabric.mod.json").decode("utf-8", "replace")
+                )
+                meta["loader"] = "fabric"
+                meta["modid"] = str(data.get("id") or "")
+                meta["version"] = str(data.get("version") or "")
+                meta["title"] = str(data.get("name") or data.get("id") or "")
+                depends = data.get("depends") or {}
+                if isinstance(depends, dict):
+                    meta["predicate"] = depends.get("minecraft") or ""
+                if "quilt.mod.json" in names:
+                    meta["loader"] = "quilt"
+            elif "quilt.mod.json" in names:
+                data = json.loads(
+                    bundle.read("quilt.mod.json").decode("utf-8", "replace")
+                )
+                loader = data.get("quilt_loader") or {}
+                meta["loader"] = "quilt"
+                meta["modid"] = str(loader.get("id") or "")
+                meta["version"] = str(loader.get("version") or "")
+                metadata = loader.get("metadata") or {}
+                meta["title"] = str(metadata.get("name") or meta["modid"])
+                for entry in loader.get("depends") or []:
+                    if isinstance(entry, dict) and str(entry.get("id")) == "minecraft":
+                        meta["predicate"] = entry.get("versions") or ""
+                        break
+            elif (
+                "META-INF/neoforge.mods.toml" in names
+                or "META-INF/mods.toml" in names
+            ):
+                entry = (
+                    "META-INF/neoforge.mods.toml"
+                    if "META-INF/neoforge.mods.toml" in names
+                    else "META-INF/mods.toml"
+                )
+                text = bundle.read(entry).decode("utf-8", "replace")
+                meta["loader"] = (
+                    "neoforge" if entry.endswith("neoforge.mods.toml") else "forge"
+                )
+                _parse_toml_meta(text, meta)
+            elif "mcmod.info" in names:
+                data = json.loads(
+                    bundle.read("mcmod.info").decode("utf-8", "replace")
+                )
+                if isinstance(data, dict):
+                    data = data.get("modList") or [data]
+                if isinstance(data, list) and data:
+                    first = data[0] if isinstance(data[0], dict) else {}
+                    meta["loader"] = "forge"
+                    meta["modid"] = str(first.get("modid") or "")
+                    meta["version"] = str(first.get("version") or "")
+                    meta["title"] = str(first.get("name") or meta["modid"])
+                    meta["predicate"] = str(first.get("mcversion") or "")
+            else:
+                try:
+                    manifest = bundle.read("META-INF/MANIFEST.MF").decode(
+                        "utf-8", "replace"
+                    )
+                except KeyError:
+                    manifest = ""
+                match = re.search(r"Implementation-Version:\s*(\S+)", manifest or "")
+                if match:
+                    meta["version"] = match.group(1)
+    except zipfile.BadZipFile:
+        meta["error"] = "不是有效的 jar"
+    except Exception as exc:  # noqa: BLE001
+        meta["error"] = str(exc)[:60]
+    if not meta["title"]:
+        meta["title"] = os.path.splitext(name)[0]
+    return meta
+
+
+def _chunks(values, size):
+    for start in range(0, len(values), size):
+        yield values[start : start + size]
+
+
+def modrinth_projects_bulk(ids, timeout=30):
+    """GET /v2/projects?ids=[...] (100 per call) -> {project_id: project}."""
+    result = {}
+    for chunk in _chunks([str(item) for item in ids if item], 100):
+        url = "https://api.modrinth.com/v2/projects?ids=" + urllib.parse.quote(
+            json.dumps(chunk)
+        )
+        try:
+            data = with_retry(lambda target=url: http_json(target, timeout=timeout))
+        except Exception:
+            log_debug("bulk project lookup failed:\n" + traceback.format_exc())
+            continue
+        if isinstance(data, dict):
+            data = [data]
+        for project in data or []:
+            if isinstance(project, dict) and project.get("id"):
+                result[str(project["id"])] = project
+    return result
+
+
+def release_versions(values):
+    """Keep plain 1.x releases (drop snapshots, RC and future numbering)."""
+    cleaned = []
+    for value in values or []:
+        text = str(value or "")
+        match = re.match(r"^(\d+)\.\d+(\.\d+)?$", text)
+        if match and match.group(1) == "1":
+            cleaned.append(text)
+    return cleaned
+
+
+def audit_mod_jars(
+    paths,
+    target,
+    allow_patch=True,
+    use_network=True,
+    progress=None,
+    loader="",
+    check_curseforge=False,
+):
+    """Classify jars: does the mod publish a build for the target MC version?"""
+    target = str(target or "").strip()
+    rows = []
+    seen = set()
+    for path in paths:
+        key = os.path.normcase(os.path.abspath(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(jar_local_meta(path))
+    if progress:
+        progress(0, len(rows), "读取本地元数据")
+
+    hashes = {}
+    for row in rows:
+        try:
+            hashes[sha1_file(row["path"])] = row
+        except OSError:
+            continue
+
+    if use_network and hashes:
+        digests = list(hashes)
+        found = {}
+        for chunk in _chunks(digests, 100):
+            try:
+                data = modrinth_version_files(chunk)
+            except Exception:
+                log_debug("audit hash lookup failed:\n" + traceback.format_exc())
+                continue
+            if isinstance(data, dict):
+                found.update(data)
+        if progress:
+            progress(1, 3, "哈希匹配 {0}/{1}".format(len(found), len(digests)))
+        # one bulk call -> newest build of each mod for exactly this MC version
+        newest = {}
+        for chunk in _chunks(digests, 100):
+            try:
+                data = modrinth_version_files(chunk, update=True, game_versions=[target])
+            except Exception:
+                log_debug("audit update lookup failed:\n" + traceback.format_exc())
+                continue
+            if isinstance(data, dict):
+                newest.update(data)
+        if progress:
+            progress(2, 3, "找到 {0} 个 {1} 构建".format(len(newest), target))
+        project_ids = sorted(
+            {
+                str(info.get("project_id"))
+                for info in found.values()
+                if isinstance(info, dict) and info.get("project_id")
+            }
+        )
+        projects = modrinth_projects_bulk(project_ids)
+        if progress:
+            progress(3, 3, "{0} 个项目已核对".format(len(projects)))
+        for digest, row in hashes.items():
+            info = found.get(digest)
+            info = info if isinstance(info, dict) else {}
+            project_id = str(info.get("project_id") or "")
+            project = projects.get(project_id) or {}
+            row["project_id"] = project_id
+            row["installed_version"] = str(info.get("version_number") or "")
+            row["installed_loaders"] = ",".join(info.get("loaders") or [])
+            if project.get("slug"):
+                row["slug"] = str(project.get("slug"))
+            game_versions = [str(item) for item in (project.get("game_versions") or [])]
+            row["max_mc"] = (
+                sort_versions_desc(release_versions(game_versions)) or [""]
+            )[0]
+            if not project_id:
+                continue
+            best = newest.get(digest)
+            if isinstance(best, dict) and best.get("version_number"):
+                row["ok"] = True
+                row["source"] = "modrinth"
+                row["best"] = str(best.get("version_number"))
+                row["best_loaders"] = ",".join(best.get("loaders") or [])
+                row["best_id"] = str(best.get("id") or "")
+                row["best_files"] = [
+                    item
+                    for item in (best.get("files") or [])
+                    if isinstance(item, dict) and item.get("url")
+                ]
+                continue
+            if game_versions:
+                row["ok"] = any(
+                    mc_same_family(target, item, allow_patch) for item in game_versions
+                )
+                row["source"] = "modrinth"
+    for row in rows:
+        if row.get("source"):
+            continue
+        predicate = row.get("predicate") or ""
+        if predicate:
+            row["ok"] = mc_predicate_ok(predicate, target, allow_patch)
+            row["source"] = "local"
+        elif row.get("mc_hint"):
+            row["ok"] = mc_same_family(target, row["mc_hint"], allow_patch)
+            row["source"] = "filename"
+        else:
+            row["ok"] = None
+            row["source"] = "unknown"
+    if use_network and check_curseforge:
+        try:
+            ports = audit_curseforge_ports(
+                rows, target, loader, allow_patch, progress
+            )
+        except Exception:
+            ports = 0
+            log_debug("curseforge audit failed:\n" + traceback.format_exc())
+        if ports and progress:
+            progress(
+                len(rows),
+                len(rows),
+                "CurseForge 找到 {0} 个移植版本".format(ports),
+            )
+    if progress:
+        progress(len(rows), len(rows), "完成")
+    return rows
+
+
+# --- Explorer drag & drop (WM_DROPFILES via ctypes, no third party libs) ----
+
+_WM_DROPFILES = 0x0233
+_GWLP_WNDPROC = -4
+_LRESULT = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
+_WNDPROC_TYPE = ctypes.WINFUNCTYPE(
+    _LRESULT, ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_size_t
+)
+_DROP_STATES = {}
+
+
+def enable_file_drop(window, callback):
+    """Let the user drop files/folders from Explorer onto a Toplevel.
+
+    Tk has no native drop support, so the top level window procedure is
+    subclassed and WM_DROPFILES is handled here. Everything is wrapped so a
+    failure simply means "drag and drop unavailable" (the dialogs still work).
+    """
+    if os.name != "nt":
+        return False
+    try:
+        handle = int(window.wm_frame(), 16)
+    except Exception:
+        return False
+    if not handle:
+        return False
+    try:
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        shell32.DragAcceptFiles.argtypes = [ctypes.c_void_p, ctypes.c_bool]
+        shell32.DragQueryFileW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint,
+            ctypes.c_wchar_p,
+            ctypes.c_uint,
+        ]
+        shell32.DragFinish.argtypes = [ctypes.c_void_p]
+        user32.CallWindowProcW.restype = _LRESULT
+        user32.CallWindowProcW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+        ]
+        user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+        user32.SetWindowLongPtrW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            _WNDPROC_TYPE,
+        ]
+        state = {"old": None, "proc": None, "callback": callback, "hwnd": handle, "paths": []}
+
+        def handler(hwnd, message, wparam, lparam):
+            if message == _WM_DROPFILES:
+                try:
+                    count = int(
+                        shell32.DragQueryFileW(
+                            ctypes.c_void_p(wparam), 0xFFFFFFFF, None, 0
+                        )
+                    )
+                    paths = []
+                    for index in range(max(0, count)):
+                        buffer = ctypes.create_unicode_buffer(1024)
+                        length = shell32.DragQueryFileW(
+                            ctypes.c_void_p(wparam), index, buffer, 1024
+                        )
+                        if length:
+                            paths.append(buffer.value)
+                    shell32.DragFinish(ctypes.c_void_p(wparam))
+                    if paths:
+                        # never touch Tk from inside the window procedure: the
+                        # dialog polls this list with after() instead.
+                        state["paths"].extend(paths)
+                except Exception:
+                    pass
+                return 0
+            try:
+                return user32.CallWindowProcW(
+                    state["old"], hwnd, message, wparam, lparam
+                )
+            except Exception:
+                return 0
+
+        proc = _WNDPROC_TYPE(handler)
+        state["proc"] = proc
+        state["old"] = user32.SetWindowLongPtrW(
+            ctypes.c_void_p(handle), _GWLP_WNDPROC, proc
+        )
+        shell32.DragAcceptFiles(ctypes.c_void_p(handle), True)
+        _DROP_STATES[handle] = state
+        return True
+    except Exception:
+        log_debug("file drop unavailable:\n" + traceback.format_exc())
+        return False
+
+
+def take_dropped_paths(window):
+    """Drain the paths a drop collected (safe to call from a Tk timer)."""
+    try:
+        handle = int(window.wm_frame(), 16)
+    except Exception:
+        return []
+    state = _DROP_STATES.get(handle)
+    if not state:
+        return []
+    paths = list(state.get("paths") or [])
+    state["paths"] = []
+    return paths
+
+
+def drop_registered(window):
+    try:
+        return int(window.wm_frame(), 16) in _DROP_STATES
+    except Exception:
+        return False
+
+
+def disable_file_drop(window):
+    try:
+        handle = int(window.wm_frame(), 16)
+    except Exception:
+        return
+    state = _DROP_STATES.pop(handle, None)
+    if not state:
+        return
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+        user32.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int, _WNDPROC_TYPE]
+        user32.SetWindowLongPtrW(
+            ctypes.c_void_p(handle), _GWLP_WNDPROC, state["old"]
+        )
+    except Exception:
+        pass
+
+
+def install_mod_build(row, target_dir, timeout=120):
+    """Download the stored target-MC build of an audit row and replace the jar."""
+    files = [
+        item
+        for item in (row.get("best_files") or [])
+        if isinstance(item, dict) and item.get("url")
+    ]
+    primary = next(
+        (item for item in files if item.get("primary")), files[0] if files else None
+    )
+    if primary is None:
+        raise LauncherError("该版本没有可下载文件")
+    ensure_dir(target_dir)
+    filename = sanitize_filename(
+        str(primary.get("filename") or os.path.basename(row.get("path") or "mod.jar"))
+    )
+    destination = os.path.join(target_dir, filename)
+    download_file(str(primary["url"]), destination, timeout=timeout)
+    expected = str((primary.get("hashes") or {}).get("sha1") or "").lower()
+    if expected:
+        actual = sha1_file(destination)
+        if actual != expected:
+            _cleanup(destination)
+            raise LauncherError("SHA1 校验失败")
+    old_path = str(row.get("path") or "")
+    if old_path and os.path.abspath(old_path) != os.path.abspath(destination):
+        same_folder = os.path.normcase(
+            os.path.dirname(os.path.abspath(old_path))
+        ) == os.path.normcase(os.path.abspath(target_dir))
+        if same_folder:
+            try:
+                os.remove(old_path)
+            except OSError as exc:
+                log_debug("audit replace failed: {0}".format(exc))
+    return destination
+
+
+def shell_thumbnail_png(source_path, size=ICON_SIZE):
+    """PNG bytes from the Windows shell thumbnailer (handles WebP icons too).
+
+    GDI+ cannot read WebP, which is how most Modrinth icons are stored, so when
+    the ``icon.png`` alias is missing the shell is asked to decode the file
+    (it uses the WIC codecs, even for WebP) and returns an HBITMAP we encode
+    ourselves.
+    """
+    if os.name != "nt":
+        raise LauncherError("thumbnail is Windows only")
+    path = os.path.abspath(str(source_path or ""))
+    if not os.path.isfile(path):
+        raise LauncherError("thumbnail source missing")
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+    gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+    uninitialised = False
+    try:
+        hr = ole32.CoInitializeEx(None, 2)  # COINIT_APARTMENTTHREADED
+        uninitialised = hr in (0, 1)
+    except Exception:
+        pass
+    shell32.SHCreateItemFromParsingName.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(_GUID),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    item = ctypes.c_void_p()
+    factory = ctypes.c_void_p()
+    hbitmap = ctypes.c_void_p()
+    try:
+        iid = _guid_from_bytes(_IID_SHELL_ITEM)
+        hr = shell32.SHCreateItemFromParsingName(
+            ctypes.c_wchar_p(path), None, ctypes.byref(iid), ctypes.byref(item)
+        )
+        if hr != 0 or not item:
+            raise LauncherError("shell item failed {0}".format(hex(hr & 0xFFFFFFFF)))
+        query = _vtable_call(
+            item,
+            0,
+            ctypes.c_long,
+            ctypes.c_void_p,
+            ctypes.POINTER(_GUID),
+            ctypes.POINTER(ctypes.c_void_p),
+        )
+        iid = _guid_from_bytes(_IID_IMAGE_FACTORY)
+        hr = query(item, ctypes.byref(iid), ctypes.byref(factory))
+        if hr != 0 or not factory:
+            raise LauncherError(
+                "image factory missing {0}".format(hex(hr & 0xFFFFFFFF))
+            )
+        get_image = _vtable_call(
+            factory,
+            3,
+            ctypes.c_long,
+            ctypes.c_void_p,
+            _POINT_SIZE,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_void_p),
+        )
+        hr = get_image(factory, _POINT_SIZE(size, size), 0, ctypes.byref(hbitmap))
+        if hr != 0 or not hbitmap:
+            raise LauncherError("thumbnail failed {0}".format(hex(hr & 0xFFFFFFFF)))
+        return _hbitmap_to_png(hbitmap, size)
+    finally:
+        try:
+            if hbitmap:
+                gdi32.DeleteObject(hbitmap)
+        except Exception:
+            pass
+        for pointer in (factory, item):
+            try:
+                if pointer:
+                    release = _vtable_call(pointer, 2, ctypes.c_ulong, ctypes.c_void_p)
+                    release(pointer)
+            except Exception:
+                pass
+        if uninitialised:
+            try:
+                ole32.CoUninitialize()
+            except Exception:
+                pass
+
+
+def http_bytes(url, timeout=20, limit=3 * 1024 * 1024):
+    """Small binary GET (project icons are a few hundred KB at most)."""
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        data = response.read(limit + 1)
+    if len(data) > limit:
+        raise LauncherError("icon too large: {0}".format(url))
+    if not data:
+        raise LauncherError("icon empty: {0}".format(url))
+    return data
+
+
+def trim_icon_cache(limit=ICON_CACHE_LIMIT):
+    try:
+        folder = icon_cache_dir()
+        entries = [
+            os.path.join(folder, name)
+            for name in os.listdir(folder)
+            if name.lower().endswith(".png")
+        ]
+    except OSError:
+        return
+    if len(entries) <= limit:
+        return
+    entries.sort(key=lambda path: os.path.getmtime(path), reverse=True)
+    for path in entries[limit:]:
+        _cleanup(path)
+
+
+def load_project_icon(slug, urls, size=ICON_SIZE):
+    """48x48 base64 PNG for a Modrinth project, cached on disk between runs."""
+    urls = [str(url).strip() for url in (urls or []) if str(url or "").strip()]
+    if not urls:
+        return ""
+    cached = icon_cache_path(slug, urls[0], size)
+    try:
+        if os.path.getsize(cached) > 0:
+            with open(cached, "rb") as handle:
+                return base64.b64encode(handle.read()).decode("ascii")
+    except OSError:
+        pass
+    png = b""
+    for url in urls:
+        try:
+            raw = http_bytes(url)
+        except Exception:
+            continue
+        if _icon_bytes_supported(raw):
+            temp_source = cached + ".src.png"
+            with open(temp_source, "wb") as handle:
+                handle.write(raw)
+            try:
+                png = render_wallpaper_png(
+                    temp_source, size, size, 0.0, "cover", C_WHITE
+                )
+            except Exception:
+                png = b""
+            finally:
+                _cleanup(temp_source)
+        else:
+            # Modrinth stores most icons as WebP; let the Windows shell decode it.
+            temp_source = cached + ".src.webp"
+            try:
+                with open(temp_source, "wb") as handle:
+                    handle.write(raw)
+                png = shell_thumbnail_png(temp_source, size)
+            except Exception:
+                png = b""
+            finally:
+                _cleanup(temp_source)
+        if png:
+            break
+    if not png:
+        return ""
+    try:
+        with open(cached, "wb") as handle:
+            handle.write(png)
+    except OSError:
+        pass
+    trim_icon_cache()
+    return base64.b64encode(png).decode("ascii")
+
+
+class IconGrid(tk.Frame):
+    """Scrollable cards: thumbnail on top, name and stats below.
+
+    Tk has no image listbox, so this keeps fixed sized cards inside a canvas and
+    re-flows the columns whenever the width changes.
+    """
+
+    def __init__(
+        self,
+        parent,
+        on_select=None,
+        on_activate=None,
+        icon_size=ICON_SIZE,
+        card_width=116,
+        multi=False,
+        background=None,
+    ):
+        background = background or C_WHITE
+        tk.Frame.__init__(self, parent, bg=background, bd=0, highlightthickness=0)
+        self.background = background
+        self.card_width = max(78, int(card_width))
+        self.icon_size = max(24, int(icon_size))
+        self.on_select = on_select
+        self.on_activate = on_activate
+        self.multi = bool(multi)
+        self._items = []
+        self._cards = []
+        self._photos = {}
+        self._selected = []
+        self._columns = 1
+        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+        self.canvas = tk.Canvas(
+            self, bg=background, bd=0, highlightthickness=0, takefocus=1
+        )
+        self.scroll = tk.Scrollbar(
+            self,
+            orient="vertical",
+            command=self.canvas.yview,
+            width=14,
+            bg=C_GRAY,
+            activebackground=C_TEAL,
+            troughcolor=C_WHITE,
+            bd=1,
+            relief="solid",
+            highlightthickness=0,
+        )
+        self.canvas.configure(yscrollcommand=self.scroll.set)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.scroll.grid(row=0, column=1, sticky="ns")
+        self.inner = tk.Frame(self.canvas, bg=background)
+        self.canvas.create_window((2, 2), window=self.inner, anchor="nw", tags="cards")
+        self.inner.bind("<Configure>", self._on_inner_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+        for widget in (self.canvas, self.inner):
+            widget.bind("<MouseWheel>", self._on_wheel)
+        self.canvas.bind("<Up>", lambda _event: self._nudge(-self._columns))
+        self.canvas.bind("<Down>", lambda _event: self._nudge(self._columns))
+        self.canvas.bind("<Left>", lambda _event: self._nudge(-1))
+        self.canvas.bind("<Right>", lambda _event: self._nudge(1))
+        self.canvas.bind("<Return>", self._activate_current)
+
+    # -- layout -------------------------------------------------------------
+    def _on_inner_configure(self, _event=None):
+        try:
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        except Exception:
+            pass
+
+    def _on_canvas_configure(self, event):
+        width = max(40, int(event.width))
+        try:
+            self.canvas.itemconfigure("cards", width=width - 4)
+        except Exception:
+            pass
+        columns = max(1, (width - 8) // (self.card_width + 6))
+        if columns != self._columns:
+            self._columns = columns
+            self._regrid()
+
+    def _on_wheel(self, event):
+        step = -1 if getattr(event, "delta", 0) > 0 else 1
+        try:
+            self.canvas.yview_scroll(step, "units")
+        except Exception:
+            pass
+        return "break"
+
+    def _regrid(self):
+        columns = max(1, int(self._columns))
+        for column in range(columns):
+            try:
+                self.inner.columnconfigure(
+                    column, weight=0, minsize=self.card_width + 4
+                )
+            except Exception:
+                pass
+        for index, card in enumerate(self._cards):
+            try:
+                card.grid(
+                    row=index // columns,
+                    column=index % columns,
+                    padx=2,
+                    pady=2,
+                    sticky="nw",
+                )
+            except Exception:
+                pass
+
+    # -- content ------------------------------------------------------------
+    def _card_height(self):
+        return self.icon_size + 58
+
+    def set_items(self, items):
+        for card in self._cards:
+            try:
+                card.destroy()
+            except Exception:
+                pass
+        self._cards = []
+        self._photos = {}
+        self._selected = []
+        self._items = list(items or [])
+        for index, item in enumerate(self._items):
+            self._cards.append(self._make_card(index, item))
+        self._regrid()
+        try:
+            self.canvas.yview_moveto(0.0)
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        except Exception:
+            pass
+
+    def _make_card(self, index, item):
+        card = tk.Frame(
+            self.inner,
+            bg=self.background,
+            bd=1,
+            relief="solid",
+            width=self.card_width,
+            height=self._card_height(),
+            cursor="hand2",
+        )
+        card.grid_propagate(False)
+        card.pack_propagate(False)
+        holder = tk.Frame(
+            card,
+            bg=C_GRAY,
+            bd=1,
+            relief="solid",
+            width=self.icon_size,
+            height=self.icon_size,
+            cursor="hand2",
+        )
+        holder.pack(pady=(4, 3))
+        holder.pack_propagate(False)
+        icon_label = tk.Label(
+            holder,
+            bg=C_GRAY,
+            fg=C_TEAL,
+            font=FONT_TITLE,
+            text=str(item.get("initial") or "?"),
+            cursor="hand2",
+        )
+        icon_label.pack(fill="both", expand=True)
+        title = tk.Label(
+            card,
+            text=str(item.get("title") or "?"),
+            bg=self.background,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            justify="center",
+            wraplength=self.card_width - 12,
+            cursor="hand2",
+        )
+        title.pack(fill="x", padx=2)
+        meta = tk.Label(
+            card,
+            text=str(item.get("meta") or ""),
+            bg=self.background,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            cursor="hand2",
+        )
+        meta.pack(fill="x", padx=2)
+        for widget in (card, holder, icon_label, title, meta):
+            widget.bind("<Button-1>", lambda event, i=index: self._on_click(i, event))
+            widget.bind(
+                "<Double-Button-1>", lambda event, i=index: self._on_double(i, event)
+            )
+            widget.bind("<MouseWheel>", self._on_wheel)
+        card._icon_label = icon_label  # type: ignore[attr-defined]
+        card._title_label = title  # type: ignore[attr-defined]
+        card._meta_label = meta  # type: ignore[attr-defined]
+        return card
+
+    # -- selection ----------------------------------------------------------
+    def _on_click(self, index, event=None):
+        additive = bool(event is not None and (event.state & 0x0004))
+        if self.multi and additive:
+            self.toggle(index)
+        else:
+            self.select(index)
+        try:
+            self.canvas.focus_set()
+        except Exception:
+            pass
+        return "break"
+
+    def _on_double(self, index, event=None):
+        self.select(index)
+        if callable(self.on_activate):
+            self.on_activate(index)
+        return "break"
+
+    def select(self, index, notify=True):
+        index = int(index)
+        if not 0 <= index < len(self._cards):
+            return
+        self._selected = [index]
+        self._repaint()
+        self._ensure_visible(index)
+        if notify and callable(self.on_select):
+            self.on_select(index)
+
+    def toggle(self, index):
+        index = int(index)
+        if not 0 <= index < len(self._cards):
+            return
+        if index in self._selected:
+            self._selected = [item for item in self._selected if item != index]
+        else:
+            self._selected.append(index)
+        self._repaint()
+        if callable(self.on_select):
+            self.on_select(index)
+
+    def selected_indices(self):
+        return list(self._selected)
+
+    def select_all(self):
+        self._selected = list(range(len(self._cards)))
+        self._repaint()
+
+    def clear_selection(self):
+        if not self._selected:
+            return
+        self._selected = []
+        self._repaint()
+
+    def _repaint(self):
+        for index, card in enumerate(self._cards):
+            selected = index in self._selected
+            background = C_TEAL if selected else self.background
+            foreground = C_WHITE if selected else C_BLACK
+            try:
+                card.configure(bg=background)
+                card._title_label.configure(bg=background, fg=foreground)
+                card._meta_label.configure(bg=background, fg=foreground)
+            except Exception:
+                pass
+
+    def _ensure_visible(self, index):
+        try:
+            card = self._cards[index]
+            self.inner.update_idletasks()
+            total = max(1, int(self.inner.winfo_height()))
+            first, last = self.canvas.yview()
+            view_top = first * total
+            view_bottom = last * total
+            top = int(card.winfo_y())
+            bottom = top + int(card.winfo_height())
+            if top < view_top:
+                self.canvas.yview_moveto(max(0.0, (top - 4) / float(total)))
+            elif bottom > view_bottom:
+                span = max(1.0, view_bottom - view_top)
+                self.canvas.yview_moveto(
+                    min(1.0, max(0.0, (bottom - span + 4) / float(total)))
+                )
+        except Exception:
+            pass
+
+    def _nudge(self, delta):
+        if not self._cards:
+            return "break"
+        current = self._selected[-1] if self._selected else -1
+        target = max(0, min(len(self._cards) - 1, current + int(delta)))
+        self.select(target)
+        return "break"
+
+    def _activate_current(self, _event=None):
+        if self._selected and callable(self.on_activate):
+            self.on_activate(self._selected[-1])
+        return "break"
+
+    # -- thumbnails ---------------------------------------------------------
+    def set_icon(self, key, data):
+        """Replace the placeholder of every card whose key matches."""
+        if not data:
+            return False
+        try:
+            photo = tk.PhotoImage(data=data)
+        except Exception:
+            return False
+        applied = False
+        for index, item in enumerate(self._items):
+            if str(item.get("key") or "") != str(key or ""):
+                continue
+            if index >= len(self._cards):
+                continue
+            try:
+                self._cards[index]._icon_label.configure(image=photo, text="")
+            except Exception:
+                continue
+            self._photos[str(key)] = photo
+            item["has_icon"] = True
+            applied = True
+        return applied
+
+
+def _hit_card(hit, target_version=""):
+    """Card payload (title / meta / key) for one Modrinth search hit."""
+    title = str(hit.get("title") or hit.get("slug") or "?")
+    meta = human_count(hit.get("downloads"))
+    warning = ""
+    if hit.get("supports_version") is False and target_version:
+        warning = "无{0}".format(target_version)
+    elif hit.get("supports_loader") is False:
+        warning = "无构建"
+    if warning:
+        meta = "{0} // {1}".format(warning, meta)
+    return {
+        "key": str(hit.get("slug") or hit.get("project_id") or title),
+        "title": wrap_card_title(title, 14),
+        "meta": meta,
+        "initial": (title[:1] or "?").upper(),
+    }
+
+
+
+# ---------------------------------------------------------------------------
+# 1. Offline Chinese -> Modrinth slug dictionary (>= 50 entries, auto written)
+# ---------------------------------------------------------------------------
+
+MOD_ALIAS_DEFAULT = {
+    # --- 性能 / 优化 ---------------------------------------------------
+    "钠": "sodium",
+    "sodium": "sodium",
+    "钠优化": "sodium",
+    "优化": "sodium",
+    "性能优化": "sodium",
+    "帧数优化": "sodium",
+    "fps优化": "sodium",
+    "锂": "lithium",
+    "lithium": "lithium",
+    "铁氧体": "ferrite-core",
+    "铁氧体内存": "ferrite-core",
+    "内存优化": "ferrite-core",
+    "氪": "krypton",
+    "网络优化": "krypton",
+    "实体剔除": "entityculling",
+    "实体渲染优化": "entityculling",
+    "立即快速": "immediatelyfast",
+    "快速渲染": "immediatelyfast",
+    "区块生成优化": "c2me-fabric",
+    "并发区块": "c2me-fabric",
+    "现代修复": "modernfix",
+    "铷": "rubidium",
+    "嵌入铷": "embeddium",
+    # --- 界面 / 信息 ---------------------------------------------------
+    "高亮显示": "jade",
+    "jade": "jade",
+    "方块信息": "jade",
+    "信息显示": "jade",
+    "物品管理器": "jei",
+    "jei": "jei",
+    "合成表": "jei",
+    "配方查询": "jei",
+    "rei": "rei",
+    "物品配方": "rei",
+    "emi": "emi",
+    "苹果皮": "apple-skin",
+    "模组菜单": "modmenu",
+    "mod菜单": "modmenu",
+    "配置菜单": "cloth-config",
+    "配置api": "cloth-config",
+    "小地图": "xaeros-minimap",
+    "xaero": "xaeros-minimap",
+    "世界地图": "xaeros-world-map",
+    "旅行地图": "journeymap",
+    "地图": "journeymap",
+    "光影": "iris",
+    "光影加载": "iris",
+    "着色器": "iris",
+    "耐久显示": "durabilityviewer",
+    "伤害显示": "damage-indicator",
+    "附魔描述": "enchdesc",
+    "更好f3": "betterf3",
+    "f3": "betterf3",
+    # --- 科技 / 机械 ---------------------------------------------------
+    "机械动力": "create",
+    "create": "create",
+    "机械": "create",
+    "工业": "create",
+    "沉浸工程": "immersive-engineering",
+    "通用机械": "mekanism",
+    "mekanism": "mekanism",
+    "精致存储": "refined-storage",
+    "应用能源": "ae2",
+    "ae2": "ae2",
+    "储物抽屉": "storage-drawers",
+    "管道": "pipez",
+    "能量": "powah",
+    "电力": "powah",
+    "太阳能": "solar-generator",
+    # --- 魔法 / 冒险 ---------------------------------------------------
+    "植物魔法": "botania",
+    "新生魔艺": "ars-nouveau",
+    "魔法": "ars-nouveau",
+    "星辉魔法": "astral-sorcery",
+    "血魔法": "blood-magic",
+    "匠魂": "tinkers-construct",
+    "以太": "aether",
+    "暮色森林": "the-twilight-forest",
+    "深层": "deeperdarker",
+    "太空": "ad-astra",
+    "星空": "ad-astra",
+    # --- 世界 / 生存 ---------------------------------------------------
+    "农夫乐事": "farmers-delight",
+    "食物": "farmers-delight",
+    "烹饪": "farmers-delight",
+    "地形": "terralith",
+    "群系": "terralith",
+    "生物群系": "oh-the-biomes-youll-go",
+    "地牢": "yungs-better-dungeons",
+    "结构": "yungs-better-dungeons",
+    "家具": "macaws-furniture",
+    "装饰": "macaws-furniture",
+    "床": "comforts",
+    "墓碑": "gravestone-mod",
+    "死亡点": "gravestone-mod",
+    "传送石": "waystones",
+    "传送": "waystones",
+    "村民交易": "easy-villagers",
+    "村民": "easy-villagers",
+    "生物": "alexs-mobs",
+    "动物": "alexs-mobs",
+    "更好的下界": "betternether",
+    "更好的末地": "betterend",
+    "跑酷": "parcool",
+    # --- 工具 / 操作 ---------------------------------------------------
+    "投影": "litematica",
+    "建筑": "litematica",
+    "连锁挖矿": "veinmining",
+    "连锁采集": "veinmining",
+    "世界编辑": "worldedit",
+    "创世神": "worldedit",
+    "自动钓鱼": "autofish",
+    "钓鱼": "autofish",
+    "语音": "simple-voice-chat",
+    "语音聊天": "simple-voice-chat",
+    "表情": "emotecraft",
+    "前置": "fabric-api",
+    "api": "fabric-api",
+    "fabric前置": "fabric-api",
+    "fabric-api": "fabric-api",
+    "第一人称": "first-person-model",
+    "更好的第三人称": "shoulder-surfing-reloaded",
+    "飞机": "immersive-aircraft",
+    "汽车": "automobility",
+    "战斗": "epic-fight-mod",
+    # --- 中文别名补充：玩家最常搜的写法 --------------------------------
+    "创造": "create",
+    "創造": "create",
+    "動力": "create",
+    "动力": "create",
+    "机械动力附属": "create",
+    "蒸汽": "create",
+    "火车": "create",
+    "列车": "create",
+    "传送带": "create",
+    "齿轮": "create",
+    "机械动力：附魔": "create-enchantment-industry",
+    "附魔工业": "create-enchantment-industry",
+    "机械动力：柴油": "create-diesel-generators",
+    "柴油动力": "create-diesel-generators",
+    "机械动力：中央厨房": "create-central-kitchen",
+    "中央厨房": "create-central-kitchen",
+    "机械动力：蒸汽船": "create-steam-n-rails",
+    "机械动力：铁路": "create-steam-n-rails",
+    "机械动力镐": "create",
+    "工业时代": "industrial-craft",
+    "工业2": "industrial-craft",
+    "工业模组": "industrial-craft",
+    "热力膨胀": "thermal-expansion",
+    "热力": "thermal-expansion",
+    "匠魂2": "tinkers-construct",
+    "匠魂3": "tinkers-construct-3",
+    "天境": "aether",
+    "深渊": "deeperdarker",
+    "虚无世界": "nevermine",
+    "等价交换": "projecte",
+    "无尽贪婪": "avaritia",
+    "神秘时代": "thaumcraft",
+    "龙之研究": "draconic-evolution",
+    "龙研": "draconic-evolution",
+    "冰与火": "ice-and-fire-dragons",
+    "冰火传说": "ice-and-fire-dragons",
+    "更多生物": "alexs-mobs",
+    "更多食物": "farmers-delight",
+    "建筑工艺": "buildcraft",
+    "铁路工艺": "railcraft",
+    "凿子": "chisel",
+    "雕刻": "chisel",
+    "星露谷": "stardew-valley",
+    "牧场物语": "stardew-valley",
+    "海岛": "tropicraft",
+    "灾难": "weather2",
+    "天气": "weather2",
+    "真实物理": "physics-mod",
+    "物理学": "physics-mod",
+    "分割": "carry-on",
+    "举起": "carry-on",
+    "搬运": "carry-on",
+    "更多附魔": "apotheosis",
+    "神化": "apotheosis",
+    "附魔增强": "apotheosis",
+    "统一": "almost-unified",
+    "末影接口": "ender-io",
+    "末影存储": "ender-storage",
+    "沉浸": "immersive-engineering",
+    "通用": "mekanism",
+    "发电机": "mekanism-generators",
+    "聚变": "mekanism-generators",
+    "反应堆": "mekanism-generators",
+    "星系": "galacticraft",
+    "月球": "galacticraft",
+    "像素mon": "cobblemon",
+    "宝可梦": "cobblemon",
+    "宠可梦": "cobblemon",
+    "冒险": "when-dungeons-arise",
+    "地牢冒险": "when-dungeons-arise",
+    "灾变": "cataclysm",
+    "灾厄": "cataclysm",
+    "更好的战斗": "better-combat",
+    "战斗优化": "better-combat",
+    "拔刀剑": "slashblade",
+    "弩": "crossbow",
+    "家具装饰": "macaws-furniture",
+    "载具": "immersive-aircraft",
+    "车辆": "automobility",
+    "光影包": "iris",
+    "材质包": "faithful",
+    "材质": "faithful",
+    "区块加载": "chunky",
+    "预生成": "chunky",
+    "备份": "ftb-backups",
+    "性能监测": "spark",
+    "分析": "spark",
+    "卡顿": "spark",
+    "服务端优化": "lithium",
+    "区块": "c2me-fabric",
+    "实体": "entityculling",
+    "物品栏": "inventory-profiles-next",
+    "背包": "inventory-profiles-next",
+    "整理": "inventory-profiles-next",
+    "自动整理": "inventory-profiles-next",
+    "护甲显示": "armor-hud",
+    "血量显示": "damage-indicator",
+    "坐标": "xaeros-minimap",
+    "路径点": "xaeros-minimap",
+    "死后不掉落": "keep-inventory",
+    "死亡不掉落": "keep-inventory",
+    "多人": "essential",
+    "联机": "essential",
+}
+
+PERF_PACK = [
+    "sodium",
+    "lithium",
+    "ferrite-core",
+    "krypton",
+    "entityculling",
+    "immediatelyfast",
+    "c2me-fabric",
+    "modernfix",
+]
+
+# One tap mod bundles.  Row keys:
+#   group   : 核心 / 前置 / 附属 (only used for the tag shown in the dialog)
+#   label   : display name
+#   slugs   : Modrinth projects tried in order, the first one with a build for
+#             the current MC version + loader wins (that is how Create Fabric
+#             and Create Forge live in two different projects)
+#   note    : one line explanation
+#   loaders : empty tuple = every loader, else the row only applies to these
+CREATE_PACK_NOTE = (
+    "全家桶会持续更新：机械动力 / 农夫乐事 / 沉浸工程 / 应用能源 2 / "
+    "通用机械 / Tetra ... 想要哪个可以在 关于 -> 反馈"
+)
+
+CREATE_PACK = [
+    {
+        "group": "核心",
+        "label": "机械动力 Create",
+        "slugs": ("create", "create-fabric"),
+        "note": "本体：齿轮 / 动能 / 自动化产线",
+        "loaders": (),
+    },
+    {
+        "group": "前置",
+        "label": "Flywheel 渲染后端",
+        "slugs": ("flw-vanillin", "flywheel"),
+        "note": "Create 6 的渲染库，必须一起装",
+        "loaders": (),
+    },
+    {
+        "group": "前置",
+        "label": "Fabric API",
+        "slugs": ("fabric-api",),
+        "note": "Fabric / Quilt 版必需前置",
+        "loaders": ("fabric", "quilt"),
+    },
+    {
+        "group": "附属",
+        "label": "Create Crafts & Additions",
+        "slugs": ("createaddition",),
+        "note": "电动机 / 交流发电机：动能和电力互转",
+        "loaders": (),
+    },
+    {
+        "group": "附属",
+        "label": "Create Deco",
+        "slugs": ("create-deco",),
+        "note": "一套工业风装饰方块",
+        "loaders": (),
+    },
+    {
+        "group": "附属",
+        "label": "Create Jetpack",
+        "slugs": ("create-jetpack",),
+        "note": "用机械动力充能的喷气背包",
+        "loaders": (),
+    },
+    {
+        "group": "附属",
+        "label": "Create Ore Excavation",
+        "slugs": ("create-ore-excavation",),
+        "note": "矿脉钻井：无限资源自动化",
+        "loaders": (),
+    },
+    {
+        "group": "附属",
+        "label": "Create: Enchantment Industry",
+        "slugs": ("create-enchantment-industry",),
+        "note": "液态经验 / 附魔流水线",
+        "loaders": (),
+    },
+    {
+        "group": "附属",
+        "label": "Create: Steam 'n' Rails",
+        "slugs": ("create-steam-n-rails",),
+        "note": "蒸汽机车与铁路扩展（1.20.1 主流）",
+        "loaders": (),
+    },
+    {
+        "group": "附属",
+        "label": "Create: Copycats+",
+        "slugs": ("copycats",),
+        "note": "任意方块外观的仿制组件",
+        "loaders": (),
+    },
+    {
+        "group": "附属",
+        "label": "Create: Connected",
+        "slugs": ("create-connected",),
+        "note": "更多传动件与齿轮箱",
+        "loaders": (),
+    },
+    {
+        "group": "附属",
+        "label": "Create Mechanical Extruder",
+        "slugs": ("create-mechanical-extruder",),
+        "note": "机械挤出机：造石 / 刷石自动化",
+        "loaders": (),
+    },
+    {
+        "group": "附属",
+        "label": "Create Confectionery",
+        "slugs": ("create-confectionery",),
+        "note": "糖果甜品生产线",
+        "loaders": (),
+    },
+    {
+        "group": "附属",
+        "label": "Create Encased",
+        "slugs": ("create-encased",),
+        "note": "装甲齿轮箱 / 传动箱变体",
+        "loaders": (),
+    },
+    {
+        "group": "附属",
+        "label": "Create Train Parts",
+        "slugs": ("create-train-parts",),
+        "note": "列车零件与车体装饰",
+        "loaders": (),
+    },
+    {
+        "group": "附属",
+        "label": "Create: Central Kitchen",
+        "slugs": ("create-central-kitchen",),
+        "note": "中央厨房：批量烹饪",
+        "loaders": (),
+    },
+]
+
+# ---------------------------------------------------------------------------
+# 2. Low level helpers: files, JSON, errors, retries, formatting
+# ---------------------------------------------------------------------------
+
+
+class LauncherError(Exception):
+    """A user-readable launcher failure (network, auth, installer, ...)."""
+
+
+class LoginCancelled(LauncherError):
+    """The user aborted an interactive authentication dialog."""
+
+
+class DeviceCodeExpired(LauncherError):
+    """The current Microsoft device code expired; request a fresh one."""
+
+    def __init__(self, message="设备代码已过期", detail=""):
+        super().__init__(message)
+        self.detail = str(detail or "")
+
+
+class DeviceCodeUsed(DeviceCodeExpired):
+    """Microsoft already consumed this device code (usually after a failed grant)."""
+
+
+class LoginNeedsPassword(LauncherError):
+    """Microsoft rejected the interactive grant; the account must sign in again."""
+
+    def __init__(self, message="", detail=""):
+        super().__init__(str(message))
+        self.detail = str(detail or "")
+
+
+class OperationCancelled(LauncherError):
+    """The user aborted a long running download / install operation."""
+
+
+class HttpError(LauncherError):
+    """HTTP failure that keeps the decoded body so OAuth errors can be parsed."""
+
+    def __init__(self, code, body, url, headers=None):
+        self.code = code
+        self.body = body or ""
+        self.url = url
+        self.headers = headers or {}
+        snippet = self.body.strip().replace("\n", " ")[:180]
+        super().__init__("HTTP {0} @ {1} :: {2}".format(code, url, snippet))
+
+    def json(self):
+        try:
+            data = json.loads(self.body)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+
+def log_debug(message):
+    try:
+        print("[AKM] " + str(message))
+    except Exception:
+        pass
+
+
+def login_log(message):
+    """Append an authentication diagnostic line to logs\\device_login.log."""
+    text = "[{0}] {1}".format(
+        time.strftime("%Y-%m-%d %H:%M:%S"),
+        str(message or "").replace("\r", " ").replace("\n", " / "),
+    )
+    try:
+        print("[AKM-AUTH] " + text)
+    except Exception:
+        pass
+    try:
+        ensure_dir(LOG_DIR)
+        with open(
+            os.path.join(LOG_DIR, "device_login.log"),
+            "a",
+            encoding="utf-8",
+            errors="replace",
+        ) as handle:
+            handle.write(text + "\n")
+    except Exception:
+        pass
+
+
+def ensure_dir(path):
+    if not path:
+        return
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as exc:
+        log_debug("mkdir failed {0}: {1}".format(path, exc))
+
+
+def resolve_path(path):
+    raw = str(path or "").strip()
+    if not raw:
+        return BASE_DIR
+    raw = os.path.expandvars(os.path.expanduser(raw))
+    if os.path.isabs(raw):
+        return os.path.abspath(raw)
+    return os.path.abspath(os.path.join(BASE_DIR, raw))
+
+
+def list_local_versions(game_dir):
+    """Return installed version ids (folders with a matching <id>.json)."""
+    versions_dir = os.path.join(game_dir, "versions")
+    if not os.path.isdir(versions_dir):
+        return []
+    rows = []
+    try:
+        names = os.listdir(versions_dir)
+    except OSError:
+        return []
+    for name in names:
+        version_path = os.path.join(versions_dir, name)
+        version_json = os.path.join(version_path, name + ".json")
+        if os.path.isdir(version_path) and os.path.isfile(version_json):
+            try:
+                stamp = os.path.getmtime(version_path)
+            except OSError:
+                stamp = 0.0
+            rows.append((stamp, name))
+    rows.sort(key=lambda item: item[0], reverse=True)
+    return [name for _stamp, name in rows]
+
+
+def guess_mc_version(version_id):
+    """Best-effort extraction of 1.x.y from a launcher version id."""
+    text = str(version_id or "").strip()
+    match = re.match(r"^(\d+\.\d+(?:\.\d+)?)$", text)
+    if match:
+        return match.group(1)
+    match = re.search(r"(\d+\.\d+(?:\.\d+)?)$", text)
+    return match.group(1) if match else ""
+
+
+def detect_loader_from_json(data):
+    """Guess the mod loader of a version JSON by its id / libraries."""
+    if not isinstance(data, dict):
+        return ""
+    parts = [str(data.get("id") or "").lower()]
+    for library in data.get("libraries") or []:
+        parts.append(str((library or {}).get("name") or "").lower())
+    arguments = data.get("arguments") or {}
+    for key in ("game", "jvm"):
+        for item in arguments.get(key) or []:
+            if isinstance(item, str):
+                parts.append(item.lower())
+    blob = " ".join(parts)
+    if "neoforge" in blob:
+        return "neoforge"
+    if "minecraftforge" in blob or "forge" in blob:
+        return "forge"
+    if "quilt" in blob:
+        return "quilt"
+    if "fabric" in blob:
+        return "fabric"
+    return ""
+
+
+def _library_names(data):
+    names = []
+    for library in (data or {}).get("libraries") or []:
+        name = str((library or {}).get("name") or "")
+        if name:
+            names.append(name)
+    return names
+
+
+def loader_artifact_info(data):
+    """Read the loader + MC version from maven library coordinates."""
+    info = {"mc": "", "loader": "", "loader_version": ""}
+    for name in _library_names(data):
+        lowered = name.lower()
+        parts = name.split(":")
+        if len(parts) < 3:
+            continue
+        if lowered.startswith("net.minecraftforge:forge:"):
+            raw = parts[2]
+            info["loader"] = "forge"
+            info["loader_version"] = raw
+            match = re.match(r"^(\d+\.\d+(?:\.\d+)?)-(.+)$", raw)
+            if match:
+                info["mc"] = match.group(1)
+                info["loader_version"] = match.group(2)
+            return info
+        if lowered.startswith("net.neoforged:neoforge:"):
+            raw = parts[2]
+            info["loader"] = "neoforge"
+            info["loader_version"] = raw
+            info["mc"] = neoforge_loader_mc_version(raw)
+            return info
+        if lowered.startswith("net.fabricmc:fabric-loader:"):
+            return {"loader": "fabric", "loader_version": parts[2], "mc": ""}
+        if lowered.startswith("org.quiltmc:quilt-loader:"):
+            return {"loader": "quilt", "loader_version": parts[2], "mc": ""}
+    return info
+
+
+def fml_argument_info(data):
+    """Read --fml.mcVersion / --fml.forgeVersion from a merged profile."""
+    info = {"mc": "", "loader": "", "loader_version": ""}
+    if not isinstance(data, dict):
+        return info
+    arguments = data.get("arguments") or {}
+    items = [item for item in (arguments.get("game") or []) if isinstance(item, str)]
+    for index, item in enumerate(items):
+        value = items[index + 1] if index + 1 < len(items) else ""
+        lowered = item.lower()
+        if not value:
+            continue
+        if lowered == "--fml.mcversion":
+            info["mc"] = value
+        elif lowered == "--fml.forgeversion":
+            info["loader"] = "forge"
+            info["loader_version"] = value
+        elif lowered == "--fml.neoforgeversion":
+            info["loader"] = "neoforge"
+            info["loader_version"] = value
+    legacy = str(data.get("minecraftArguments") or "")
+    if legacy:
+        match = re.search(r"--fml\.mcVersion\s+(\S+)", legacy)
+        if match and not info["mc"]:
+            info["mc"] = match.group(1)
+        match = re.search(r"--fml\.(neo)?[fF]orgeVersion\s+(\S+)", legacy)
+        if match and not info["loader"]:
+            info["loader"] = "neoforge" if match.group(1) else "forge"
+            info["loader_version"] = match.group(2)
+    return info
+
+
+def parse_version_id(version_id, mc_dir=""):
+    """Split a launcher version id into {mc, loader, loader_version}.
+
+    Handles Fabric/Quilt (``fabric-loader-0.19.5-26.3``), Forge
+    (``26.3-forge-66.1.0`` / ``1.21.1-Forge_52.1.16``), NeoForge
+    (``neoforge-21.1.264``) and custom names (``AKM的大世界``) by reading
+    ``inheritsFrom`` / the loader library coordinates from the version JSON.
+    """
+    text = str(version_id or "").strip()
+    result = {"mc": "", "loader": "", "loader_version": ""}
+    if not text:
+        return result
+    lowered = text.lower()
+
+    match = re.match(r"^(fabric|quilt)-loader-(.+)-(\d+\.\d+(?:\.\d+)?)$", lowered)
+    if match:
+        result.update(
+            {
+                "loader": match.group(1),
+                "loader_version": match.group(2),
+                "mc": match.group(3),
+            }
+        )
+        return result
+
+    match = re.match(r"^(\d+\.\d+(?:\.\d+)?)[ _-]+forge[ _-]+(.+)$", lowered)
+    if match:
+        result.update(
+            {"mc": match.group(1), "loader": "forge", "loader_version": match.group(2)}
+        )
+        return result
+
+    match = re.match(r"^forge[ _-]+(\d+\.\d+(?:\.\d+)?)[ _-]+(.+)$", lowered)
+    if match:
+        result.update(
+            {"mc": match.group(1), "loader": "forge", "loader_version": match.group(2)}
+        )
+        return result
+
+    match = re.match(r"^(\d+\.\d+(?:\.\d+)?)[ _-]+neoforge[ _-]+(.+)$", lowered)
+    if match:
+        result.update(
+            {
+                "mc": match.group(1),
+                "loader": "neoforge",
+                "loader_version": match.group(2),
+            }
+        )
+        return result
+
+    match = re.match(r"^neoforge[ _-]+(.+)$", lowered)
+    if match:
+        result.update(
+            {
+                "loader": "neoforge",
+                "loader_version": match.group(1),
+                "mc": neoforge_loader_mc_version(match.group(1)),
+            }
+        )
+        return result
+
+    match = re.match(r"^(\d+\.\d+(?:\.\d+)?)(?:[-_].*)?$", lowered)
+    if match:
+        result["mc"] = match.group(1)
+
+    if mc_dir:
+        data = read_json(
+            os.path.join(mc_dir, "versions", text, text + ".json"), None
+        )
+        if isinstance(data, dict):
+            base = str(data.get("inheritsFrom") or "").strip()
+            if base and not result["mc"]:
+                base_info = parse_version_id(base)
+                result["mc"] = base_info.get("mc") or base
+                if not result["loader"]:
+                    result["loader"] = base_info.get("loader") or ""
+                if not result["loader_version"]:
+                    result["loader_version"] = base_info.get("loader_version") or ""
+            artifact = loader_artifact_info(data)
+            fml = fml_argument_info(data)
+            if not result["mc"] and fml["mc"]:
+                result["mc"] = fml["mc"]
+            if not result["loader"] and fml["loader"]:
+                result["loader"] = fml["loader"]
+            if not result["loader_version"] and fml["loader_version"]:
+                result["loader_version"] = fml["loader_version"]
+            if not result["loader"] and artifact["loader"]:
+                result["loader"] = artifact["loader"]
+            if not result["loader_version"] and artifact["loader_version"]:
+                result["loader_version"] = artifact["loader_version"]
+            if not result["mc"] and artifact["mc"]:
+                result["mc"] = artifact["mc"]
+            if not result["loader"]:
+                result["loader"] = detect_loader_from_json(data)
+    return result
+
+
+_JAVA_MAJOR_CACHE = {}
+
+
+def _prefer_console_java(path):
+    text = str(path or "")
+    if text.lower().endswith("javaw.exe"):
+        sibling = text[: -len("javaw.exe")] + "java.exe"
+        if os.path.isfile(sibling):
+            return sibling
+    return text
+
+
+def java_major_version(java_path):
+    path = str(java_path or "").strip()
+    if not path:
+        return 0
+    if path in _JAVA_MAJOR_CACHE:
+        return _JAVA_MAJOR_CACHE[path]
+    major = 0
+    try:
+        flags = 0x08000000 if os.name == "nt" else 0
+        result = subprocess.run(
+            [path, "-version"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=8,
+            creationflags=flags,
+        )
+        text = (result.stderr or "") + "\n" + (result.stdout or "")
+        match = re.search(r'version\s+"(\d+)(?:\.(\d+))?', text)
+        if match:
+            major = int(match.group(1))
+            if major == 1 and match.group(2):
+                major = int(match.group(2))
+    except Exception:
+        major = 0
+    _JAVA_MAJOR_CACHE[path] = major
+    return major
+
+
+def _java_candidates(mc_dir):
+    candidates = []
+
+    def add(path):
+        if not path:
+            return
+        path = _prefer_console_java(path)
+        if not os.path.isfile(path):
+            return
+        absolute = os.path.abspath(path)
+        if absolute not in candidates:
+            candidates.append(absolute)
+
+    add(shutil.which("java"))
+    if os.name == "nt":
+        add(shutil.which("javaw"))
+    for pattern in (
+        os.path.join(mc_dir, "runtime", "**", "bin", "javaw.exe"),
+        os.path.join(mc_dir, "runtime", "**", "bin", "java.exe"),
+        os.path.join(mc_dir, "runtime", "**", "bin", "java"),
+    ):
+        try:
+            for item in sorted(glob.glob(pattern, recursive=True)):
+                add(item)
+        except Exception:
+            pass
+    if os.name == "nt":
+        patterns = [
+            r"C:\Program Files\Eclipse Adoptium\*\bin\java.exe",
+            r"C:\Program Files\Java\*\bin\java.exe",
+            r"C:\Program Files\Microsoft\jdk-*\bin\java.exe",
+            r"C:\Program Files\Amazon Corretto\jdk*\bin\java.exe",
+            r"C:\Program Files\BellSoft\*\bin\java.exe",
+        ]
+        local_appdata = os.environ.get("LOCALAPPDATA") or ""
+        if local_appdata:
+            patterns.append(
+                os.path.join(
+                    local_appdata,
+                    "Programs",
+                    "Eclipse Adoptium",
+                    "*",
+                    "bin",
+                    "java.exe",
+                )
+            )
+        for pattern in patterns:
+            try:
+                for item in sorted(glob.glob(pattern)):
+                    add(item)
+            except Exception:
+                pass
+    return candidates
+
+
+def find_java_executable(mc_dir, configured="", required_major=0):
+    """Resolve Java, preferring a version that satisfies required_major."""
+    configured = str(configured or "").strip()
+    if configured:
+        candidate = configured
+        if not os.path.isabs(candidate):
+            absolute = resolve_path(candidate)
+            if os.path.isfile(absolute):
+                return _prefer_console_java(absolute)
+            found = shutil.which(configured)
+            return _prefer_console_java(found) if found else ""
+        if os.path.isfile(candidate):
+            return _prefer_console_java(candidate)
+        found = shutil.which(configured)
+        return _prefer_console_java(found) if found else ""
+    candidates = _java_candidates(mc_dir)
+    if not candidates:
+        return ""
+    try:
+        required = int(required_major or 0)
+    except Exception:
+        required = 0
+    if required <= 0:
+        return candidates[0]
+    satisfying = []
+    for candidate in candidates:
+        major = java_major_version(candidate)
+        if major >= required:
+            satisfying.append((major, candidate))
+    if satisfying:
+        satisfying.sort(key=lambda item: (item[0], item[1]))
+        return satisfying[0][1]
+    best = candidates[0]
+    best_major = -1
+    for candidate in candidates:
+        major = java_major_version(candidate)
+        if major > best_major:
+            best = candidate
+            best_major = major
+    return best
+
+
+def read_json(path, default=None):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, data):
+    ensure_dir(os.path.dirname(path))
+    tmp = "{0}.{1}.tmp".format(path, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def _merge_defaults(base, override):
+    result = dict(base)
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            result[key] = _merge_defaults(base[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def ensure_config():
+    raw = read_json(CONFIG_PATH, None)
+    config = _merge_defaults(DEFAULT_CONFIG, raw if isinstance(raw, dict) else {})
+    if raw != config:
+        try:
+            write_json(CONFIG_PATH, config)
+        except OSError as exc:
+            log_debug("config write failed: {0}".format(exc))
+    return config
+
+
+def ensure_auth():
+    raw = read_json(AUTH_PATH, None)
+    auth = dict(DEFAULT_AUTH)
+    if isinstance(raw, dict):
+        auth.update(raw)
+    if auth.get("ms_refresh_token") and not auth.get("refresh_token"):
+        auth["refresh_token"] = auth["ms_refresh_token"]
+    if auth.get("refresh_token") and not auth.get("ms_refresh_token"):
+        auth["ms_refresh_token"] = auth["refresh_token"]
+    if auth.get("ms_uuid") and not auth.get("uuid"):
+        auth["uuid"] = auth["ms_uuid"]
+    if auth.get("uuid") and not auth.get("ms_uuid"):
+        auth["ms_uuid"] = auth["uuid"]
+    if raw != auth:
+        try:
+            write_json(AUTH_PATH, auth)
+        except OSError as exc:
+            log_debug("auth write failed: {0}".format(exc))
+    return auth
+
+
+def ensure_alias():
+    raw = read_json(ALIAS_PATH, None)
+    merged = {}
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if isinstance(key, str) and isinstance(value, str) and key.strip():
+                merged[key.strip().lower()] = value.strip()
+    added = 0
+    for key, value in MOD_ALIAS_DEFAULT.items():
+        if key.lower() not in merged:
+            added += 1
+        merged.setdefault(key.lower(), value)
+    if not isinstance(raw, dict) or len(raw) < 50 or added:
+        try:
+            write_json(ALIAS_PATH, merged)
+        except OSError as exc:
+            log_debug("alias write failed: {0}".format(exc))
+    return merged
+
+
+def bootstrap_files():
+    ensure_dir(BASE_DIR)
+    ensure_dir(LOG_DIR)
+    config = ensure_config()
+    auth = ensure_auth()
+    alias = ensure_alias()
+    game_dir = resolve_path(config.get("minecraft_dir"))
+    ensure_dir(game_dir)
+    for sub_dir in (
+        "mods",
+        "versions",
+        "libraries",
+        "assets",
+        "runtime",
+        "saves",
+        "config",
+        "resourcepacks",
+        "shaderpacks",
+        "screenshots",
+        "logs",
+        "crash-reports",
+        "defaultconfigs",
+    ):
+        ensure_dir(os.path.join(game_dir, sub_dir))
+    return config, auth, alias
+
+
+def offline_uuid(name):
+    digest = hashlib.md5(("OfflinePlayer:" + name).encode("utf-8")).digest()
+    raw = bytearray(digest)
+    raw[6] = (raw[6] & 0x0F) | 0x30
+    raw[8] = (raw[8] & 0x3F) | 0x80
+    return str(uuid.UUID(bytes=bytes(raw)))
+
+
+def dashed_uuid(value):
+    text = str(value or "").replace("-", "").strip()
+    if len(text) != 32:
+        return text
+    return "{0}-{1}-{2}-{3}-{4}".format(
+        text[0:8], text[8:12], text[12:16], text[16:20], text[20:32]
+    )
+
+
+def short_uuid(value, head=8, tail=4):
+    """Compact UUID for the single-line identity row: 6419fcdf...d1a7."""
+    text = str(value or "").strip()
+    if not text:
+        return "-"
+    compact = text.replace("-", "")
+    if len(compact) <= head + tail:
+        return text
+    return "{0}\u2026{1}".format(compact[:head], compact[-tail:])
+
+
+def ts_to_str(epoch):
+    try:
+        epoch = float(epoch)
+        if epoch <= 0:
+            return "UNKNOWN"
+        return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return "UNKNOWN"
+
+
+def human_count(value):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return "?"
+    if number >= 1000000:
+        return "{0:.1f}M".format(number / 1000000.0)
+    if number >= 1000:
+        return "{0:.0f}K".format(number / 1000.0)
+    return str(number)
+
+
+def sanitize_filename(name):
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(name or "")).strip()
+    cleaned = cleaned.strip(".")
+    if not cleaned:
+        cleaned = "mod-{0}.jar".format(int(time.time()))
+    if not cleaned.lower().endswith(".jar"):
+        cleaned += ".jar"
+    return cleaned[:180]
+
+
+def translate_query_candidates(raw, alias):
+    """ASCII search terms for a (possibly Chinese) query, best first."""
+    query = str(raw or "").strip()
+    if not query:
+        return []
+    lowered = query.lower()
+    compact = lowered.replace(" ", "")
+    ordered = []
+
+    def add(value):
+        text = str(value or "").strip().lower()
+        if not text or text in ordered:
+            return
+        if re.search(r"[\u4e00-\u9fff]", text):
+            return
+        ordered.append(text)
+
+    add(alias.get(lowered))
+    add(alias.get(compact))
+    for key in sorted(alias.keys(), key=len, reverse=True):
+        if key and not key.isascii() and key in compact:
+            add(alias.get(key))
+    if lowered.isascii():
+        add(lowered)
+    return ordered
+
+
+def alias_suggestions(raw, alias, limit=6):
+    """Close Chinese dictionary keys, used when a query finds nothing."""
+    import difflib
+
+    query = str(raw or "").strip().lower()
+    if not query:
+        return []
+    keys = [key for key in alias if key and not key.isascii()]
+    results = list(
+        difflib.get_close_matches(query, keys, n=limit, cutoff=0.35) or []
+    )
+    for key in keys:
+        if (key in query or query in key) and key not in results:
+            results.append(key)
+    return results[:limit]
+
+
+def hits_mention(hits, term):
+    """True when at least one hit really contains the searched term."""
+    needle = str(term or "").strip().lower()
+    if not needle:
+        return False
+    for hit in hits or []:
+        slug = str(hit.get("slug") or "").lower()
+        title = str(hit.get("title") or "").lower()
+        if needle in slug or needle in title:
+            return True
+    return False
+
+
+def project_to_hit(data, mc_version="", loader=""):
+    """Convert /project/{slug} data into a search-hit shaped dict."""
+    if not isinstance(data, dict):
+        return None
+    slug = str(data.get("slug") or "").strip()
+    if not slug:
+        return None
+    versions = [str(item) for item in (data.get("game_versions") or [])]
+    loaders = [str(item).lower() for item in (data.get("loaders") or [])]
+    hit = {
+        "project_id": str(data.get("id") or ""),
+        "slug": slug,
+        "title": str(data.get("title") or slug),
+        "description": str(data.get("description") or ""),
+        "categories": list(data.get("categories") or []) + loaders,
+        "downloads": data.get("downloads") or 0,
+        "follows": data.get("follows") or 0,
+        "game_versions": versions,
+        "versions": versions,
+        "project_type": str(data.get("project_type") or "mod"),
+    }
+    hit["supports_version"] = (not mc_version) or (mc_version in versions)
+    hit["supports_loader"] = (not loader) or (loader in loaders)
+    hit["loaders"] = loaders
+    return hit
+
+
+def translate_query(raw, alias):
+    """Return (term_to_send, matched_alias)."""
+    query = str(raw or "").strip()
+    if not query:
+        return "", False
+    lowered = query.lower()
+    compact = lowered.replace(" ", "")
+    if lowered in alias:
+        return alias[lowered], True
+    if compact in alias:
+        return alias[compact], True
+    for key in sorted(alias.keys(), key=len, reverse=True):
+        if key and not key.isascii() and key in compact:
+            return alias[key], True
+    return query, False
+
+
+def category_tag(categories):
+    cats = {str(item).lower() for item in (categories or [])}
+    if cats & {"optimization", "performance", "fps", "rendering"}:
+        return TAG_PERF
+    if cats & {"shaders", "shader", "graphics", "visual"}:
+        return TAG_SHDR
+    if cats & {"library", "api", "core"}:
+        return TAG_CORE
+    return TAG_GAME
+
+
+def highest_game_version(hit):
+    """Return the highest Minecraft release advertised by a Modrinth hit."""
+    source = (hit or {}).get("game_versions")
+    if not source:
+        source = (hit or {}).get("versions")
+    values = [
+        str(value).strip()
+        for value in (source or [])
+        if str(value or "").strip()
+    ]
+    if not values:
+        return ""
+    stable = [
+        value
+        for value in values
+        if re.fullmatch(r"\d+\.\d+(?:\.\d+)?", value)
+    ]
+    pool = stable or values
+    try:
+        return max(pool, key=version_sort_key)
+    except Exception:
+        return pool[0]
+
+
+def hit_game_versions(hit):
+    """All Minecraft versions a search hit advertises, newest first."""
+    source = (hit or {}).get("game_versions")
+    if not source:
+        source = (hit or {}).get("versions")
+    values = [
+        str(value).strip()
+        for value in (source or [])
+        if str(value or "").strip()
+    ]
+    if not values:
+        return []
+    stable = [value for value in values if re.fullmatch(r"\d+\.\d+(?:\.\d+)?", value)]
+    pool = stable or values
+    return sort_versions_desc(pool)
+
+
+def format_version_summary(hit, limit=3):
+    versions = hit_game_versions(hit)
+    if not versions:
+        return "MC ?"
+    head = ",".join(versions[:limit])
+    if len(versions) > limit:
+        head += ",+{0}".format(len(versions) - limit)
+    return "MC " + head
+
+
+def format_hit(hit, fallback_version="", target_version=""):
+    tag = category_tag(hit.get("categories"))
+    title = str(hit.get("title") or hit.get("slug") or "unknown")
+    if len(title) > 18:
+        title = title[:17] + "~"
+    slug = str(hit.get("slug") or hit.get("project_id") or "")
+    versions = hit_game_versions(hit)
+    target = str(target_version or "").strip()
+    ordered = versions
+    if target and target in versions:
+        # Put the version the player filtered on first, so it is obvious.
+        ordered = [target] + [item for item in versions if item != target]
+    if ordered:
+        head = ",".join(ordered[:3])
+        if len(ordered) > 3:
+            head += ",+{0}".format(len(ordered) - 3)
+        summary = "MC " + head
+    else:
+        summary = "MC " + str(fallback_version or "?")
+    mark = ""
+    if target:
+        mark = "*" if target in versions else "-"
+    if len(summary) > 16:
+        summary = summary[:15] + "~"
+    if len(slug) > 12:
+        slug = slug[:11] + "~"
+    return "{0} {1:<18} {2:>7}  {3}{4:<16} {5}".format(
+        tag, title, human_count(hit.get("downloads")), mark, summary, slug
+    )
+
+
+def ascii_progress_bar(current, total, width=24):
+    try:
+        current = float(current)
+        total = float(total)
+    except (TypeError, ValueError):
+        return "[" + "-" * width + "]"
+    if total <= 0:
+        return "[" + "-" * width + "]"
+    ratio = max(0.0, min(1.0, current / total))
+    filled = int(round(ratio * width))
+    return "[{0}{1}] {2:3.0f}%".format(
+        "#" * filled, "-" * (width - filled), ratio * 100
+    )
+
+
+def format_bytes(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "?"
+    if number >= 1024 ** 3:
+        return "{0:.2f} GB".format(number / 1024 ** 3)
+    if number >= 1024 ** 2:
+        return "{0:.1f} MB".format(number / 1024 ** 2)
+    if number >= 1024:
+        return "{0:.0f} KB".format(number / 1024)
+    return "{0:.0f} B".format(number)
+
+
+def version_sort_key(value):
+    parts = re.split(r"([0-9]+)", str(value or ""))
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part.lower())
+        for part in parts
+    )
+
+
+def sort_versions_desc(values):
+    return sorted(set(values), key=version_sort_key, reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# 3. HTTP layer (urllib only, always called from worker threads)
+# ---------------------------------------------------------------------------
+
+
+def _perform(req, timeout):
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            raw = response.read()
+            charset = response.headers.get_content_charset() or "utf-8"
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        raise HttpError(exc.code, body, req.full_url, dict(exc.headers or {})) from None
+    except urllib.error.URLError as exc:
+        raise LauncherError("网络不可达: {0} ({1})".format(req.full_url, exc.reason)) from None
+    except TimeoutError:
+        raise LauncherError("请求超时: {0}".format(req.full_url)) from None
+    except OSError as exc:
+        raise LauncherError("网络错误: {0} ({1})".format(req.full_url, exc)) from None
+    if not raw:
+        return None
+    try:
+        return json.loads(raw.decode(charset, "replace"))
+    except ValueError:
+        raise LauncherError("响应不是合法 JSON: {0}".format(req.full_url)) from None
+
+
+def http_json(url, payload=None, headers=None, method=None, timeout=30):
+    hdrs = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    if headers:
+        hdrs.update(headers)
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        hdrs["Content-Type"] = "application/json"
+        method = method or "POST"
+    req = urllib.request.Request(url, data=data, headers=hdrs, method=method or "GET")
+    return _perform(req, timeout)
+
+
+def http_form(url, fields, timeout=30, headers=None):
+    hdrs = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    if headers:
+        hdrs.update(headers)
+    data = urllib.parse.urlencode(fields).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
+    return _perform(req, timeout)
+
+
+def http_form_with_headers(url, fields, timeout=30):
+    """POST a form and return (decoded JSON, response headers)."""
+    hdrs = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    data = urllib.parse.urlencode(fields).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
+    headers = None
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            headers = response.headers
+            raw = response.read()
+            charset = response.headers.get_content_charset() or "utf-8"
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        raise HttpError(
+            exc.code, body, req.full_url, dict(exc.headers or {})
+        ) from None
+    except urllib.error.URLError as exc:
+        raise LauncherError(
+            "网络不可达: {0} ({1})".format(req.full_url, exc.reason)
+        ) from None
+    except TimeoutError:
+        raise LauncherError("请求超时: {0}".format(req.full_url)) from None
+    except OSError as exc:
+        raise LauncherError(
+            "网络错误: {0} ({1})".format(req.full_url, exc)
+        ) from None
+    if not raw:
+        return None, headers
+    try:
+        return json.loads(raw.decode(charset, "replace")), headers
+    except ValueError:
+        raise LauncherError("响应不是合法 JSON: {0}".format(req.full_url)) from None
+
+
+def with_retry(func, attempts=2, delay=1.2):
+    last_error = None
+    for attempt in range(max(1, attempts)):
+        try:
+            return func()
+        except HttpError as exc:
+            last_error = exc
+            if 400 <= exc.code < 500:
+                raise
+        except LauncherError as exc:
+            last_error = exc
+        if attempt + 1 < attempts:
+            time.sleep(delay * (attempt + 1))
+    if last_error is not None:
+        raise last_error
+    raise LauncherError("未知网络失败")
+
+
+# ---------------------------------------------------------------------------
+# 4. Modrinth engine
+# ---------------------------------------------------------------------------
+
+
+MODRINTH_MAX_LIMIT = 100
+
+
+def _modrinth_facets(mc_version, loader, project_type="mod"):
+    """AND of facet groups; empty version/loader simply drops that group."""
+    groups = []
+    if str(project_type or "").strip():
+        groups.append(["project_type:{0}".format(str(project_type).strip())])
+    if str(mc_version or "").strip():
+        groups.append(["versions:{0}".format(str(mc_version).strip())])
+    if str(loader or "").strip():
+        groups.append(["categories:{0}".format(str(loader).strip())])
+    if not groups:
+        return ""
+    return json.dumps(groups, separators=(",", ":"))
+
+
+def modrinth_search_page(
+    query="",
+    limit=8,
+    index="downloads",
+    mc_version="1.21.1",
+    loader="fabric",
+    offset=0,
+    project_type="mod",
+):
+    """Return (hits, total_hits). ``offset`` powers the [更多结果] paging."""
+    try:
+        size = max(1, min(MODRINTH_MAX_LIMIT, int(limit)))
+    except (TypeError, ValueError):
+        size = 8
+    params = {"query": query or "", "limit": size, "index": index}
+    try:
+        start = int(offset or 0)
+    except (TypeError, ValueError):
+        start = 0
+    if start > 0:
+        params["offset"] = start
+    facets = _modrinth_facets(mc_version, loader, project_type)
+    if facets:
+        params["facets"] = facets
+    url = "{0}/search?{1}".format(MODRINTH_API, urllib.parse.urlencode(params))
+    data = with_retry(lambda: http_json(url, timeout=25))
+    if not isinstance(data, dict):
+        return [], 0
+    hits = data.get("hits")
+    if not isinstance(hits, list):
+        return [], 0
+    try:
+        total = int(data.get("total_hits") or 0)
+    except (TypeError, ValueError):
+        total = 0
+    return [hit for hit in hits if isinstance(hit, dict)], total
+
+
+def modrinth_search(
+    query="",
+    limit=8,
+    index="downloads",
+    mc_version="1.21.1",
+    loader="fabric",
+    offset=0,
+):
+    hits, _total = modrinth_search_page(
+        query, limit, index, mc_version, loader, offset=offset
+    )
+    return hits
+
+
+def modrinth_game_versions(timeout=20):
+    """Release Minecraft versions from Modrinth's tag endpoint (newest first)."""
+    data = with_retry(
+        lambda: http_json(
+            "{0}/tag/game_version".format(MODRINTH_API), timeout=timeout
+        )
+    )
+    if not isinstance(data, list):
+        return []
+    releases = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("version_type") or "") != "release":
+            continue
+        version = str(item.get("version") or "").strip()
+        if version:
+            releases.append(version)
+    return sort_versions_desc(releases)
+
+
+def modrinth_project(project):
+    """Fetch a Modrinth project by slug / id (ignores version + loader facets)."""
+    identifier = urllib.parse.quote(str(project or "").strip(), safe="")
+    if not identifier:
+        raise LauncherError("空的 Modrinth 项目标识")
+    data = with_retry(
+        lambda: http_json(
+            "{0}/project/{1}".format(MODRINTH_API, identifier), timeout=25
+        )
+    )
+    return data if isinstance(data, dict) else {}
+
+
+def modrinth_versions(project, mc_version, loader):
+    identifier = urllib.parse.quote(str(project or "").strip(), safe="")
+    if not identifier:
+        raise LauncherError("空的 Modrinth 项目标识")
+    params = {
+        "game_versions": json.dumps([mc_version]),
+        "loaders": json.dumps([loader]),
+    }
+    url = "{0}/project/{1}/version?{2}".format(
+        MODRINTH_API, identifier, urllib.parse.urlencode(params)
+    )
+    data = with_retry(lambda: http_json(url, timeout=30))
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, dict)]
+
+
+def pick_version(versions):
+    for version in versions:
+        if str(version.get("version_type", "")).lower() == "release":
+            return version
+    return versions[0] if versions else None
+
+
+CONTENT_KIND_LABELS = {
+    "shader": "光影",
+    "resourcepack": "材质包",
+}
+CONTENT_KIND_FOLDERS = {
+    "shader": "shaderpacks",
+    "resourcepack": "resourcepacks",
+}
+CONTENT_ALIAS_DEFAULT = {
+    # --- 光影 ---------------------------------------------------------
+    "光影": "complementary-reimagined",
+    "互补光影": "complementary-reimagined",
+    "complementary": "complementary-reimagined",
+    "bsl": "bsl-shaders",
+    "bsl光影": "bsl-shaders",
+    "seus": "seus-shaders",
+    "seus光影": "seus-shaders",
+    "光子": "photon-shader",
+    "photon": "photon-shader",
+    "sildur": "sildurs-vibrant-shaders",
+    "sildurs": "sildurs-vibrant-shaders",
+    "眩光": "sildurs-vibrant-shaders",
+    "超级光": "super-duper-vanilla-shaders",
+    "原版增强光影": "super-duper-vanilla-shaders",
+    "光晕": "makeup-ultra-fast-shaders",
+    "makeup": "makeup-ultra-fast-shaders",
+    "低配光影": "makeup-ultra-fast-shaders",
+    # --- 材质包 -------------------------------------------------------
+    "原版材质": "faithful-32x",
+    "faithful": "faithful-32x",
+    "faithful32": "faithful-32x",
+    "原版风": "faithful-32x",
+    "鲜活动画": "fresh-animations",
+    "动画材质": "fresh-animations",
+    "fresh": "fresh-animations",
+    "舒适材质": "stay-true",
+    "staytrue": "stay-true",
+    "bare bones": "bare-bones",
+    "简约材质": "bare-bones",
+    "像素风": "bare-bones",
+    "高清材质": "patrix",
+    "patrix": "patrix",
+    "3d材质": "3d-default",
+    "字体": "smooth-font",
+    "中文字体": "smooth-font",
+}
+
+
+def sanitize_asset_filename(name, default_ext=".zip"):
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(name or "")).strip().strip(".")
+    if not cleaned:
+        cleaned = "akm-download-{0}{1}".format(int(time.time()), default_ext)
+    if not cleaned.lower().endswith((".zip", ".jar")):
+        cleaned += default_ext
+    return cleaned[:180]
+
+
+def fetch_content_file(project, mc_version, target_dir, say=None, kind="shader"):
+    """Download a shader / resource pack archive into target_dir."""
+    identifier = urllib.parse.quote(str(project or "").strip(), safe="")
+    if not identifier:
+        raise LauncherError("空的 Modrinth 项目标识")
+    base = "{0}/project/{1}/version".format(MODRINTH_API, identifier)
+    versions = []
+    if str(mc_version or "").strip():
+        params = {"game_versions": json.dumps([str(mc_version).strip()])}
+        data = with_retry(
+            lambda: http_json(
+                "{0}?{1}".format(base, urllib.parse.urlencode(params)), timeout=30
+            )
+        )
+        if isinstance(data, list):
+            versions = [item for item in data if isinstance(item, dict)]
+    if not versions:
+        data = with_retry(lambda: http_json(base, timeout=30))
+        if isinstance(data, list):
+            versions = [item for item in data if isinstance(item, dict)]
+    if not versions:
+        raise LauncherError(
+            "{0}: 没有可下载的文件（可能不支持 MC {1}）".format(project, mc_version or "?")
+        )
+    chosen = pick_version(versions)
+    files = [
+        item
+        for item in (chosen or {}).get("files") or []
+        if isinstance(item, dict)
+        and item.get("url")
+        and str(item.get("filename") or "").lower().endswith((".zip", ".jar"))
+    ]
+    if not files:
+        raise LauncherError("{0}: 该版本没有 zip/jar 文件".format(project))
+    primary = next((item for item in files if item.get("primary")), files[0])
+    filename = sanitize_asset_filename(primary.get("filename"), ".zip")
+    dest = os.path.join(target_dir, filename)
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        return {
+            "status": "skip",
+            "filename": filename,
+            "project": str(project),
+            "version": str(chosen.get("version_number") or ""),
+            "kind": kind,
+        }
+
+    def _progress(done, total):
+        if say is None:
+            return
+        if total:
+            say(
+                "下载 {0} :: {1}% ({2}/{3} KiB)".format(
+                    filename, int(done * 100 / total), done // 1024, total // 1024
+                )
+            )
+
+    hashes = primary.get("hashes") or {}
+    download_to_dest(
+        [("modrinth", primary["url"])],
+        dest,
+        sha1=str(hashes.get("sha1") or "").lower(),
+        size=int(primary.get("size") or 0),
+        progress=_progress,
+        timeout=600,
+    )
+    return {
+        "status": "ok",
+        "filename": filename,
+        "project": str(project),
+        "version": str(chosen.get("version_number") or ""),
+        "kind": kind,
+    }
+
+
+def content_search_page(
+    query="",
+    kind="shader",
+    limit=20,
+    index="relevance",
+    mc_version="",
+    offset=0,
+):
+    """Search Modrinth for shaders / resource packs (no loader facet)."""
+    project_type = "resourcepack" if kind == "resourcepack" else "shader"
+    return modrinth_search_page(
+        query,
+        limit,
+        index,
+        mc_version,
+        "",
+        offset=offset,
+        project_type=project_type,
+    )
+
+
+def _cleanup(path):
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def download_file(url, dest_path, progress=None, timeout=60):
+    ensure_dir(os.path.dirname(dest_path))
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    tmp_path = dest_path + ".part"
+    last_bucket = -1
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            total = int(response.headers.get("Content-Length") or 0)
+            done = 0
+            with open(tmp_path, "wb") as handle:
+                while True:
+                    chunk = response.read(65536)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    done += len(chunk)
+                    record_download_bytes(len(chunk))
+                    if progress is not None:
+                        bucket = int(done * 10 / total) if total else 0
+                        if bucket != last_bucket:
+                            last_bucket = bucket
+                            progress(done, total)
+            if total and done < total:
+                raise LauncherError("下载中断: 仅收到 {0}/{1} 字节".format(done, total))
+        os.replace(tmp_path, dest_path)
+    except urllib.error.HTTPError as exc:
+        _cleanup(tmp_path)
+        raise HttpError(exc.code, "", url) from None
+    except urllib.error.URLError as exc:
+        _cleanup(tmp_path)
+        raise LauncherError("下载失败: {0} ({1})".format(url, exc.reason)) from None
+    except TimeoutError:
+        _cleanup(tmp_path)
+        raise LauncherError("下载超时: {0}".format(url)) from None
+    except OSError as exc:
+        _cleanup(tmp_path)
+        raise LauncherError("写入文件失败: {0} ({1})".format(dest_path, exc)) from None
+    except LauncherError:
+        _cleanup(tmp_path)
+        raise
+    return dest_path
+
+
+def fetch_mod_jar(project, mc_version, loader, mods_dir, say=None):
+    """Resolve + download the newest matching jar. Returns a result dict."""
+    if say:
+        say("解析 {0} 的版本切片 ({1}/{2}) ...".format(project, mc_version, loader))
+    versions = modrinth_versions(project, mc_version, loader)
+    if not versions:
+        raise LauncherError("{0}: 无 {1}/{2} 版本".format(project, mc_version, loader))
+    version = pick_version(versions)
+    files = [
+        item
+        for item in (version.get("files") or [])
+        if isinstance(item, dict)
+        and str(item.get("filename", "")).lower().endswith(".jar")
+        and item.get("url")
+    ]
+    if not files:
+        raise LauncherError("{0}: 该版本没有 .jar 文件".format(project))
+    primary = next((item for item in files if item.get("primary")), files[0])
+    filename = sanitize_filename(primary.get("filename") or (project + ".jar"))
+    dest = os.path.join(mods_dir, filename)
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        return {
+            "status": "skip",
+            "filename": filename,
+            "project": str(project),
+            "version": str(version.get("version_number") or ""),
+        }
+
+    def _progress(done, total):
+        if say is None:
+            return
+        if total:
+            say("下载 {0} :: {1}% ({2}/{3} KiB)".format(
+                filename, int(done * 100 / total), done // 1024, total // 1024))
+        else:
+            say("下载 {0} :: {1} KiB".format(filename, done // 1024))
+
+    download_file(primary["url"], dest, progress=_progress)
+    return {
+        "status": "ok",
+        "filename": filename,
+        "project": str(project),
+        "version": str(version.get("version_number") or ""),
+    }
+
+
+def _cf_version_ok(versions, target, allow_patch=True):
+    for item in versions or []:
+        if mc_same_family(target, str(item), allow_patch):
+            return True
+    return False
+
+
+def _cf_loader_ok(versions, loader):
+    """cfwidget lists loaders as plain words inside the ``versions`` array."""
+    wanted = str(loader or "").strip().lower()
+    words = {str(item).strip().lower() for item in versions or []}
+    tags = words & {"forge", "fabric", "neoforge", "quilt"}
+    if not tags:
+        return True
+    if wanted == "quilt":
+        # Quilt loads Fabric mods, so a Fabric build is a valid port
+        return "quilt" in tags or "fabric" in tags
+    if wanted in ("forge", "fabric", "neoforge"):
+        return wanted in tags
+    return True
+
+
+def _cf_uploaded_key(text):
+    """Sortable key for cfwidget's ``uploaded_at`` strings."""
+    return re.sub(r"[^0-9]", "", str(text or ""))[:14]
+
+
+def curseforge_file_url(file_id, filename):
+    """Build the CurseForge CDN link for a numeric file id."""
+    try:
+        number = int(file_id)
+    except (TypeError, ValueError):
+        return ""
+    name = urllib.parse.quote(str(filename or "").strip(), safe="+.-_")
+    if number <= 0 or not name:
+        return ""
+    return "https://edge.forgecdn.net/files/{0}/{1}/{2}".format(
+        number // 1000, number % 1000, name
+    )
+
+
+def curseforge_project(slug, timeout=25):
+    """Read a CurseForge project through the public cfwidget mirror."""
+    ident = str(slug or "").strip().lower()
+    if not ident:
+        raise LauncherError("空的 CurseForge 项目标识")
+    url = "{0}/minecraft/mc-mods/{1}".format(
+        CURSEFORGE_WIDGET_API, urllib.parse.quote(ident, safe="")
+    )
+    data = with_retry(lambda: http_json(url, timeout=timeout))
+    if not isinstance(data, dict):
+        raise LauncherError("CurseForge 返回格式异常")
+    return data
+
+
+def curseforge_lookup(slug, target, loader="", allow_patch=True):
+    """Return ``(project, file_or_None)`` for a CurseForge slug.
+
+    ``project`` is a small dict (title / slug / page) so the caller can check
+    that the CurseForge project really is the same mod; ``file`` is the newest
+    jar whose ``versions`` contain the target MC version and the loader.
+    """
+    data = curseforge_project(slug)
+    project = {
+        "title": str(data.get("title") or slug),
+        "slug": str(slug),
+        "id": str(data.get("id") or ""),
+        "page": str((data.get("urls") or {}).get("curseforge") or ""),
+    }
+    best = None
+    for item in data.get("files") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "")
+        if not name.lower().endswith(".jar"):
+            continue
+        versions = item.get("versions") or []
+        if not _cf_version_ok(versions, target, allow_patch):
+            continue
+        if not _cf_loader_ok(versions, loader):
+            continue
+        candidate = {
+            "title": project["title"],
+            "slug": project["slug"],
+            "project_id": project["id"],
+            "page": project["page"],
+            "file_id": item.get("id"),
+            "filename": name,
+            "version": str(item.get("version") or ""),
+            "type": str(item.get("type") or ""),
+            "size": int(item.get("filesize") or 0),
+            "uploaded": str(item.get("uploaded_at") or ""),
+        }
+        candidate["url"] = curseforge_file_url(candidate["file_id"], name)
+        if not candidate["url"]:
+            continue
+        if best is None or _cf_uploaded_key(candidate["uploaded"]) > _cf_uploaded_key(
+            best["uploaded"]
+        ):
+            best = candidate
+    return project, best
+
+
+def _name_key(text):
+    return re.sub(r"[^0-9a-z]+", "", str(text or "").lower())
+
+
+def cf_names_agree(left, right):
+    """Conservative same-mod check between a row title and a CurseForge title."""
+    left_key = _name_key(left)
+    right_key = _name_key(right)
+    if not left_key or not right_key:
+        return False
+    if left_key == right_key:
+        return True
+    shorter, longer = sorted((left_key, right_key), key=len)
+    return len(shorter) >= 3 and shorter in longer
+
+
+def cf_stem_slug(filename):
+    """Best-effort CurseForge slug from a jar file name."""
+    stem = os.path.splitext(str(filename or ""))[0].lower()
+    stem = stem.replace("+", "-").replace("_", "-")
+    keep = []
+    for piece in [part for part in stem.split("-") if part]:
+        if re.fullmatch(r"v?\d+(\.\d+)*([a-z]\d*)?", piece):
+            break
+        if piece in (
+            "fabric",
+            "forge",
+            "neoforge",
+            "quilt",
+            "mc",
+            "client",
+            "server",
+        ):
+            break
+        keep.append(piece)
+    return "-".join(keep).strip("-")
+
+
+def cf_slug_candidates(row):
+    """CurseForge slug guesses for an audit row, most likely first."""
+    names = []
+    sources = [
+        row.get("slug"),
+        row.get("modid"),
+        row.get("title"),
+        cf_stem_slug(row.get("file")),
+    ]
+    for raw in sources:
+        slug = str(raw or "").strip().lower()
+        if not slug:
+            continue
+        if not re.fullmatch(r"[a-z0-9._-]+", slug):
+            slug = re.sub(r"\(.*?\)|\[.*?\]", " ", slug)
+            slug = re.sub(r"[^0-9a-z]+", "-", slug).strip("-")
+        for prefix in ("mod-", "the-"):
+            if slug.startswith(prefix) and len(slug) > len(prefix) + 3:
+                slug = slug[len(prefix):]
+        if slug and slug not in names:
+            names.append(slug)
+    return names[:5]
+
+
+def audit_curseforge_ports(
+    rows, target, loader="", allow_patch=True, progress=None, limit=40
+):
+    """Fill ``row['cf']`` when CurseForge carries a build for the target MC.
+
+    Only rows that Modrinth could not satisfy are probed (a mod that already
+    has a matching build does not need a "port").  Each row tries a handful of
+    slug guesses, and a hit is only accepted when the CurseForge project title
+    really matches the local mod title, so we never hand the user a wrong jar.
+    """
+    pending = [row for row in rows if row.get("ok") is not True][:limit]
+    if not pending:
+        return 0
+    cache = {}
+    found = 0
+    lock = threading.Lock()
+    done = [0]
+
+    def probe(row):
+        title = row.get("title") or row.get("file")
+        for slug in cf_slug_candidates(row):
+            with lock:
+                cached = slug in cache
+                project, file_hit = cache.get(slug, (None, None))
+            if not cached:
+                try:
+                    project, file_hit = curseforge_lookup(
+                        slug, target, loader, allow_patch
+                    )
+                except Exception:
+                    project, file_hit = None, None
+                with lock:
+                    cache[slug] = (project, file_hit)
+            if not project:
+                continue
+            if not cf_names_agree(project.get("title"), title):
+                continue
+            return project, file_hit
+        return None, None
+
+    workers = min(4, len(pending))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="akm-cf") as pool:
+        futures = {pool.submit(probe, row): row for row in pending}
+        for future in as_completed(futures):
+            row = futures[future]
+            done[0] += 1
+            if progress:
+                progress(
+                    done[0],
+                    len(pending),
+                    "CurseForge 移植检查 // {0}".format(
+                        shorten_text(row.get("file") or "", 24)
+                    ),
+                )
+            try:
+                project, file_hit = future.result()
+            except Exception:
+                project, file_hit = None, None
+            if project:
+                row["cf_project"] = project
+            if file_hit:
+                row["cf"] = file_hit
+                found += 1
+    return found
+
+
+def download_cf_port(port, target_dir, timeout=180):
+    """Download one CurseForge port jar into ``target_dir`` (size checked)."""
+    url = str(port.get("url") or "")
+    if not url:
+        raise LauncherError("没有可用的下载地址")
+    ensure_dir(target_dir)
+    filename = sanitize_filename(
+        str(port.get("filename") or "curseforge-mod.jar")
+    )
+    destination = os.path.join(target_dir, filename)
+    download_file(url, destination, timeout=timeout)
+    expected = int(port.get("size") or 0)
+    if expected:
+        try:
+            actual = os.path.getsize(destination)
+        except OSError:
+            actual = -1
+        if actual != expected:
+            _cleanup(destination)
+            raise LauncherError(
+                "大小校验失败 ({0} != {1})".format(actual, expected)
+            )
+    return destination
+
+
+MODPACK_SUFFIXES = (".mrpack", ".zip")
+
+
+def sanitize_pack_id(name, mc_dir):
+    """Build a unique, filesystem/version-id safe folder name for a pack."""
+    base = re.sub(r"[^A-Za-z0-9._-]+", "-", str(name or "")).strip("-._")
+    if not base:
+        base = "pack"
+    base = "PACK-" + base[:32]
+    candidate = base
+    index = 2
+    versions_dir = os.path.join(mc_dir, "versions")
+    while os.path.isdir(os.path.join(versions_dir, candidate)):
+        candidate = "{0}-{1}".format(base, index)
+        index += 1
+    return candidate
+
+
+def read_mrpack_index(path):
+    """Load modrinth.index.json from a .mrpack archive."""
+    try:
+        with zipfile.ZipFile(path) as bundle:
+            names = bundle.namelist()
+            target = ""
+            for name in names:
+                if name.replace("\\", "/").lower() == "modrinth.index.json":
+                    target = name
+                    break
+            if not target:
+                raise LauncherError(
+                    "整合包缺少 modrinth.index.json，不是有效的 .mrpack 文件"
+                )
+            raw = bundle.read(target)
+    except zipfile.BadZipFile:
+        raise LauncherError("无法解压整合包：文件不是有效的 zip / mrpack") from None
+    try:
+        data = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        raise LauncherError("modrinth.index.json 不是合法 JSON") from None
+    if not isinstance(data, dict):
+        raise LauncherError("modrinth.index.json 结构异常")
+    return data
+
+
+def mrpack_dependencies(index):
+    """Return (mc_version, loader, loader_version) from a pack index."""
+    deps = (index or {}).get("dependencies") or {}
+    mc_version = str(deps.get("minecraft") or "").strip()
+    loader = ""
+    loader_version = ""
+    for key in ("neoforge", "forge", "fabric-loader", "quilt-loader"):
+        value = str(deps.get(key) or "").strip()
+        if not value:
+            continue
+        loader = {"fabric-loader": "fabric", "quilt-loader": "quilt"}.get(key, key)
+        loader_version = value
+        break
+    return mc_version, loader, loader_version
+
+
+def mrpack_files(index):
+    """Client-side downloadable entries: path / urls / sha1 / size."""
+    rows = []
+    for item in (index or {}).get("files") or []:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").replace("\\", "/").strip()
+        if not path or path.startswith("/") or ".." in path.split("/"):
+            continue
+        env = item.get("env") or {}
+        if str(env.get("client") or "required").lower() == "unsupported":
+            continue
+        urls = [
+            str(url).strip()
+            for url in (item.get("downloads") or [])
+            if str(url or "").strip()
+        ]
+        if not urls:
+            continue
+        hashes = item.get("hashes") or {}
+        try:
+            size = int(item.get("fileSize") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        rows.append(
+            {
+                "path": path,
+                "urls": urls,
+                "sha1": str(hashes.get("sha1") or "").lower(),
+                "size": size,
+            }
+        )
+    return rows
+
+
+def safe_extract_zip(bundle, target_dir, prefix_filter=None, strip_top=False):
+    """Extract a zip (optionally limited to top-level folders) without zip-slip."""
+    base = os.path.abspath(target_dir)
+    ensure_dir(base)
+    count = 0
+    for info in bundle.infolist():
+        name = info.filename.replace("\\", "/")
+        if not name or name.endswith("/"):
+            continue
+        if prefix_filter is not None:
+            top = name.split("/", 1)[0].lower()
+            if top not in prefix_filter and name.lower() not in prefix_filter:
+                continue
+        relative = name
+        if strip_top:
+            parts = name.split("/", 1)
+            if len(parts) < 2 or not parts[1]:
+                continue
+            relative = parts[1]
+        dest = os.path.abspath(os.path.join(base, relative))
+        if dest != base and not dest.startswith(base + os.sep):
+            continue
+        ensure_dir(os.path.dirname(dest))
+        with bundle.open(info) as source, open(dest, "wb") as out:
+            shutil.copyfileobj(source, out)
+        count += 1
+    return count
+
+
+def parse_app_version(text):
+    """Comparable tuple: letter series first (A=1, B=2 ...), then 3 numbers.
+
+    ``B0.1`` -> (2, 0, 1, 0) so the new "B" series always wins over the old
+    ``1.7rc9`` style (0, 1, 7, 9); ``1.7rc9`` keeps sorting correctly too.
+    """
+    raw = str(text or "").strip()
+    series = 0
+    prefix = re.match(r"^([A-Za-z]+)", raw)
+    if prefix:
+        series = ord(prefix.group(1)[0].upper()) - 64
+    parts = [int(piece) for piece in re.findall(r"\d+", raw)[:3]]
+    while len(parts) < 3:
+        parts.append(0)
+    return (series, parts[0], parts[1], parts[2])
+
+
+def app_version_tag(version=None):
+    """Display tag: ``B0.1`` stays as is, numeric versions get a ``v`` prefix."""
+    text = str(version if version is not None else APP_VERSION).strip()
+    if not text:
+        return "v?"
+    return text if text[:1].isalpha() else "v" + text
+
+
+def version_is_newer(remote, local):
+    return parse_app_version(remote) > parse_app_version(local)
+
+
+def fetch_update_manifest(url, timeout=15):
+    """Read the self-update JSON manifest (version / url / sha256 / notes)."""
+    data = http_json(url, timeout=timeout)
+    if not isinstance(data, dict):
+        raise LauncherError("更新清单格式错误（需要 JSON 对象）")
+    version = str(data.get("version") or "").strip()
+    link = str(data.get("url") or "").strip()
+    if not version or not link:
+        raise LauncherError("更新清单缺少 version 或 url 字段")
+    if not link.lower().startswith(("http://", "https://")):
+        raise LauncherError("更新清单的 url 必须是 http(s) 地址")
+    return {
+        "version": version,
+        "url": link,
+        "notes": str(data.get("notes") or ""),
+        "sha256": str(data.get("sha256") or "").lower(),
+        "page": str(data.get("page") or ""),
+    }
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def fetch_fabric_loader_version(mc_version):
+    url = "{0}/{1}".format(FABRIC_META, mc_version)
+    entries = with_retry(lambda: http_json(url, timeout=25))
+    if not isinstance(entries, list) or not entries:
+        raise LauncherError("Fabric Meta 未返回 {0} 的加载器版本".format(mc_version))
+    stable = [entry for entry in entries if (entry.get("loader") or {}).get("stable")]
+    chosen = (stable or entries)[0]
+    version = (chosen.get("loader") or {}).get("version")
+    if not version:
+        raise LauncherError("无法解析 Fabric 加载器版本号")
+    return str(version)
+
+
+def fetch_fabric_profile(mc_version, loader_version):
+    url = "{0}/{1}/{2}/profile/json".format(FABRIC_META, mc_version, loader_version)
+    profile = with_retry(lambda: http_json(url, timeout=30))
+    if not isinstance(profile, dict) or not profile.get("id"):
+        raise LauncherError("Fabric 版本清单无效")
+    return profile
+
+
+def loader_versions_for(loader_id, minecraft_version):
+    """Loader versions usable with one MC version (BMCLAPI mirror first)."""
+    loader_id = str(loader_id or "").lower()
+    minecraft_version = str(minecraft_version or "").strip()
+    if not loader_id or loader_id == "vanilla" or not minecraft_version:
+        return []
+    if loader_id == "neoforge":
+        try:
+            versions = sort_versions_desc(
+                neoforge_mirror_loader_versions(minecraft_version)
+            )
+            if versions:
+                return versions
+        except Exception:
+            log_debug("neoforge mirror versions failed:\n" + traceback.format_exc())
+    try:
+        import minecraft_launcher_lib.mod_loader as mll_loader
+
+        loader = mll_loader.get_mod_loader(loader_id)
+        return sort_versions_desc(
+            list(loader.get_loader_versions(minecraft_version, False) or [])
+        )
+    except Exception:
+        log_debug("loader versions failed:\n" + traceback.format_exc())
+        return []
+
+
+def run_with_timeout(func, timeout, label="请求"):
+    """Run func in a worker thread; fail fast instead of hanging the loader UI."""
+    box = {}
+
+    def target():
+        try:
+            box["value"] = func()
+        except BaseException as exc:  # noqa: BLE001 - re-raised in the caller
+            box["error"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise LauncherError(
+            "{0} 超时（{1} 秒无响应）。请检查网络，或使用页面上的 [官方下载] 入口。".format(
+                label, int(timeout)
+            )
+        )
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+def forge_promo_map(timeout=15):
+    """Forge official promotions: {mc_version: {"latest": v, "recommended": v}}."""
+    data = http_json(FORGE_PROMOS_URL, timeout=timeout)
+    promos = (data or {}).get("promos") or {}
+    mapping = {}
+    for key, value in promos.items():
+        if not isinstance(key, str) or "-" not in key:
+            continue
+        mc_version, _, kind = key.rpartition("-")
+        if not mc_version or kind not in {"latest", "recommended"}:
+            continue
+        mapping.setdefault(mc_version, {})[kind] = str(value)
+    return mapping
+
+
+def loader_mc_fallback(loader_id):
+    """Offline/mirror fallback so Forge & NeoForge always have an entry."""
+    loader_id = str(loader_id or "").lower()
+    if loader_id == "forge":
+        try:
+            mapping = run_with_timeout(
+                lambda: forge_promo_map(timeout=12),
+                18,
+                "Forge promotions",
+            )
+            versions = sort_versions_desc(list(mapping.keys()))
+            if versions:
+                return versions, "MIRROR // 已改用 Forge 官方 promotions 数据"
+        except Exception:
+            return [], ""
+    if loader_id == "neoforge":
+        return (
+            sort_versions_desc(list(NEOFORGE_FALLBACK_MC)),
+            "OFFLINE // NeoForge 元数据不可达，已使用内置版本表；可直接用 [NeoForge 官网] 下载",
+        )
+    return [], ""
+
+
+def loader_version_fallback(loader_id, mc_version):
+    """Loader versions when the metadata API is unreachable."""
+    loader_id = str(loader_id or "").lower()
+    if loader_id == "forge":
+        try:
+            mapping = run_with_timeout(
+                lambda: forge_promo_map(timeout=12),
+                18,
+                "Forge promotions",
+            )
+        except Exception:
+            return []
+        info = mapping.get(str(mc_version)) or {}
+        return sort_versions_desc([value for value in info.values() if value])
+    return []
+
+
+# ---------------------------------------------------------------------------
+# 4a-2. Memory allocation helpers (settings UI + launch command)
+# ---------------------------------------------------------------------------
+
+
+def total_ram_mb():
+    """Physical RAM of this machine in MB (0 when it cannot be detected)."""
+    try:
+        import ctypes
+
+        class _MemoryStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_uint32),
+                ("dwMemoryLoad", ctypes.c_uint32),
+                ("ullTotalPhys", ctypes.c_uint64),
+                ("ullAvailPhys", ctypes.c_uint64),
+                ("ullTotalPageFile", ctypes.c_uint64),
+                ("ullAvailPageFile", ctypes.c_uint64),
+                ("ullTotalVirtual", ctypes.c_uint64),
+                ("ullAvailVirtual", ctypes.c_uint64),
+                ("ullAvailExtendedVirtual", ctypes.c_uint64),
+            ]
+
+        status = _MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return int(status.ullTotalPhys // (1024 * 1024))
+    except Exception:
+        pass
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        size = os.sysconf("SC_PAGE_SIZE")
+        return int(pages * size // (1024 * 1024))
+    except Exception:
+        return 0
+
+
+def parse_memory_mb(value, default_mb=0):
+    """'2048M' / '2G' / '2048' / 2048 -> MB."""
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return int(number * 1024) if number < 64 else int(number)
+    text = str(value or "").strip().lower().replace(" ", "")
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([mg]?)", text)
+    if not match:
+        return int(default_mb)
+    number = float(match.group(1))
+    unit = match.group(2) or "m"
+    return int(round(number * 1024)) if unit == "g" else int(round(number))
+
+
+def format_memory_mb(value):
+    try:
+        mb = int(value or 0)
+    except (TypeError, ValueError):
+        mb = 0
+    if mb >= 1024 and mb % 1024 == 0:
+        return "{0}G".format(mb // 1024)
+    return "{0}M".format(mb)
+
+
+def normalize_memory_config(memory, ram_mb=0):
+    """Clamp the stored memory block to something the JVM will accept."""
+    memory = memory if isinstance(memory, dict) else {}
+    min_mb = parse_memory_mb(memory.get("min"), 1024) or 1024
+    max_mb = parse_memory_mb(memory.get("max"), 4096) or 4096
+    if min_mb < 256:
+        min_mb = 256
+    if max_mb < 512:
+        max_mb = 512
+    if max_mb < min_mb:
+        max_mb = min_mb
+    limit = int(ram_mb or 0)
+    if limit > 0:
+        usable = max(512, limit - 512)
+        if max_mb > usable:
+            max_mb = usable
+        if min_mb > max_mb:
+            min_mb = max_mb
+    return {"min_mb": int(min_mb), "max_mb": int(max_mb)}
+
+
+def recommended_memory_mb(ram_mb=0):
+    """Half of the installed RAM, clamped to the range Minecraft likes."""
+    limit = int(ram_mb or 0)
+    if limit <= 0:
+        return 4096
+    half = int(limit / 2 / 1024) * 1024
+    return max(2048, min(half, 16384))
+
+
+# ---------------------------------------------------------------------------
+# 4a-3. NeoForge metadata / installer through the BMCLAPI mirror
+# ---------------------------------------------------------------------------
+
+
+def http_text(url, timeout=30):
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        raise LauncherError("HTTP {0}: {1}".format(exc.code, url)) from None
+    except urllib.error.URLError as exc:
+        raise LauncherError(
+            "网络不可达: {0} ({1})".format(url, exc.reason)
+        ) from None
+    except (TimeoutError, OSError) as exc:
+        raise LauncherError("请求超时: {0} ({1})".format(url, exc)) from None
+
+
+def neoforge_loader_mc_version(loader_version):
+    """21.1.264 -> 1.21.1 // 20.4.237 -> 1.20.4 // 21.0.167 -> 1.21"""
+    match = re.match(r"^(\d+)\.(\d+)", str(loader_version or "").strip())
+    if not match:
+        return ""
+    major, minor = match.group(1), match.group(2)
+    if major == "0":
+        return ""
+    if minor == "0":
+        return "1." + major
+    return "1.{0}.{1}".format(major, minor)
+
+
+def neoforge_mirror_pairs(timeout=JAVA_RUNTIME_TIMEOUT):
+    """{minecraft_version: [loader versions, newest first]} from BMCLAPI."""
+    raw = http_text(NEOFORGE_MIRROR_METADATA, timeout=timeout)
+    mapping = {}
+    for version in re.findall(r"<version>\s*([^<\s]+)\s*</version>", raw):
+        mc_version = neoforge_loader_mc_version(version)
+        if not mc_version:
+            continue
+        mapping.setdefault(mc_version, []).append(version)
+    for mc_version in list(mapping.keys()):
+        mapping[mc_version] = sort_versions_desc(mapping[mc_version])
+    return mapping
+
+
+def neoforge_mirror_loader_versions(mc_version, timeout=JAVA_RUNTIME_TIMEOUT):
+    """Loader versions for one Minecraft version, newest first (BMCLAPI)."""
+    mc_version = str(mc_version or "").strip()
+    if not mc_version:
+        return []
+    data = http_json(NEOFORGE_MIRROR_LIST.format(mc_version), timeout=timeout)
+    versions = []
+    for item in data or []:
+        version = str((item or {}).get("version") or "").strip()
+        if version:
+            versions.append(version)
+    return sort_versions_desc(versions)
+
+
+def installer_library_entries(installer_path):
+    """Read the library list embedded in a Forge/NeoForge installer jar."""
+    entries = []
+    seen = set()
+    try:
+        with zipfile.ZipFile(installer_path) as bundle:
+            names = set(bundle.namelist())
+            for name in ("install_profile.json", "version.json"):
+                if name not in names:
+                    continue
+                try:
+                    data = json.loads(
+                        bundle.read(name).decode("utf-8", "replace")
+                    )
+                except ValueError:
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                for item in data.get("libraries") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    artifact = (item.get("downloads") or {}).get("artifact") or {}
+                    path = str(artifact.get("path") or "").replace("\\", "/")
+                    if not path or path in seen:
+                        continue
+                    seen.add(path)
+                    entries.append(
+                        {
+                            "path": path,
+                            "sha1": str(artifact.get("sha1") or "").lower(),
+                            "size": int(artifact.get("size") or 0),
+                            "url": str(artifact.get("url") or ""),
+                        }
+                    )
+    except (OSError, zipfile.BadZipFile):
+        log_debug("installer library list unreadable: {0}".format(installer_path))
+        return []
+    return entries
+
+
+def preseed_installer_libraries(
+    mc_dir, installer_path, report=None, timeout=45, deadline_seconds=150
+):
+    """Fetch the installer's libraries from the BMCLAPI mirror first.
+
+    maven.neoforged.net is slow or unreachable from a lot of networks, and the
+    installer downloads ~150 jars one by one (each with its own timeout).  When
+    the files are already on disk the installer prints
+    ``File ... exists. Checksum valid.`` and skips them, so seeding from the
+    mirror turns a multi-minute timeout-prone run into a short one.
+    """
+    base = str(mc_dir or "").strip()
+    entries = installer_library_entries(installer_path)
+    if not base or not entries:
+        return 0, 0
+    libraries_dir = os.path.join(base, "libraries")
+    todo = []
+    skipped = 0
+    for entry in entries:
+        target = os.path.join(libraries_dir, entry["path"].replace("/", os.sep))
+        if os.path.isfile(target) and os.path.getsize(target) > 0:
+            skipped += 1
+            continue
+        todo.append((entry, target))
+    fetched = 0
+    started = time.time()
+    for index, (entry, target) in enumerate(todo, start=1):
+        if time.time() - started > deadline_seconds:
+            if report:
+                report(
+                    "loader",
+                    index,
+                    len(todo),
+                    "预取超时 // 剩下的 {0} 个交给安装器自己下载".format(
+                        len(todo) - index + 1
+                    ),
+                )
+            break
+        if report:
+            report(
+                "loader",
+                index,
+                len(todo),
+                "预取安装器依赖 {0}/{1} // {2}".format(
+                    index, len(todo), os.path.basename(entry["path"])
+                ),
+            )
+        urls = []
+        if entry["url"]:
+            urls.append(entry["url"])
+        mirror = BMCLAPI_BASE + "/maven/" + entry["path"]
+        if mirror not in urls:
+            urls.insert(0, mirror)
+        ensure_dir(os.path.dirname(target))
+        for url in urls:
+            try:
+                download_file(url, target, timeout=timeout)
+            except Exception:
+                _cleanup(target)
+                continue
+            expected = entry["sha1"]
+            if expected:
+                try:
+                    actual = sha1_file(target)
+                except OSError:
+                    actual = ""
+                if actual != expected:
+                    _cleanup(target)
+                    continue
+            fetched += 1
+            break
+    if report:
+        report(
+            "loader",
+            len(todo),
+            len(todo),
+            "安装器依赖已就绪 // 新下载 {0} / 已有 {1}".format(fetched, skipped),
+        )
+    return fetched, skipped
+
+
+def neoforge_installer_pairs(loader_version):
+    """(tag, url) list: BMCLAPI mirror first, official maven second."""
+    loader_version = str(loader_version or "").strip()
+    jar = "neoforge-{0}-installer.jar".format(loader_version)
+    return [
+        (
+            "bmclapi",
+            "{0}/neoforge/{1}/{2}".format(
+                NEOFORGE_MIRROR_MAVEN, loader_version, jar
+            ),
+        ),
+        (
+            "official",
+            "{0}/{1}/{2}".format(NEOFORGE_OFFICIAL_MAVEN, loader_version, jar),
+        ),
+    ]
+
+
+LAUNCHER_PROFILES_DEFAULT = {
+    "profiles": {},
+    "settings": {
+        "enableSnapshots": False,
+        "enableAdvanced": False,
+        "keepLauncherOpen": False,
+        "showGameLog": False,
+        "showMenu": False,
+    },
+    "version": 3,
+}
+
+
+def ensure_launcher_profiles(mc_dir, version_label=""):
+    """Forge / NeoForge installers refuse to run without launcher_profiles.json.
+
+    The official launcher writes that file; AKM keeps its own profile list in
+    config.json, so a fresh AKM game dir has none and every Forge / NeoForge
+    install stops with "There is no minecraft launcher profile ... you need to
+    run the launcher first".  Create a minimal one when it is missing, and
+    never touch an existing file (the official launcher may own it).
+    """
+    base = str(mc_dir or "").strip()
+    if not base:
+        return ""
+    path = os.path.join(base, "launcher_profiles.json")
+    if os.path.isfile(path):
+        return path
+    ensure_dir(base)
+    data = dict(LAUNCHER_PROFILES_DEFAULT)
+    data["profiles"] = {}
+    label = str(version_label or "").strip()
+    if label:
+        data["profiles"][label] = {
+            "name": label,
+            "type": "custom",
+            "created": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "lastUsed": "1970-01-01T00:00:00.000Z",
+            "icon": "Furnace",
+            "gameDir": base,
+            "lastVersionId": label,
+        }
+    try:
+        write_json(path, data)
+        log_debug("created launcher_profiles.json -> {0}".format(path))
+    except OSError as exc:
+        log_debug("launcher_profiles.json create failed: {0}".format(exc))
+    return path
+
+
+# ---------------------------------------------------------------------------
+# 4a-4. Bundled Java runtimes (Temurin JRE 8 / 11 / 17 / 21 / 25)
+# ---------------------------------------------------------------------------
+
+
+def java_runtime_root(mc_dir):
+    return os.path.join(mc_dir, "runtime")
+
+
+def java_runtime_dir(mc_dir, major):
+    return os.path.join(
+        java_runtime_root(mc_dir), JAVA_RUNTIME_PREFIX + str(int(major))
+    )
+
+
+def java_runtime_executable(mc_dir, major):
+    base = java_runtime_dir(mc_dir, major)
+    for name in ("java.exe", "java"):
+        path = os.path.join(base, "bin", name)
+        if os.path.isfile(path):
+            return path
+    return ""
+
+
+def dir_size(path):
+    total = 0
+    try:
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, name))
+                except OSError:
+                    pass
+    except OSError:
+        return 0
+    return total
+
+
+def installed_java_runtimes(mc_dir):
+    """Runtimes installed by AKM under <game>/runtime/akm-java-<major>."""
+    rows = []
+    for major in JAVA_RUNTIME_MAJORS:
+        java = java_runtime_executable(mc_dir, major)
+        if not java:
+            continue
+        base = java_runtime_dir(mc_dir, major)
+        rows.append(
+            {
+                "major": int(major),
+                "java": java,
+                "dir": base,
+                "size": dir_size(base),
+            }
+        )
+    return rows
+
+
+def _java_zip_version_key(name):
+    return tuple(int(part) for part in re.findall(r"\d+", str(name or "")))
+
+
+def java_runtime_sources(major, timeout=JAVA_RUNTIME_TIMEOUT):
+    """[(tag, url)] - Tsinghua Adoptium mirror first, Adoptium API second."""
+    major = int(major)
+    sources = []
+    page = "{0}/{1}/jre/x64/windows/".format(TUNA_ADOPTIUM_BASE, major)
+    try:
+        html = http_text(page, timeout=timeout)
+        pattern = (
+            r'href="(OpenJDK{0}U-jre_x64_windows_hotspot_[^"]+\.zip)"'.format(major)
+        )
+        names = sorted(set(re.findall(pattern, html)), key=_java_zip_version_key)
+        if names:
+            sources.append(("tuna", page + names[-1]))
+    except Exception:
+        pass
+    sources.append(("adoptium", ADOPTIUM_BINARY_API.format(major)))
+    return sources
+
+
+def install_java_runtime(major, mc_dir, progress=None, cancel=None, say=None):
+    """Download + unpack one Temurin JRE into <game>/runtime/akm-java-<major>."""
+    major = int(major)
+
+    def report(text):
+        if say is not None:
+            say(text)
+
+    sources = java_runtime_sources(major)
+    if not sources:
+        raise LauncherError("没有可用的 Java {0} 下载源".format(major))
+    root = java_runtime_root(mc_dir)
+    ensure_dir(root)
+    archive = os.path.join(root, "_akm-java-{0}.zip".format(major))
+    report(
+        "Java {0}: 下载 {1}".format(major, sources[0][1])
+    )
+    download_to_dest(
+        sources,
+        archive,
+        progress=progress,
+        cancel=cancel,
+        timeout=180,
+    )
+    unpack_dir = tempfile.mkdtemp(prefix="akm-java-{0}-".format(major), dir=root)
+    target = java_runtime_dir(mc_dir, major)
+    try:
+        check_cancel(cancel)
+        report("Java {0}: 解压 ...".format(major))
+        with zipfile.ZipFile(archive) as bundle:
+            bundle.extractall(unpack_dir)
+        inner = unpack_dir
+        if not os.path.isfile(os.path.join(inner, "bin", "java.exe")):
+            found = ""
+            for name in os.listdir(unpack_dir):
+                candidate = os.path.join(unpack_dir, name)
+                if os.path.isdir(candidate) and os.path.isfile(
+                    os.path.join(candidate, "bin", "java.exe")
+                ):
+                    found = candidate
+                    break
+            if not found:
+                raise LauncherError(
+                    "Java {0} 压缩包结构异常（未找到 bin/java.exe）".format(major)
+                )
+            inner = found
+        shutil.rmtree(target, ignore_errors=True)
+        shutil.move(inner, target)
+    finally:
+        shutil.rmtree(unpack_dir, ignore_errors=True)
+        try:
+            os.remove(archive)
+        except OSError:
+            pass
+    java = java_runtime_executable(mc_dir, major)
+    if not java:
+        raise LauncherError("Java {0} 解压后缺少 bin/java.exe".format(major))
+    _JAVA_MAJOR_CACHE.pop(java, None)
+    detected = java_major_version(java)
+    if not detected:
+        raise LauncherError("Java {0} 安装完成但无法执行".format(major))
+    report("Java {0} 就绪 // {1}".format(detected, java))
+    return {
+        "major": major,
+        "java": java,
+        "dir": target,
+        "size": dir_size(target),
+        "detected": detected,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 4b. Vanilla installer: official Mojang source + BMCLAPI mirror
+# ---------------------------------------------------------------------------
+
+
+def sha1_file(path):
+    digest = hashlib.sha1()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def source_order(source):
+    source = str(source or "auto").lower()
+    if source == "official":
+        return ["official", "mirror"]
+    return ["mirror", "official"]
+
+
+def ordered_urls(order, official_url, mirror_url):
+    mapping = {"official": official_url, "mirror": mirror_url}
+    return [(tag, mapping[tag]) for tag in order if mapping.get(tag)]
+
+
+def check_cancel(cancel):
+    if cancel is not None and cancel.is_set():
+        raise OperationCancelled("下载已取消")
+
+
+# -- download plumbing: keep-alive pool + source health ----------------------
+
+_TLS_CONTEXT = ssl.create_default_context()
+_POOL_LOCAL = threading.local()
+
+
+class _HttpStatusError(LauncherError):
+    """Definitive HTTP answer (4xx/5xx) coming from one download source."""
+
+    def __init__(self, code, url):
+        LauncherError.__init__(self, "HTTP {0} // {1}".format(code, url))
+        self.code = int(code)
+
+
+class SourceHealth(object):
+    """Remember a source that keeps answering 4xx and skip it for this install."""
+
+    def __init__(self, threshold=6):
+        self._lock = threading.Lock()
+        self._threshold = max(1, int(threshold))
+        self._strikes = {}
+        self._dead = set()
+
+    def note(self, tag, ok):
+        tag = str(tag or "")
+        with self._lock:
+            if ok:
+                self._strikes.pop(tag, None)
+                return
+            count = self._strikes.get(tag, 0) + 1
+            self._strikes[tag] = count
+            if count >= self._threshold:
+                self._dead.add(tag)
+
+    def blocked(self, tag):
+        with self._lock:
+            return str(tag or "") in self._dead
+
+    def reset(self):
+        with self._lock:
+            self._strikes.clear()
+            self._dead.clear()
+
+
+class _DownloadStream(object):
+    """urllib-like reader that can hand its socket back to the keep-alive pool."""
+
+    def __init__(self, response, conn=None, key=None):
+        self.headers = response.headers
+        self._response = response
+        self._conn = conn
+        self._key = key
+
+    def read(self, amount=None):
+        if amount is None:
+            return self._response.read()
+        return self._response.read(amount)
+
+    def close(self, drain=True):
+        if self._conn is None:
+            try:
+                self._response.close()
+            except Exception:
+                pass
+            return
+        if not drain:
+            _drop_pool_conn(self._key)
+            try:
+                self._response.close()
+            except Exception:
+                pass
+            return
+        try:
+            self._response.read()
+        except Exception:
+            _drop_pool_conn(self._key)
+
+
+def _thread_pool():
+    pool = getattr(_POOL_LOCAL, "pool", None)
+    if pool is None:
+        pool = {}
+        _POOL_LOCAL.pool = pool
+    return pool
+
+
+def _drop_pool_conn(key):
+    conn = _thread_pool().pop(key, None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def close_download_pool():
+    """Drop every keep-alive connection held by the calling thread."""
+    pool = _thread_pool()
+    for key in list(pool):
+        _drop_pool_conn(key)
+
+
+def _pooled_conn(key, timeout):
+    pool = _thread_pool()
+    conn = pool.get(key)
+    if conn is not None:
+        return conn
+    scheme, netloc = key
+    if scheme == "https":
+        conn = http.client.HTTPSConnection(
+            netloc, timeout=timeout, context=_TLS_CONTEXT
+        )
+    else:
+        conn = http.client.HTTPConnection(netloc, timeout=timeout)
+    pool[key] = conn
+    return conn
+
+
+def open_download_stream(url, timeout=60, keepalive=False):
+    """Open ``url``; with ``keepalive`` reuse this thread's TLS connection."""
+    if not keepalive:
+        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        try:
+            response = urllib.request.urlopen(request, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            raise _HttpStatusError(exc.code, url)
+        return _DownloadStream(response)
+    current = url
+    for _hop in range(4):
+        parts = urllib.parse.urlsplit(current)
+        key = (parts.scheme, parts.netloc)
+        path = parts.path or "/"
+        if parts.query:
+            path = path + "?" + parts.query
+        response = None
+        for attempt in (0, 1):
+            conn = _pooled_conn(key, timeout)
+            try:
+                conn.request(
+                    "GET",
+                    path,
+                    headers={
+                        "User-Agent": USER_AGENT,
+                        "Accept-Encoding": "identity",
+                        "Connection": "keep-alive",
+                    },
+                )
+                response = conn.getresponse()
+                break
+            except Exception:
+                _drop_pool_conn(key)
+                response = None
+                if attempt:
+                    raise LauncherError("连接失败: {0}".format(current))
+        if response is None:
+            raise LauncherError("连接失败: {0}".format(current))
+        if response.status in (301, 302, 303, 307, 308):
+            location = str(response.getheader("Location") or "").strip()
+            try:
+                response.read()
+            except Exception:
+                _drop_pool_conn(key)
+            if not location:
+                _drop_pool_conn(key)
+                raise LauncherError("重定向缺少 Location: {0}".format(current))
+            if path.startswith("/assets/") and "/download/" in location:
+                remember_asset_cdn(location)
+            current = urllib.parse.urljoin(current, location)
+            continue
+        if response.status != 200:
+            try:
+                response.read()
+            except Exception:
+                pass
+            _drop_pool_conn(key)
+            raise _HttpStatusError(response.status, current)
+        return _DownloadStream(response, conn, key)
+    raise LauncherError("重定向次数过多: {0}".format(url))
+
+
+def fetch_json_sources(order, official_url, mirror_url, cancel=None, timeout=25):
+    last_error = None
+    for tag, url in ordered_urls(order, official_url, mirror_url):
+        for attempt in range(2):
+            check_cancel(cancel)
+            try:
+                request = urllib.request.Request(
+                    url,
+                    headers={
+                        "User-Agent": USER_AGENT,
+                        "Accept": "application/json",
+                    },
+                )
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    raw = response.read()
+                data = json.loads(raw.decode("utf-8", "replace"))
+                if not isinstance(data, dict):
+                    raise LauncherError("响应不是 JSON 对象")
+                return data, tag, url
+            except OperationCancelled:
+                raise
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0:
+                    time.sleep(0.8)
+    raise LauncherError(
+        "获取 {0} 失败: {1}".format(official_url or mirror_url, last_error)
+    )
+
+
+_ASSET_CDN_LOCK = threading.Lock()
+_ASSET_CDN = {"prefix": "", "node": "", "hits": 0}
+
+
+def asset_cdn_prefix():
+    """Cached BMCLAPI asset CDN prefix ('https://<node>:443/download/' or '')."""
+    with _ASSET_CDN_LOCK:
+        return str(_ASSET_CDN.get("prefix") or "")
+
+
+def asset_cdn_node():
+    with _ASSET_CDN_LOCK:
+        return str(_ASSET_CDN.get("node") or "")
+
+
+def asset_cdn_hits():
+    with _ASSET_CDN_LOCK:
+        return int(_ASSET_CDN.get("hits") or 0)
+
+
+def remember_asset_cdn(location):
+    """Turn a BMCLAPI 302 into a reusable '/download/<hash>?name=<hash>' prefix.
+
+    BMCLAPI answers every asset object with a 302 to a random `bmclapiNN` node.
+    Remembering the node lets the next few thousand objects skip the redirect
+    hop and reuse one keep-alive TLS connection per worker thread, which is the
+    difference between ~1.2s and ~0.2s per tiny file.
+    """
+    location = str(location or "")
+    marker = "/download/"
+    index = location.find(marker)
+    if index < 0:
+        return ""
+    prefix = location[: index + len(marker)]
+    node = prefix.split("://", 1)[-1].split("/", 1)[0]
+    with _ASSET_CDN_LOCK:
+        if _ASSET_CDN.get("prefix") != prefix:
+            _ASSET_CDN["prefix"] = prefix
+            _ASSET_CDN["node"] = node
+            _ASSET_CDN["hits"] = 0
+        _ASSET_CDN["hits"] = int(_ASSET_CDN.get("hits") or 0) + 1
+    return prefix
+
+
+def forget_asset_cdn():
+    with _ASSET_CDN_LOCK:
+        _ASSET_CDN["prefix"] = ""
+        _ASSET_CDN["node"] = ""
+        _ASSET_CDN["hits"] = 0
+
+
+def asset_cdn_url(filehash):
+    """Direct CDN URL for one asset hash, or '' when no node is pinned yet."""
+    prefix = asset_cdn_prefix()
+    if not prefix:
+        return ""
+    filehash = str(filehash or "")
+    return "{0}{1}?name={1}".format(prefix, filehash)
+
+
+class DownloadMonitor(object):
+    """Thread-safe, low-cost registry of the files a download task is moving.
+
+    The launcher renders it in the "下载详情" window: every active file gets its
+    own little progress bar, finished files are counted, and the phase summary
+    mirrors what ``install_vanilla_game`` reports.
+    """
+
+    RECENT_LIMIT = 40
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.title = ""
+        self.started = time.time()
+        self.phase = ("", 0, 0, "")
+        self.active = {}
+        self.recent = []
+        self.counts = {"done": 0, "cached": 0, "failed": 0}
+        self.bytes_done = 0
+        self.bytes_cached = 0
+        self.notes = ""
+
+    def reset(self, title=""):
+        with self._lock:
+            self.title = str(title or "")
+            self.started = time.time()
+            self.phase = ("", 0, 0, "")
+            self.active = {}
+            self.recent = []
+            self.counts = {"done": 0, "cached": 0, "failed": 0}
+            self.bytes_done = 0
+            self.bytes_cached = 0
+            self.notes = ""
+
+    def set_phase(self, phase, current=0, total=0, detail=""):
+        with self._lock:
+            self.phase = (str(phase or ""), int(current or 0), int(total or 0), str(detail or ""))
+
+    def begin(self, key, label, size=0, kind=""):
+        with self._lock:
+            self.active[str(key)] = {
+                "key": str(key),
+                "label": str(label or key),
+                "size": int(size or 0),
+                "done": 0,
+                "kind": str(kind or ""),
+                "since": time.time(),
+            }
+
+    def ensure(self, key, label, size=0, kind=""):
+        key = str(key)
+        with self._lock:
+            row = self.active.get(key)
+            if row is None:
+                self.active[key] = {
+                    "key": key,
+                    "label": str(label or key),
+                    "size": int(size or 0),
+                    "done": 0,
+                    "kind": str(kind or ""),
+                    "since": time.time(),
+                }
+                return
+            if label:
+                row["label"] = str(label)
+            if size:
+                row["size"] = int(size)
+
+    def update(self, key, done, size=0):
+        with self._lock:
+            row = self.active.get(str(key))
+            if row is None:
+                return
+            row["done"] = int(done or 0)
+            if size:
+                row["size"] = int(size)
+
+    def finish(self, key, status="done", size=0):
+        key = str(key)
+        with self._lock:
+            row = self.active.pop(key, None)
+            if row is None:
+                row = {"label": key, "size": int(size or 0), "done": int(size or 0)}
+            status = str(status or "done")
+            if status == "cached":
+                self.counts["cached"] += 1
+                self.bytes_cached += int(size or row.get("size") or 0)
+            elif status in ("failed", "cancelled"):
+                self.counts["failed"] += 1
+            else:
+                self.counts["done"] += 1
+                self.bytes_done += int(size or row.get("size") or row.get("done") or 0)
+            row = dict(row)
+            row["status"] = status
+            row["at"] = time.time()
+            self.recent.append(row)
+            if len(self.recent) > self.RECENT_LIMIT:
+                del self.recent[: len(self.recent) - self.RECENT_LIMIT]
+
+    def note_cached(self, label, size=0):
+        with self._lock:
+            self.counts["cached"] += 1
+            self.bytes_cached += int(size or 0)
+            self.recent.append(
+                {
+                    "label": str(label or ""),
+                    "size": int(size or 0),
+                    "done": int(size or 0),
+                    "status": "cached",
+                    "at": time.time(),
+                }
+            )
+            if len(self.recent) > self.RECENT_LIMIT:
+                del self.recent[: len(self.recent) - self.RECENT_LIMIT]
+
+    def set_notes(self, text):
+        with self._lock:
+            self.notes = str(text or "")
+
+    def snapshot(self, active_limit=12):
+        with self._lock:
+            rows = sorted(self.active.values(), key=lambda item: item["since"])
+            active = [dict(item) for item in rows[:active_limit]]
+            active_bytes = sum(item["done"] for item in self.active.values())
+            queued = max(0, len(self.active) - len(active))
+            elapsed = max(0.05, time.time() - self.started)
+            return {
+                "title": self.title,
+                "phase": self.phase,
+                "counts": dict(self.counts),
+                "active": active,
+                "active_total": len(self.active),
+                "active_bytes": active_bytes,
+                "queued": queued,
+                "bytes_done": self.bytes_done,
+                "bytes_cached": self.bytes_cached,
+                "speed": (self.bytes_done + active_bytes) / elapsed,
+                "elapsed": elapsed,
+                "recent": [dict(item) for item in self.recent[-5:]],
+                "recent_total": len(self.recent),
+                "notes": self.notes,
+            }
+
+
+DOWNLOAD_MONITOR = DownloadMonitor()
+
+
+def download_to_dest(
+    url_pairs,
+    dest,
+    sha1="",
+    size=0,
+    progress=None,
+    cancel=None,
+    timeout=60,
+    keepalive=False,
+    health=None,
+    monitor=None,
+    label="",
+):
+    """Download one file with mirror/official fallback and optional SHA1.
+
+    ``keepalive`` reuses this worker thread's TLS connection (big win for the
+    thousands of tiny asset files), ``health`` lets the caller blacklist a
+    source that keeps answering 404 for the rest of the install, ``monitor``
+    feeds the live "下载详情" file list.
+    """
+    ensure_dir(os.path.dirname(dest))
+    expected_size = int(size or 0)
+    expected_sha1 = str(sha1 or "").lower()
+    display = str(label or os.path.basename(dest) or dest)
+    if os.path.isfile(dest):
+        try:
+            actual_size = os.path.getsize(dest)
+            if expected_sha1:
+                if sha1_file(dest) == expected_sha1:
+                    if monitor is not None:
+                        monitor.note_cached(display, actual_size)
+                    return "cached", "disk"
+            elif actual_size > 0 and (not expected_size or actual_size == expected_size):
+                if monitor is not None:
+                    monitor.note_cached(display, actual_size)
+                return "cached", "disk"
+        except OSError:
+            pass
+
+    if monitor is not None:
+        monitor.begin(dest, display, expected_size)
+
+    tmp_path = "{0}.{1}.part".format(dest, threading.get_ident())
+    last_error = None
+    pairs = [(tag, url) for tag, url in (url_pairs or []) if url]
+    if health is not None and len(pairs) > 1:
+        usable = [item for item in pairs if not health.blocked(item[0])]
+        if usable:
+            pairs = usable
+    for tag, url in pairs:
+        for attempt in range(2):
+            try:
+                check_cancel(cancel)
+            except OperationCancelled:
+                if monitor is not None:
+                    monitor.finish(dest, "cancelled")
+                raise
+            try:
+                stream = open_download_stream(url, timeout, keepalive)
+            except OperationCancelled:
+                raise
+            except _HttpStatusError as exc:
+                # Definitive answer: no point retrying this source, move on.
+                last_error = exc
+                if health is not None:
+                    health.note(tag, False)
+                if exc.code >= 500 and attempt == 0:
+                    time.sleep(0.4)
+                    continue
+                break
+            except Exception as exc:
+                last_error = exc
+                if health is not None:
+                    health.note(tag, False)
+                if attempt == 0:
+                    time.sleep(0.4)
+                continue
+            finished = False
+            try:
+                total = int(stream.headers.get("Content-Length") or 0)
+                if expected_size and total and total != expected_size:
+                    raise LauncherError(
+                        "Content-Length 与预期不符: {0}/{1}".format(
+                            total, expected_size
+                        )
+                    )
+                done = 0
+                digest = hashlib.sha1()
+                with open(tmp_path, "wb") as handle:
+                    while True:
+                        check_cancel(cancel)
+                        chunk = stream.read(256 * 1024)
+                        if not chunk:
+                            break
+                        handle.write(chunk)
+                        digest.update(chunk)
+                        done += len(chunk)
+                        if monitor is not None:
+                            monitor.update(dest, done)
+                        if expected_size and done > expected_size:
+                            raise LauncherError(
+                                "文件大小超出预期: {0}/{1}".format(
+                                    done, expected_size
+                                )
+                            )
+                        if progress is not None:
+                            progress(done, total)
+                if expected_size and done != expected_size:
+                    raise LauncherError(
+                        "文件大小不符: {0}/{1}".format(done, expected_size)
+                    )
+                if total and done != total:
+                    raise LauncherError(
+                        "下载不完整: {0}/{1}".format(done, total)
+                    )
+                if expected_sha1 and digest.hexdigest() != expected_sha1:
+                    raise LauncherError("SHA1 校验失败")
+                finished = True
+            except OperationCancelled:
+                _cleanup(tmp_path)
+                if monitor is not None:
+                    monitor.finish(dest, "cancelled")
+                raise
+            except Exception as exc:
+                last_error = exc
+                if health is not None:
+                    health.note(tag, False)
+                _cleanup(tmp_path)
+                if attempt == 0:
+                    time.sleep(0.4)
+                continue
+            finally:
+                stream.close(drain=finished)
+            os.replace(tmp_path, dest)
+            if health is not None:
+                health.note(tag, True)
+            if monitor is not None:
+                monitor.finish(dest, "done", done)
+            return "downloaded", tag
+    if monitor is not None:
+        monitor.finish(dest, "failed")
+    raise LauncherError(
+        "下载失败 {0}: {1}".format(os.path.basename(dest), last_error)
+    )
+
+
+def library_allowed(library):
+    rules = library.get("rules")
+    if not rules:
+        return True
+    try:
+        import minecraft_launcher_lib.install as mll_install
+
+        parser = getattr(mll_install, "parse_rule_list", None)
+        if parser is not None:
+            return bool(parser(rules, {}))
+    except Exception:
+        pass
+    allowed = False
+    for rule in rules:
+        os_info = rule.get("os") or {}
+        name = os_info.get("name")
+        if name and name != "windows":
+            continue
+        if os_info.get("arch") == "x86" and platform.architecture()[0] != "32bit":
+            continue
+        action = rule.get("action")
+        if action == "allow":
+            allowed = True
+        elif action == "disallow":
+            allowed = False
+    return allowed
+
+
+def maven_path(name, classifier=""):
+    text = str(name or "").strip()
+    if not text:
+        return ""
+    base, _, extension = text.partition("@")
+    parts = base.split(":")
+    if len(parts) < 3:
+        return ""
+    group, artifact, version = parts[0], parts[1], parts[2]
+    if not classifier and len(parts) > 3:
+        classifier = parts[3]
+    extension = extension or "jar"
+    filename = "{0}-{1}".format(artifact, version)
+    if classifier:
+        filename += "-" + classifier
+    filename += "." + extension
+    return "/".join(group.split(".") + [artifact, version, filename])
+
+
+def extract_natives(jar_path, natives_dir, extract_cfg):
+    ensure_dir(natives_dir)
+    excludes = []
+    for item in (extract_cfg or {}).get("exclude") or []:
+        excludes.append(str(item).replace("\\", "/"))
+    natives_root = os.path.abspath(natives_dir)
+    try:
+        with zipfile.ZipFile(jar_path) as archive:
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                member = info.filename.replace("\\", "/")
+                if any(member.startswith(prefix) for prefix in excludes):
+                    continue
+                target = os.path.abspath(os.path.join(natives_root, member))
+                if not target.startswith(natives_root):
+                    continue
+                ensure_dir(os.path.dirname(target))
+                with archive.open(info) as source, open(target, "wb") as dest:
+                    shutil.copyfileobj(source, dest)
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise LauncherError(
+            "解压 natives 失败 {0}: {1}".format(os.path.basename(jar_path), exc)
+        ) from None
+
+
+def fetch_version_manifest(source="auto", cancel=None):
+    order = source_order(source)
+    data, tag, url = fetch_json_sources(
+        order, OFFICIAL_MANIFEST_URL, MIRROR_MANIFEST_URL, cancel
+    )
+    versions = data.get("versions") or []
+    if not isinstance(versions, list) or not versions:
+        raise LauncherError("版本清单为空")
+    return data, tag
+
+
+def install_vanilla_game(
+    version_id,
+    mc_dir,
+    source="auto",
+    progress=None,
+    say=None,
+    cancel=None,
+    monitor=None,
+):
+    version_id = str(version_id or "").strip()
+    if not version_id:
+        raise LauncherError("版本号为空")
+    if not re.fullmatch(r"[A-Za-z0-9._\-]+", version_id):
+        raise LauncherError("版本号包含非法字符")
+    order = source_order(source)
+    source_key = str(source or "auto").lower()
+    health = SourceHealth()
+
+    def report(phase, current=0, total=0, detail=""):
+        if monitor is not None:
+            monitor.set_phase(phase, current, total, detail)
+        if progress is None:
+            return
+        try:
+            progress(phase, int(current or 0), int(total or 0), str(detail or ""))
+        except Exception:
+            pass
+
+    if say:
+        say(
+            "原版安装开始: {0} // {1}".format(
+                version_id,
+                VANILLA_SOURCE_LABELS.get(source_key, source_key),
+            )
+        )
+    report("manifest", 0, 1, "获取版本清单")
+    manifest, manifest_tag = fetch_version_manifest(source_key, cancel)
+    entry = next(
+        (
+            item
+            for item in manifest.get("versions", [])
+            if item.get("id") == version_id
+        ),
+        None,
+    )
+    if entry is None:
+        raise LauncherError("版本清单中未找到 {0}".format(version_id))
+
+    report("version_json", 0, 1, "获取版本 JSON ({0})".format(manifest_tag))
+    version, json_tag, json_url = fetch_json_sources(
+        order,
+        str(entry.get("url") or ""),
+        "{0}/version/{1}/json".format(BMCLAPI_BASE, version_id),
+        cancel,
+    )
+    version_dir = os.path.join(mc_dir, "versions", version_id)
+    ensure_dir(version_dir)
+    version_json_path = os.path.join(version_dir, version_id + ".json")
+    write_json(version_json_path, version)
+    report("version_json", 1, 1, "版本 JSON OK")
+    if say:
+        say("版本清单: {0} // JSON: {1}".format(manifest_tag, json_tag))
+
+    client_info = (version.get("downloads") or {}).get("client") or {}
+    client_size = int(client_info.get("size") or 0)
+    client_dest = os.path.join(version_dir, version_id + ".jar")
+    report("client", 0, client_size, "下载客户端 jar")
+
+    def client_progress(done, total):
+        report("client", done, total or client_size, "client.jar")
+
+    client_status, client_source = download_to_dest(
+        ordered_urls(
+            order,
+            str(client_info.get("url") or ""),
+            "{0}/version/{1}/client".format(BMCLAPI_BASE, version_id),
+        ),
+        client_dest,
+        sha1=str(client_info.get("sha1") or ""),
+        size=client_size,
+        progress=client_progress,
+        cancel=cancel,
+        timeout=CLIENT_TIMEOUT,
+        monitor=monitor,
+        label="client.jar",
+    )
+    if say:
+        say("客户端 jar: {0} ({1})".format(client_status, client_source))
+    report(
+        "client",
+        client_size or 1,
+        client_size or 1,
+        "CLIENT JAR " + client_status.upper(),
+    )
+
+    libraries = version.get("libraries") or []
+    library_tasks = []
+    seen_paths = set()
+    natives_dir = os.path.join(version_dir, "natives")
+    for library in libraries:
+        if not isinstance(library, dict) or not library_allowed(library):
+            continue
+        downloads = library.get("downloads") or {}
+        artifact = downloads.get("artifact") or {}
+        artifact_path = str(artifact.get("path") or "")
+        if not artifact_path:
+            artifact_path = maven_path(library.get("name", ""))
+        if artifact_path:
+            destination = os.path.join(
+                mc_dir, "libraries", *artifact_path.split("/")
+            )
+            if destination not in seen_paths:
+                seen_paths.add(destination)
+                official_url = str(
+                    artifact.get("url")
+                    or (OFFICIAL_LIBRARIES_BASE + "/" + artifact_path)
+                )
+                mirror_url = "{0}/maven/{1}".format(BMCLAPI_BASE, artifact_path)
+                library_tasks.append(
+                    {
+                        "dest": destination,
+                        "pairs": ordered_urls(order, official_url, mirror_url),
+                        "sha1": str(artifact.get("sha1") or ""),
+                        "size": int(artifact.get("size") or 0),
+                        "extract": None,
+                    }
+                )
+
+        native_key = str((library.get("natives") or {}).get("windows") or "")
+        native_key = native_key.replace(
+            "${arch}", "64" if sys.maxsize > 2 ** 32 else "32"
+        )
+        if native_key:
+            classifier = (downloads.get("classifiers") or {}).get(native_key) or {}
+            classifier_path = str(
+                classifier.get("path")
+                or maven_path(library.get("name", ""), native_key)
+            )
+            if classifier_path:
+                destination = os.path.join(
+                    mc_dir, "libraries", *classifier_path.split("/")
+                )
+                if destination not in seen_paths:
+                    seen_paths.add(destination)
+                    official_url = str(
+                        classifier.get("url")
+                        or (OFFICIAL_LIBRARIES_BASE + "/" + classifier_path)
+                    )
+                    mirror_url = "{0}/maven/{1}".format(
+                        BMCLAPI_BASE, classifier_path
+                    )
+                    library_tasks.append(
+                        {
+                            "dest": destination,
+                            "pairs": ordered_urls(order, official_url, mirror_url),
+                            "sha1": str(classifier.get("sha1") or ""),
+                            "size": int(classifier.get("size") or 0),
+                            "extract": (
+                                natives_dir,
+                                library.get("extract")
+                                or {"exclude": ["META-INF/"]},
+                            ),
+                        }
+                    )
+
+    total_libraries = len(library_tasks)
+    report(
+        "libraries", 0, total_libraries, "库文件 {0} 个".format(total_libraries)
+    )
+    if say:
+        say("库文件: {0} 个 // 并发下载".format(total_libraries))
+    library_counter = {"done": 0}
+    library_lock = threading.Lock()
+    library_failures = []
+
+    def download_library(task):
+        check_cancel(cancel)
+        status, used = download_to_dest(
+            task["pairs"],
+            task["dest"],
+            sha1=task["sha1"],
+            size=task["size"],
+            cancel=cancel,
+            timeout=LIBRARY_TIMEOUT,
+            keepalive=True,
+            health=health,
+            monitor=monitor,
+            label=os.path.basename(task["dest"]),
+        )
+        if task["extract"]:
+            extract_natives(task["dest"], task["extract"][0], task["extract"][1])
+        with library_lock:
+            library_counter["done"] += 1
+            current = library_counter["done"]
+        report("libraries", current, total_libraries, os.path.basename(task["dest"]))
+        return status, used
+
+    if library_tasks:
+        with ThreadPoolExecutor(
+            max_workers=LIBRARY_WORKERS, thread_name_prefix="akm-lib"
+        ) as pool:
+            future_map = {
+                pool.submit(download_library, task): task
+                for task in library_tasks
+            }
+            for future in as_completed(future_map):
+                task = future_map[future]
+                try:
+                    future.result()
+                except OperationCancelled:
+                    for pending in future_map:
+                        pending.cancel()
+                    raise
+                except Exception as exc:
+                    library_failures.append(
+                        (os.path.basename(task["dest"]), str(exc))
+                    )
+    if library_failures:
+        detail = "; ".join(
+            "{0}: {1}".format(name, error)
+            for name, error in library_failures[:3]
+        )
+        raise LauncherError(
+            "库文件下载失败 {0} 个 // {1}".format(
+                len(library_failures), detail
+            )
+        )
+    report(
+        "libraries",
+        total_libraries or 1,
+        total_libraries or 1,
+        "LIBRARIES OK",
+    )
+
+    total_assets = 0
+    asset_index = version.get("assetIndex") or {}
+    asset_id = str(version.get("assets") or asset_index.get("id") or "")
+    if asset_index and asset_id:
+        index_dest = os.path.join(mc_dir, "assets", "indexes", asset_id + ".json")
+        report("assets", 0, 1, "下载资源索引 {0}".format(asset_id))
+        index_status, index_source = download_to_dest(
+            ordered_urls(
+                order,
+                str(asset_index.get("url") or ""),
+                "",
+            ),
+            index_dest,
+            sha1=str(asset_index.get("sha1") or ""),
+            size=int(asset_index.get("size") or 0),
+            cancel=cancel,
+            timeout=90,
+            monitor=monitor,
+            label="indexes/{0}.json".format(asset_id),
+        )
+        if say:
+            say("资源索引: {0} ({1})".format(index_status, index_source))
+        index_data = read_json(index_dest, {}) or {}
+        objects = index_data.get("objects") or {}
+        unique_assets = {}
+        asset_names = {}
+        for name, obj in objects.items():
+            if isinstance(obj, dict) and obj.get("hash"):
+                filehash = str(obj["hash"])
+                unique_assets.setdefault(filehash, int(obj.get("size") or 0))
+                if filehash not in asset_names:
+                    label = str(name or "").strip()
+                    asset_names[filehash] = (
+                        label if len(label) <= 46 else label[:43] + "..."
+                    )
+        total_assets = len(unique_assets)
+        report(
+            "assets", 0, total_assets, "资源对象 {0} 个".format(total_assets)
+        )
+        if say:
+            say("资源对象: {0} 个 // 并发下载".format(total_assets))
+        asset_counter = {"done": 0}
+        asset_lock = threading.Lock()
+        asset_failures = []
+
+        def download_asset(item):
+            filehash, file_size = item
+            check_cancel(cancel)
+            destination = os.path.join(
+                mc_dir, "assets", "objects", filehash[:2], filehash
+            )
+            if os.path.isfile(destination):
+                try:
+                    if not file_size or os.path.getsize(destination) == file_size:
+                        with asset_lock:
+                            asset_counter["done"] += 1
+                            current = asset_counter["done"]
+                        if current == total_assets or current % 25 == 0:
+                            report(
+                                "assets",
+                                current,
+                                total_assets,
+                                "assets objects",
+                            )
+                        return "cached"
+                except OSError:
+                    pass
+            pinned = asset_cdn_url(filehash) if order[0] == "mirror" else ""
+            mirror_url = "{0}/assets/{1}/{2}".format(
+                BMCLAPI_BASE, filehash[:2], filehash
+            )
+            official_url = "{0}/{1}/{2}".format(
+                OFFICIAL_RESOURCES_BASE, filehash[:2], filehash
+            )
+            if pinned:
+                # Pinned CDN node: skip BMCLAPI's 302 hop, keep one TLS socket.
+                pairs = [
+                    ("mirror", pinned),
+                    ("mirror-redirect", mirror_url),
+                    ("official", official_url),
+                ]
+            else:
+                pairs = [("mirror", mirror_url), ("official", official_url)]
+            status, used = download_to_dest(
+                pairs,
+                destination,
+                sha1=filehash,
+                size=file_size,
+                cancel=cancel,
+                timeout=ASSET_TIMEOUT,
+                keepalive=True,
+                health=health,
+                monitor=monitor,
+                label=asset_names.get(filehash)
+                or "assets/{0}".format(filehash[:8]),
+            )
+            if used == "mirror-redirect":
+                # Fresh CDN node learned from the 302: un-strike the mirror tag.
+                health.note("mirror", True)
+            with asset_lock:
+                asset_counter["done"] += 1
+                current = asset_counter["done"]
+            if current == total_assets or current % 25 == 0:
+                report("assets", current, total_assets, "assets objects")
+            return "downloaded"
+
+        if unique_assets:
+            with ThreadPoolExecutor(
+                max_workers=ASSET_WORKERS, thread_name_prefix="akm-asset"
+            ) as pool:
+                future_map = {
+                    pool.submit(download_asset, item): item[0]
+                    for item in unique_assets.items()
+                }
+                for future in as_completed(future_map):
+                    filehash = future_map[future]
+                    try:
+                        future.result()
+                    except OperationCancelled:
+                        for pending in future_map:
+                            pending.cancel()
+                        raise
+                    except Exception as exc:
+                        asset_failures.append((filehash, str(exc)))
+        if asset_failures:
+            detail = "; ".join(
+                "{0}: {1}".format(filehash[:10], error)
+                for filehash, error in asset_failures[:3]
+            )
+            raise LauncherError(
+                "资源文件下载失败 {0} 个 // {1}".format(
+                    len(asset_failures), detail
+                )
+            )
+        report(
+            "assets",
+            total_assets or 1,
+            total_assets or 1,
+            "ASSETS OK",
+        )
+    else:
+        if say:
+            say("该版本没有 assetIndex，跳过资源下载")
+        report("assets", 1, 1, "NO ASSET INDEX")
+
+    logging_info = (
+        (((version.get("logging") or {}).get("client") or {}).get("file") or {})
+    )
+    logging_url = str(logging_info.get("url") or "")
+    if logging_url:
+        log_name = str(
+            logging_info.get("id")
+            or os.path.basename(urllib.parse.urlparse(logging_url).path)
+            or "client-log.xml"
+        )
+        log_dest = os.path.join(mc_dir, "assets", "log_configs", log_name)
+        report("logging", 0, 1, "日志配置")
+        try:
+            download_to_dest(
+                ordered_urls(
+                    order,
+                    logging_url,
+                    "",
+                ),
+                log_dest,
+                sha1=str(logging_info.get("sha1") or ""),
+                size=int(logging_info.get("size") or 0),
+                cancel=cancel,
+                timeout=45,
+                monitor=monitor,
+                label=log_name,
+            )
+            report("logging", 1, 1, "LOGGING OK")
+        except OperationCancelled:
+            raise
+        except Exception as exc:
+            if say:
+                say("日志配置下载失败（可忽略）: {0}".format(exc))
+            report("logging", 1, 1, "LOGGING SKIPPED")
+    else:
+        report("logging", 1, 1, "NO LOGGING CONFIG")
+
+    write_json(
+        os.path.join(version_dir, ".akm_vanilla.json"),
+        {
+            "version": version_id,
+            "source": source_key,
+            "installed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "client_sha1": str(client_info.get("sha1") or ""),
+            "libraries": total_libraries,
+            "assets": total_assets,
+        },
+    )
+    report("complete", 1, 1, "INSTALL COMPLETE")
+    if say:
+        say(
+            "原版安装完成: {0} // 库 {1} / 资源 {2}".format(
+                version_id, total_libraries, total_assets
+            )
+        )
+    return {
+        "version": version_id,
+        "source": source_key,
+        "libraries": total_libraries,
+        "assets": total_assets,
+        "client": client_dest,
+    }
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# 5. Microsoft account
+#    - browser flow (default, public Xbox client id): open the OAuth page and
+#      paste the redirected URL back into AKM
+#    - device code flow (optional, needs an Azure app id in device_client_id)
+#    Both converge on the Xbox Live -> Minecraft services token chain below.
+# ---------------------------------------------------------------------------
+
+
+def msa_request_device_code(client_id):
+    data = http_form(
+        MS_ENTRA_DEVICE_URL,
+        {"client_id": client_id, "scope": MS_SCOPE},
+        timeout=25,
+    )
+    if not isinstance(data, dict) or not data.get("user_code"):
+        raise LauncherError("微软未返回设备代码")
+    return data
+
+
+def msa_request_live_device_code(client_id=MS_DEFAULT_CLIENT_ID):
+    """Device code for the built-in Xbox client (no Azure app required)."""
+    data, headers = http_form_with_headers(
+        MS_LIVE_DEVICE_URL,
+        {
+            "client_id": client_id,
+            "scope": MS_LIVE_SCOPE,
+            "response_type": "device_code",
+        },
+        timeout=25,
+    )
+    if not isinstance(data, dict) or not data.get("user_code"):
+        raise LauncherError("微软未返回设备代码")
+    cookie = ""
+    try:
+        values = headers.get_all("Set-Cookie") if headers is not None else None
+        if values:
+            cookie = "; ".join(value.split(";", 1)[0] for value in values)
+    except Exception:
+        cookie = ""
+    if cookie:
+        data["_cookie"] = cookie
+    return data
+
+
+def msa_poll_device_token(
+    device, client_id, say=None, cancel=None, token_url=None, poll_now=None
+):
+    device_code = device.get("device_code")
+    if not device_code:
+        raise LauncherError("设备代码缺失")
+    token_url = token_url or MS_ENTRA_TOKEN_URL
+    interval = max(2, int(device.get("interval") or 5))
+    expires_at = time.time() + max(60, int(device.get("expires_in") or 900))
+    last_notice = time.time()
+    attempt = 0
+    invalid_grants = 0
+    login_log(
+        "device poll start: url={0} interval={1}s expires_in={2}s".format(
+            token_url, interval, max(60, int(device.get("expires_in") or 900))
+        )
+    )
+    while time.time() < expires_at:
+        wait_until = min(expires_at, time.time() + interval)
+        while time.time() < wait_until:
+            if cancel is not None and cancel.is_set():
+                raise LoginCancelled("已取消设备码登录")
+            if poll_now is not None and poll_now.is_set():
+                poll_now.clear()
+                break
+            time.sleep(min(0.5, max(0.05, wait_until - time.time())))
+        if cancel is not None and cancel.is_set():
+            raise LoginCancelled("已取消设备码登录")
+        attempt += 1
+        try:
+            poll_headers = {}
+            cookie = str(device.get("_cookie") or "").strip()
+            if cookie:
+                poll_headers["Cookie"] = cookie
+            token = http_form(
+                token_url,
+                {
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                    "client_id": client_id,
+                    "device_code": device_code,
+                },
+                timeout=25,
+                headers=poll_headers or None,
+            )
+            if isinstance(token, dict) and token.get("access_token"):
+                login_log(
+                    "device poll #{0}: access_token received (refresh_token={1})".format(
+                        attempt, "yes" if token.get("refresh_token") else "no"
+                    )
+                )
+                return token
+            login_log("device poll #{0}: response without access_token".format(attempt))
+            raise LauncherError("微软令牌响应缺少 access_token")
+        except HttpError as exc:
+            info = exc.json()
+            error = str(info.get("error") or "")
+            detail = str(info.get("error_description") or "")
+            login_log(
+                "device poll #{0}: http {1} error={2} detail={3}".format(
+                    attempt, exc.code, error or "?", detail[:400]
+                )
+            )
+            if error == "authorization_pending":
+                if say and time.time() - last_notice > 25:
+                    last_notice = time.time()
+                    say("等待浏览器授权中 ... 请在微软页面输入验证码")
+                continue
+            if error == "slow_down":
+                interval += 5
+                continue
+            if error == "expired_token":
+                raise DeviceCodeExpired("设备代码已过期，需要刷新", detail) from None
+            if error == "authorization_declined":
+                raise LauncherError(
+                    "微软授权被拒绝，登录已终止。请在授权页面点击“允许/继续”。"
+                ) from None
+            if error == "bad_verification_code":
+                raise LauncherError(
+                    "验证码无效：网页收到的验证码与启动器不一致，请重新登录。"
+                ) from None
+            if error in {"unauthorized_client", "invalid_client"}:
+                raise LauncherError(
+                    "设备代码流 Client ID 无效，或 Azure 应用未启用 "
+                    "“Allow public client flows”"
+                ) from None
+            if error == "invalid_grant":
+                low = detail.lower()
+                if "already been used" in low:
+                    raise DeviceCodeUsed(
+                        "验证码已被微软消耗", detail
+                    ) from None
+                if (
+                    "could not be authenticated" in low
+                    or "user interaction is required" in low
+                    or "must sign in again" in low
+                ):
+                    raise LoginNeedsPassword(
+                        "微软拒绝了本次授权：该账号需要重新完成一次登录。\n\n"
+                        "常见原因：账号开启了无密码登录（只用身份验证器/邮箱验证码），"
+                        "或者本次授权没有真正授予 XboxLive 权限。\n\n"
+                        "请按下面步骤处理：\n"
+                        "1. 重新点击 [正版登录] 获取新的验证码；\n"
+                        "2. 在微软授权页点击「其他登录方法」→「使用我的密码」；\n"
+                        "3. 如果账号没有密码，请先到 account.live.com/password/Change 设置密码；\n"
+                        "4. 登录后确认页面出现「已成功登录」再回到启动器。\n\n"
+                        "微软原始信息：{0}".format(detail or "-"),
+                        detail,
+                    ) from None
+                invalid_grants += 1
+                if invalid_grants <= 2:
+                    login_log(
+                        "device poll: invalid_grant, retry {0}/2".format(
+                            invalid_grants
+                        )
+                    )
+                    time.sleep(2)
+                    continue
+                raise DeviceCodeExpired("设备码授权已失效，需要刷新", detail) from None
+            raise LauncherError(
+                "微软授权失败: {0}".format(detail or error or exc)
+            ) from None
+        except LauncherError:
+            raise
+    login_log("device poll timeout: attempts={0}".format(attempt))
+    raise DeviceCodeExpired("设备代码已过期，需要刷新")
+
+
+def jwt_expiry(token):
+    """Read the exp claim of a JWT without verifying it (expiry hint only)."""
+    parts = str(token or "").strip().split(".")
+    if len(parts) < 2:
+        return 0
+    payload = parts[1] + "=" * (-len(parts[1]) % 4)
+    try:
+        data = json.loads(
+            base64.urlsafe_b64decode(payload.encode("ascii")).decode(
+                "utf-8", "replace"
+            )
+        )
+        exp = int(data.get("exp") or 0)
+        return exp if exp > 0 else 0
+    except Exception:
+        return 0
+
+
+def clean_token_input(raw):
+    """Accept a token, Bearer prefix, or a small pasted auth JSON object."""
+    text = str(raw or "").strip().strip('"').strip("'")
+    if text.lower().startswith("bearer "):
+        text = text[7:].strip()
+    if text.startswith("{") and text.endswith("}"):
+        try:
+            data = json.loads(text)
+            for key in ("refresh_token", "access_token", "token"):
+                value = str(data.get(key) or "").strip()
+                if value:
+                    return value
+        except Exception:
+            pass
+    return re.sub(r"\s+", "", text)
+
+
+def msa_fetch_minecraft_profile(access_token):
+    token = str(access_token or "").strip()
+    if not token:
+        raise LauncherError("Minecraft 访问令牌为空")
+    try:
+        profile = http_json(
+            "https://api.minecraftservices.com/minecraft/profile",
+            headers={"Authorization": "Bearer " + token},
+            timeout=25,
+        )
+    except HttpError as exc:
+        if exc.code == 404:
+            raise LauncherError("该账户未拥有 Minecraft: Java 版") from None
+        if exc.code in (401, 403):
+            raise LauncherError("访问令牌无效或已过期，请重新获取令牌") from None
+        raise LauncherError(
+            "读取 Minecraft 档案失败 (HTTP {0})".format(exc.code)
+        ) from None
+    if not isinstance(profile, dict) or not profile.get("id"):
+        raise LauncherError("Minecraft 档案为空")
+    return {
+        "uuid": dashed_uuid(profile.get("id")),
+        "name": str(profile.get("name") or "Commander"),
+        "skins": profile.get("skins") or [],
+    }
+
+
+def msa_xbox_to_minecraft(ms_access_token, azure=False):
+    # Live (MBI_SSL / login.live.com) tokens use "t="; Entra/Azure
+    # (XboxLive.signin) tokens use "d=" -- see prismarine-auth getUserToken.
+    ticket = ("d=" if azure else "t=") + str(ms_access_token or "")
+    try:
+        xbl = http_json(
+            "https://user.auth.xboxlive.com/user/authenticate",
+            {
+                "Properties": {
+                    "AuthMethod": "RPS",
+                    "SiteName": "user.auth.xboxlive.com",
+                    "RpsTicket": ticket,
+                },
+                "RelyingParty": "http://auth.xboxlive.com",
+                "TokenType": "JWT",
+            },
+            timeout=25,
+        )
+        xbl_token = (xbl or {}).get("Token")
+        claims = ((xbl or {}).get("DisplayClaims") or {}).get("xui") or []
+        user_hash = claims[0].get("uhs") if claims else None
+        if not xbl_token or not user_hash:
+            raise LauncherError("Xbox Live 认证响应异常")
+        login_log("xbox live authenticate: ok")
+    except HttpError as exc:
+        body = str(exc.body or "").strip().replace("\n", " ")[:300]
+        login_log(
+            "xbox live authenticate failed: http {0} ticket={1} body={2}".format(
+                exc.code, ticket[:2], body
+            )
+        )
+        raise LauncherError(
+            "Xbox Live 认证失败 (HTTP {0}){1}".format(
+                exc.code, "\n" + body if body else ""
+            )
+        ) from None
+
+    try:
+        xsts = http_json(
+            "https://xsts.auth.xboxlive.com/xsts/authorize",
+            {
+                "Properties": {"SandboxId": "RETAIL", "UserTokens": [xbl_token]},
+                "RelyingParty": "rp://api.minecraftservices.com/",
+                "TokenType": "JWT",
+            },
+            timeout=25,
+        )
+        xsts_token = (xsts or {}).get("Token")
+        if not xsts_token:
+            raise LauncherError("XSTS 授权响应异常")
+        login_log("xsts authorize: ok")
+    except HttpError as exc:
+        info = exc.json()
+        xerr = info.get("XErr")
+        login_log("xsts authorize failed: http {0} xerr={1}".format(exc.code, xerr))
+        message = XSTS_ERRORS.get(xerr)
+        if message is None:
+            message = "XSTS 授权失败 (HTTP {0} / XErr={1})".format(exc.code, xerr)
+        raise LauncherError(message) from None
+
+    try:
+        mc_token = http_json(
+            "https://api.minecraftservices.com/authentication/login_with_xbox",
+            {"identityToken": "XBL3.0 x={0};{1}".format(user_hash, xsts_token)},
+            timeout=25,
+        )
+        access_token = (mc_token or {}).get("access_token")
+        if not access_token:
+            raise LauncherError("Minecraft 服务未返回访问令牌")
+        login_log("minecraft login_with_xbox: ok")
+    except HttpError as exc:
+        login_log("minecraft login_with_xbox failed: http {0}".format(exc.code))
+        raise LauncherError(
+            "Minecraft 登录被拒 (HTTP {0})，账户可能未拥有 Java 版".format(exc.code)
+        ) from None
+
+    profile = msa_fetch_minecraft_profile(access_token)
+
+    return {
+        "access_token": access_token,
+        "expires_in": int((mc_token or {}).get("expires_in") or 86400),
+        "uuid": profile["uuid"],
+        "name": profile["name"],
+        "skins": profile.get("skins") or [],
+    }
+
+
+def msa_build_login_url(client_id, redirect_uri=MS_REDIRECT_URI):
+    scope = (
+        MS_LIVE_SCOPE
+        if str(client_id or "").strip() == MS_DEFAULT_CLIENT_ID
+        else MS_SCOPE
+    )
+    params = {
+        "client_id": client_id,
+        "response_type": "code",
+        "scope": scope,
+        "redirect_uri": redirect_uri,
+        "prompt": "select_account",
+    }
+    return "{0}?{1}".format(MS_LIVE_AUTH_URL, urllib.parse.urlencode(params))
+
+
+def msa_extract_code(raw):
+    """Accept a full redirected URL, a query fragment or a bare code."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if text.lower().startswith(("http://", "https://")):
+        parsed = urllib.parse.urlparse(text)
+        code = urllib.parse.parse_qs(parsed.query).get("code", [""])[0]
+        return code.strip()
+    if "code=" in text:
+        candidate = text.split("code=", 1)[1].split("&", 1)[0]
+        return urllib.parse.unquote(candidate).strip()
+    return text
+
+
+def msa_exchange_authorization_code(client_id, redirect_uri, code):
+    token = http_form(
+        MS_LIVE_TOKEN_URL,
+        {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "grant_type": "authorization_code",
+            "code": code,
+        },
+        timeout=25,
+    )
+    if not isinstance(token, dict) or not token.get("access_token"):
+        raise LauncherError("授权码交换失败：响应缺少 access_token")
+    return token
+
+
+def msa_refresh_access_token(refresh_token, client_id, flow="browser", redirect_uri=MS_REDIRECT_URI):
+    flow = str(flow or "browser").lower()
+    if flow == "device":
+        fields = {
+            "grant_type": "refresh_token",
+            "client_id": client_id,
+            "refresh_token": refresh_token,
+            "scope": MS_SCOPE,
+        }
+        token = http_form(MS_ENTRA_TOKEN_URL, fields, timeout=25)
+    elif flow == "live":
+        fields = {
+            "client_id": client_id,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "scope": MS_LIVE_SCOPE,
+        }
+        try:
+            token = http_form(MS_LIVE_TOKEN_URL, fields, timeout=25)
+        except HttpError:
+            # Stored tokens from the browser flow may carry another scope set.
+            fields.pop("scope", None)
+            token = http_form(MS_LIVE_TOKEN_URL, fields, timeout=25)
+    else:
+        fields = {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        }
+        token = http_form(MS_LIVE_TOKEN_URL, fields, timeout=25)
+    if not isinstance(token, dict) or not token.get("access_token"):
+        raise LauncherError("刷新令牌响应缺少 access_token")
+    return token
+
+
+# ---------------------------------------------------------------------------
+# 6. Windows 1.0 shell application
+# ---------------------------------------------------------------------------
+
+
+class SnakeModel:
+    """Pure-python classic snake core (no Tk) so it stays unit-testable."""
+
+    DIRECTIONS = {
+        "up": (0, -1),
+        "down": (0, 1),
+        "left": (-1, 0),
+        "right": (1, 0),
+    }
+
+    def __init__(self, cols=20, rows=14, rng=None):
+        self.cols = max(8, int(cols))
+        self.rows = max(8, int(rows))
+        self.rng = rng or random.Random()
+        self.reset()
+
+    def reset(self):
+        cx, cy = self.cols // 2, self.rows // 2
+        self.snake = [(cx, cy), (cx - 1, cy), (cx - 2, cy)]
+        self.direction = (1, 0)
+        self._queued = []
+        self.score = 0
+        self.alive = True
+        self.moves = 0
+        self.food = self._place_food()
+
+    def _place_food(self):
+        occupied = set(self.snake)
+        free = [
+            (x, y)
+            for y in range(self.rows)
+            for x in range(self.cols)
+            if (x, y) not in occupied
+        ]
+        if not free:
+            return None
+        return self.rng.choice(free)
+
+    def turn(self, name):
+        """Queue a direction change (ignores reversal and no-ops)."""
+        if not self.alive:
+            return False
+        delta = self.DIRECTIONS.get(str(name or "").lower())
+        if delta is None:
+            return False
+        last = self._queued[-1] if self._queued else self.direction
+        if delta == last or delta == (-last[0], -last[1]):
+            return False
+        self._queued.append(delta)
+        return True
+
+    def step(self):
+        """Advance one cell. Returns 'ok' / 'eat' / 'dead'."""
+        if not self.alive:
+            return "dead"
+        if self._queued:
+            self.direction = self._queued.pop(0)
+        head_x, head_y = self.snake[0]
+        delta_x, delta_y = self.direction
+        next_cell = (head_x + delta_x, head_y + delta_y)
+        if (
+            next_cell[0] < 0
+            or next_cell[1] < 0
+            or next_cell[0] >= self.cols
+            or next_cell[1] >= self.rows
+        ):
+            self.alive = False
+            return "dead"
+        eating = self.food is not None and next_cell == self.food
+        body = self.snake if eating else self.snake[:-1]
+        if next_cell in body:
+            self.alive = False
+            return "dead"
+        self.snake.insert(0, next_cell)
+        self.moves += 1
+        if eating:
+            self.score += 10
+            self.food = self._place_food()
+            return "eat"
+        self.snake.pop()
+        return "ok"
+
+    @property
+    def speed_ms(self):
+        return max(70, 150 - (self.score // 10) * 5)
+
+
+class SnakeGame:
+    """Classic snake window: arrows / WASD, space pause, R restart, Esc close."""
+
+    CELL = 22
+
+    def __init__(self, master, best=0, on_best=None, model=None):
+        self.best = int(best or 0)
+        self.on_best = on_best
+        self.model = model or SnakeModel(cols=20, rows=14)
+        self.speed_ms = self.model.speed_ms
+        self.paused = False
+        self.started = False
+        self._after_id = None
+
+        self.win = tk.Toplevel(master)
+        self.win.title("SNAKE // 经典贪吃蛇")
+        self.win.configure(bg=C_WHITE)
+        self.win.resizable(False, False)
+        self.win.protocol("WM_DELETE_WINDOW", self.close)
+
+        head = tk.Frame(self.win, bg=C_TEAL, bd=1, relief="solid")
+        head.pack(fill="x", padx=6, pady=(6, 0))
+        tk.Label(
+            head,
+            text=title_text("SNAKE // 经典贪吃蛇"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=3,
+        ).pack(side="left")
+        self.best_var = tk.StringVar(value="最高 {0}".format(self.best))
+        tk.Label(
+            head,
+            textvariable=self.best_var,
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_SMALL,
+            anchor="e",
+            padx=6,
+        ).pack(side="right")
+
+        stats = tk.Frame(self.win, bg=C_GRAY, bd=1, relief="solid")
+        stats.pack(fill="x", padx=6, pady=(4, 0))
+        self.score_var = tk.StringVar(value="SCORE 0")
+        self.speed_var = tk.StringVar(value="SPEED 1.0x")
+        tk.Label(
+            stats,
+            textvariable=self.score_var,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+            padx=6,
+            pady=2,
+        ).pack(side="left")
+        tk.Label(
+            stats,
+            textvariable=self.speed_var,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="e",
+            padx=6,
+        ).pack(side="right")
+
+        self.canvas = tk.Canvas(
+            self.win,
+            width=self.model.cols * self.CELL,
+            height=self.model.rows * self.CELL,
+            bg=C_WHITE,
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=C_BLACK,
+        )
+        self.canvas.pack(padx=6, pady=6)
+        tk.Label(
+            self.win,
+            text="方向键 / WASD 移动 · 空格暂停 · R 重开 · Esc 关闭",
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            padx=6,
+            pady=3,
+        ).pack(fill="x", padx=6, pady=(0, 6))
+
+        for key, name in (
+            ("<Up>", "up"),
+            ("<w>", "up"),
+            ("<W>", "up"),
+            ("<Down>", "down"),
+            ("<s>", "down"),
+            ("<S>", "down"),
+            ("<Left>", "left"),
+            ("<a>", "left"),
+            ("<A>", "left"),
+            ("<Right>", "right"),
+            ("<d>", "right"),
+            ("<D>", "right"),
+        ):
+            self.win.bind(
+                key, lambda _event, direction=name: self._turn(direction)
+            )
+        self.win.bind("<space>", lambda _event: self.toggle_pause())
+        self.win.bind("<r>", lambda _event: self.restart())
+        self.win.bind("<R>", lambda _event: self.restart())
+        self.win.bind("<Escape>", lambda _event: self.close())
+        self.win.bind("<Destroy>", self._on_destroy)
+
+        try:
+            self.win.update_idletasks()
+            self.win.geometry(
+                "+{0}+{1}".format(
+                    max(20, master.winfo_rootx() + 80),
+                    max(20, master.winfo_rooty() + 60),
+                )
+            )
+        except Exception:
+            pass
+        self.win.focus_force()
+        self.draw()
+        self.schedule()
+
+    def _turn(self, name):
+        if not self.started:
+            self.started = True
+            self.draw()
+        self.model.turn(name)
+
+    def toggle_pause(self):
+        if not self.model.alive:
+            self.restart()
+            return
+        if not self.started:
+            self.started = True
+            self.draw()
+            return
+        self.paused = not self.paused
+        self.draw()
+
+    def restart(self):
+        self.model.reset()
+        self.paused = False
+        self.started = False
+        self.speed_ms = self.model.speed_ms
+        self.draw()
+        self.schedule()
+
+    def draw(self):
+        try:
+            if not self.win.winfo_exists():
+                return
+        except Exception:
+            return
+        canvas = self.canvas
+        canvas.delete("all")
+        canvas.configure(bg=C_WHITE, highlightbackground=C_BLACK)
+        for y in range(self.model.rows):
+            for x in range(self.model.cols):
+                cx = x * self.CELL + self.CELL // 2
+                cy = y * self.CELL + self.CELL // 2
+                canvas.create_rectangle(
+                    cx - 1, cy - 1, cx + 1, cy + 1, fill=C_GRAY, width=0
+                )
+        if self.model.food is not None:
+            fx, fy = self.model.food
+            pad = 4
+            canvas.create_oval(
+                fx * self.CELL + pad,
+                fy * self.CELL + pad,
+                fx * self.CELL + self.CELL - pad,
+                fy * self.CELL + self.CELL - pad,
+                fill=C_TEAL,
+                outline=C_BLACK,
+            )
+        for index, (sx, sy) in enumerate(self.model.snake):
+            inset = 1 if index else 0
+            canvas.create_rectangle(
+                sx * self.CELL + inset,
+                sy * self.CELL + inset,
+                sx * self.CELL + self.CELL - inset,
+                sy * self.CELL + self.CELL - inset,
+                fill=C_BLACK if index == 0 else C_GRAY,
+                outline=C_WHITE,
+            )
+        if self.paused and self.model.alive:
+            self._draw_overlay("PAUSED // 空格继续")
+        if not self.started and self.model.alive:
+            self._draw_overlay("READY\n按方向键 / WASD 开始")
+        if not self.model.alive:
+            self._draw_overlay(
+                "GAME OVER // 得分 {0}\n按 R 再来一局".format(self.model.score)
+            )
+        try:
+            self.score_var.set("SCORE {0}".format(self.model.score))
+            self.speed_var.set("SPEED {0:.1f}x".format(150.0 / max(1, self.speed_ms)))
+        except Exception:
+            pass
+
+    def _draw_overlay(self, text):
+        canvas = self.canvas
+        width = self.model.cols * self.CELL
+        height = self.model.rows * self.CELL
+        canvas.create_rectangle(
+            width * 0.12,
+            height * 0.36,
+            width * 0.88,
+            height * 0.64,
+            fill=C_BLACK,
+            outline=C_TEAL,
+            width=2,
+        )
+        canvas.create_text(
+            width / 2,
+            height / 2,
+            text=text,
+            fill=C_WHITE,
+            font=FONT_MAIN,
+            justify="center",
+        )
+
+    def schedule(self):
+        self.cancel()
+        try:
+            self._after_id = self.win.after(self.speed_ms, self.tick)
+        except Exception:
+            self._after_id = None
+
+    def cancel(self):
+        if self._after_id is None:
+            return
+        try:
+            self.win.after_cancel(self._after_id)
+        except Exception:
+            pass
+        self._after_id = None
+
+    def tick(self):
+        self._after_id = None
+        try:
+            if not self.win.winfo_exists():
+                return
+        except Exception:
+            return
+        if self.paused:
+            self.schedule()
+            return
+        if not self.started:
+            self.schedule()
+            return
+        result = self.model.step()
+        self.speed_ms = self.model.speed_ms
+        self.draw()
+        if result == "dead":
+            self._finish()
+            return
+        self.schedule()
+
+    def _finish(self):
+        score = int(self.model.score)
+        if score > self.best:
+            self.best = score
+            try:
+                self.best_var.set("最高 {0}".format(self.best))
+            except Exception:
+                pass
+            if self.on_best is not None:
+                try:
+                    self.on_best(score)
+                except Exception:
+                    pass
+
+    def _on_destroy(self, _event=None):
+        self.cancel()
+
+    def close(self):
+        self.cancel()
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+
+
+class Game2048Model:
+    """Pure 2048 core: 4x4 grid, merge rules, score, win/lose detection."""
+
+    SIZE = 4
+
+    def __init__(self, rng=None):
+        self.rng = rng or random.Random()
+        self.reset()
+
+    def reset(self):
+        self.grid = [0] * (self.SIZE * self.SIZE)
+        self.score = 0
+        self.won = False
+        self.alive = True
+        self.spawn()
+        self.spawn()
+
+    def spawn(self):
+        free = [index for index, value in enumerate(self.grid) if value == 0]
+        if not free:
+            return False
+        index = self.rng.choice(free)
+        self.grid[index] = 4 if self.rng.random() < 0.1 else 2
+        return True
+
+    def _merge_line(self, line):
+        values = [value for value in line if value]
+        merged = []
+        gained = 0
+        index = 0
+        while index < len(values):
+            if index + 1 < len(values) and values[index] == values[index + 1]:
+                combined = values[index] * 2
+                merged.append(combined)
+                gained += combined
+                if combined >= 2048:
+                    self.won = True
+                index += 2
+            else:
+                merged.append(values[index])
+                index += 1
+        merged += [0] * (self.SIZE - len(merged))
+        return merged, gained
+
+    def move(self, direction):
+        if not self.alive:
+            return False
+        before = list(self.grid)
+        gained = 0
+        if direction in ("left", "right"):
+            for row in range(self.SIZE):
+                start = row * self.SIZE
+                line = self.grid[start : start + self.SIZE]
+                if direction == "right":
+                    line = list(reversed(line))
+                merged, add = self._merge_line(line)
+                gained += add
+                if direction == "right":
+                    merged = list(reversed(merged))
+                self.grid[start : start + self.SIZE] = merged
+        elif direction in ("up", "down"):
+            for column in range(self.SIZE):
+                line = [self.grid[row * self.SIZE + column] for row in range(self.SIZE)]
+                if direction == "down":
+                    line = list(reversed(line))
+                merged, add = self._merge_line(line)
+                gained += add
+                if direction == "down":
+                    merged = list(reversed(merged))
+                for row, value in enumerate(merged):
+                    self.grid[row * self.SIZE + column] = value
+        else:
+            return False
+        if self.grid == before:
+            return False
+        self.score += gained
+        self.spawn()
+        if not self.can_move():
+            self.alive = False
+        return True
+
+    def can_move(self):
+        if any(value == 0 for value in self.grid):
+            return True
+        for row in range(self.SIZE):
+            for column in range(self.SIZE):
+                value = self.grid[row * self.SIZE + column]
+                if (
+                    column + 1 < self.SIZE
+                    and value == self.grid[row * self.SIZE + column + 1]
+                ):
+                    return True
+                if (
+                    row + 1 < self.SIZE
+                    and value == self.grid[(row + 1) * self.SIZE + column]
+                ):
+                    return True
+        return False
+
+
+class Game2048Window:
+    """Tk view for 2048 (arrows / WASD, R restart, Esc close)."""
+
+    CELL = 78
+    GAP = 8
+    COLORS = {
+        0: ("#CDC1B4", "#776E65"),
+        2: ("#EEE4DA", "#776E65"),
+        4: ("#EDE0C8", "#776E65"),
+        8: ("#F2B179", "#F9F6F2"),
+        16: ("#F59563", "#F9F6F2"),
+        32: ("#F67C5F", "#F9F6F2"),
+        64: ("#F65E3B", "#F9F6F2"),
+        128: ("#EDCF72", "#F9F6F2"),
+        256: ("#EDCC61", "#F9F6F2"),
+        512: ("#EDC850", "#F9F6F2"),
+        1024: ("#EDC53F", "#F9F6F2"),
+        2048: ("#EDC22E", "#F9F6F2"),
+    }
+
+    def __init__(self, master, best=0, on_best=None, model=None):
+        self.best = int(best or 0)
+        self.on_best = on_best
+        self.model = model or Game2048Model()
+        self.win = tk.Toplevel(master)
+        self.win.title("2048 // 小游戏")
+        self.win.configure(bg=C_WHITE)
+        self.win.resizable(False, False)
+        self.win.protocol("WM_DELETE_WINDOW", self.close)
+
+        head = tk.Frame(self.win, bg=C_TEAL, bd=1, relief="solid")
+        head.pack(fill="x", padx=6, pady=(6, 0))
+        tk.Label(
+            head,
+            text=title_text("2048 // 合并方块"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=3,
+        ).pack(side="left")
+        self.best_var = tk.StringVar(value="最高 {0}".format(self.best))
+        tk.Label(
+            head,
+            textvariable=self.best_var,
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_SMALL,
+            anchor="e",
+            padx=6,
+        ).pack(side="right")
+
+        stats = tk.Frame(self.win, bg=C_GRAY, bd=1, relief="solid")
+        stats.pack(fill="x", padx=6, pady=(4, 0))
+        self.score_var = tk.StringVar(value="SCORE 0")
+        tk.Label(
+            stats,
+            textvariable=self.score_var,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+            padx=6,
+            pady=2,
+        ).pack(side="left")
+
+        size = self.model.SIZE * self.CELL + (self.model.SIZE + 1) * self.GAP
+        self.canvas = tk.Canvas(
+            self.win,
+            width=size,
+            height=size,
+            bg="#BBADA0",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=C_BLACK,
+        )
+        self.canvas.pack(padx=6, pady=6)
+        tk.Label(
+            self.win,
+            text="方向键 / WASD 移动 · R 重开 · Esc 关闭",
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            padx=6,
+            pady=3,
+        ).pack(fill="x", padx=6, pady=(0, 6))
+
+        for key, direction in (
+            ("<Up>", "up"),
+            ("<w>", "up"),
+            ("<W>", "up"),
+            ("<Down>", "down"),
+            ("<s>", "down"),
+            ("<S>", "down"),
+            ("<Left>", "left"),
+            ("<a>", "left"),
+            ("<A>", "left"),
+            ("<Right>", "right"),
+            ("<d>", "right"),
+            ("<D>", "right"),
+        ):
+            self.win.bind(key, lambda _event, name=direction: self._move(name))
+        self.win.bind("<r>", lambda _event: self.restart())
+        self.win.bind("<R>", lambda _event: self.restart())
+        self.win.bind("<Escape>", lambda _event: self.close())
+
+        try:
+            self.win.update_idletasks()
+            self.win.geometry(
+                "+{0}+{1}".format(
+                    max(20, master.winfo_rootx() + 120),
+                    max(20, master.winfo_rooty() + 40),
+                )
+            )
+        except Exception:
+            pass
+        self.win.focus_force()
+        self.draw()
+
+    def _move(self, direction):
+        if not self.model.alive:
+            return
+        if self.model.move(direction):
+            self.draw()
+            if not self.model.alive:
+                self._finish()
+
+    def restart(self):
+        self.model.reset()
+        self.draw()
+
+    def draw(self):
+        try:
+            if not self.win.winfo_exists():
+                return
+        except Exception:
+            return
+        canvas = self.canvas
+        canvas.delete("all")
+        for row in range(self.model.SIZE):
+            for column in range(self.model.SIZE):
+                value = self.model.grid[row * self.model.SIZE + column]
+                x0 = self.GAP + column * (self.CELL + self.GAP)
+                y0 = self.GAP + row * (self.CELL + self.GAP)
+                fill, text_color = self.COLORS.get(value, ("#3C3A32", "#F9F6F2"))
+                canvas.create_rectangle(
+                    x0,
+                    y0,
+                    x0 + self.CELL,
+                    y0 + self.CELL,
+                    fill=fill,
+                    outline=C_WHITE,
+                    width=2,
+                )
+                if value:
+                    canvas.create_text(
+                        x0 + self.CELL / 2,
+                        y0 + self.CELL / 2,
+                        text=str(value),
+                        fill=text_color,
+                        font=FONT_TITLE if value < 100 else FONT_MAIN,
+                    )
+        if not self.model.alive:
+            size = self.model.SIZE * self.CELL + (self.model.SIZE + 1) * self.GAP
+            canvas.create_rectangle(
+                0,
+                size * 0.36,
+                size,
+                size * 0.64,
+                fill=C_BLACK,
+                outline=C_TEAL,
+                width=2,
+            )
+            canvas.create_text(
+                size / 2,
+                size / 2,
+                text=title_text("GAME OVER // {0} 分\n按 R 再来一局".format(self.model.score)),
+                fill=C_WHITE,
+                font=FONT_MAIN,
+                justify="center",
+            )
+        try:
+            self.score_var.set("SCORE {0}".format(self.model.score))
+        except Exception:
+            pass
+
+    def _finish(self):
+        score = int(self.model.score)
+        if score > self.best:
+            self.best = score
+            try:
+                self.best_var.set("最高 {0}".format(self.best))
+            except Exception:
+                pass
+            if self.on_best is not None:
+                try:
+                    self.on_best(score)
+                except Exception:
+                    pass
+
+    def close(self):
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+
+
+class MinesweeperModel:
+    """Classic 9x9 minesweeper core (first click is always safe)."""
+
+    def __init__(self, cols=9, rows=9, mines=10, rng=None):
+        self.cols = max(5, int(cols))
+        self.rows = max(5, int(rows))
+        self.mines = max(1, min(int(mines), self.cols * self.rows - 9))
+        self.rng = rng or random.Random()
+        self.reset()
+
+    def reset(self):
+        self.mine_cells = set()
+        self.revealed = set()
+        self.flags = set()
+        self.placed = False
+        self.alive = True
+        self.won = False
+        self.started_at = 0.0
+
+    def neighbours(self, x, y):
+        cells = []
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < self.cols and 0 <= ny < self.rows:
+                    cells.append((nx, ny))
+        return cells
+
+    def adjacent(self, x, y):
+        return sum(1 for cell in self.neighbours(x, y) if cell in self.mine_cells)
+
+    def _place_mines(self, safe_x, safe_y):
+        blocked = {(safe_x, safe_y)} | set(self.neighbours(safe_x, safe_y))
+        candidates = [
+            (x, y)
+            for y in range(self.rows)
+            for x in range(self.cols)
+            if (x, y) not in blocked
+        ]
+        count = min(self.mines, len(candidates))
+        self.mine_cells = set(self.rng.sample(candidates, count))
+        self.placed = True
+
+    def toggle_flag(self, x, y):
+        if not self.alive or self.won or (x, y) in self.revealed:
+            return False
+        if (x, y) in self.flags:
+            self.flags.discard((x, y))
+        else:
+            self.flags.add((x, y))
+        return True
+
+    def reveal(self, x, y):
+        if not self.alive or self.won:
+            return "skip"
+        if (x, y) in self.flags or (x, y) in self.revealed:
+            return "skip"
+        if not self.placed:
+            self._place_mines(x, y)
+        if (x, y) in self.mine_cells:
+            self.revealed.add((x, y))
+            self.alive = False
+            return "boom"
+        stack = [(x, y)]
+        while stack:
+            cx, cy = stack.pop()
+            if (cx, cy) in self.revealed or (cx, cy) in self.flags:
+                continue
+            if (cx, cy) in self.mine_cells:
+                continue
+            self.revealed.add((cx, cy))
+            if self.adjacent(cx, cy) == 0:
+                stack.extend(self.neighbours(cx, cy))
+        if len(self.revealed) >= self.cols * self.rows - len(self.mine_cells):
+            self.won = True
+            return "win"
+        return "ok"
+
+
+class MinesweeperWindow:
+    """Tk view: left click reveal, right click flag, R restart, Esc close."""
+
+    CELL = 30
+
+    def __init__(self, master, best=0, on_best=None, model=None):
+        self.on_best = on_best
+        self.best = int(best or 0)  # best time in seconds (0 = none)
+        self.model = model or MinesweeperModel()
+        self.win = tk.Toplevel(master)
+        self.win.title("MINESWEEPER // 扫雷")
+        self.win.configure(bg=C_WHITE)
+        self.win.resizable(False, False)
+        self.win.protocol("WM_DELETE_WINDOW", self.close)
+        self._timer_id = None
+
+        head = tk.Frame(self.win, bg=C_TEAL, bd=1, relief="solid")
+        head.pack(fill="x", padx=6, pady=(6, 0))
+        tk.Label(
+            head,
+            text=title_text("MINESWEEPER // 扫雷 9x9 · 10 雷"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=3,
+        ).pack(side="left")
+        self.best_var = tk.StringVar(
+            value="最快 {0}".format(format_clock(self.best) if self.best else "--")
+        )
+        tk.Label(
+            head,
+            textvariable=self.best_var,
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_SMALL,
+            anchor="e",
+            padx=6,
+        ).pack(side="right")
+
+        stats = tk.Frame(self.win, bg=C_GRAY, bd=1, relief="solid")
+        stats.pack(fill="x", padx=6, pady=(4, 0))
+        self.status_var = tk.StringVar(value="")
+        tk.Label(
+            stats,
+            textvariable=self.status_var,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+            padx=6,
+            pady=2,
+        ).pack(side="left")
+        self.time_var = tk.StringVar(value="00:00")
+        tk.Label(
+            stats,
+            textvariable=self.time_var,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="e",
+            padx=6,
+        ).pack(side="right")
+
+        self.canvas = tk.Canvas(
+            self.win,
+            width=self.model.cols * self.CELL,
+            height=self.model.rows * self.CELL,
+            bg=C_WHITE,
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=C_BLACK,
+        )
+        self.canvas.pack(padx=6, pady=6)
+        self.canvas.bind("<Button-1>", self._on_left)
+        self.canvas.bind("<Button-3>", self._on_right)
+        tk.Label(
+            self.win,
+            text="左键翻开 · 右键插旗 · R 重开 · Esc 关闭",
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            padx=6,
+            pady=3,
+        ).pack(fill="x", padx=6, pady=(0, 6))
+
+        self.win.bind("<r>", lambda _event: self.restart())
+        self.win.bind("<R>", lambda _event: self.restart())
+        self.win.bind("<Escape>", lambda _event: self.close())
+        try:
+            self.win.update_idletasks()
+            self.win.geometry(
+                "+{0}+{1}".format(
+                    max(20, master.winfo_rootx() + 140),
+                    max(20, master.winfo_rooty() + 50),
+                )
+            )
+        except Exception:
+            pass
+        self.win.focus_force()
+        self.draw()
+        self._start_timer()
+
+    # -- helpers -------------------------------------------------------------
+
+    def _cell_at(self, event):
+        x = int(event.x // self.CELL)
+        y = int(event.y // self.CELL)
+        if 0 <= x < self.model.cols and 0 <= y < self.model.rows:
+            return x, y
+        return None
+
+    def _start_timer(self):
+        self._cancel_timer()
+        self._timer_id = self.win.after(500, self._tick_timer)
+
+    def _cancel_timer(self):
+        if self._timer_id is None:
+            return
+        try:
+            self.win.after_cancel(self._timer_id)
+        except Exception:
+            pass
+        self._timer_id = None
+
+    def _tick_timer(self):
+        self._timer_id = None
+        try:
+            if not self.win.winfo_exists():
+                return
+        except Exception:
+            return
+        if self.model.started_at and not self.model.won and self.model.alive:
+            self.time_var.set(format_clock(time.time() - self.model.started_at))
+        try:
+            self._timer_id = self.win.after(500, self._tick_timer)
+        except Exception:
+            self._timer_id = None
+
+    def _on_left(self, event):
+        cell = self._cell_at(event)
+        if cell is None:
+            return
+        if not self.model.placed:
+            self.model.started_at = time.time()
+        result = self.model.reveal(*cell)
+        self.draw()
+        if result in ("boom", "win"):
+            self._finish(result)
+
+    def _on_right(self, event):
+        cell = self._cell_at(event)
+        if cell is None:
+            return
+        if self.model.toggle_flag(*cell):
+            self.draw()
+
+    def restart(self):
+        self.model.reset()
+        self.time_var.set("00:00")
+        self.draw()
+
+    def draw(self):
+        try:
+            if not self.win.winfo_exists():
+                return
+        except Exception:
+            return
+        canvas = self.canvas
+        canvas.delete("all")
+        number_colors = {
+            1: "#1B5FBF",
+            2: "#1E7A23",
+            3: "#B03030",
+            4: "#5A2A8C",
+            5: "#8C4A1E",
+            6: "#1E7A7A",
+            7: "#333333",
+            8: "#666666",
+        }
+        for y in range(self.model.rows):
+            for x in range(self.model.cols):
+                x0 = x * self.CELL
+                y0 = y * self.CELL
+                cell = (x, y)
+                mine = cell in self.model.mine_cells
+                if cell in self.model.revealed:
+                    fill = "#E05F5F" if mine else C_WHITE
+                    canvas.create_rectangle(
+                        x0, y0, x0 + self.CELL, y0 + self.CELL,
+                        fill=fill, outline=C_BLACK, width=1,
+                    )
+                    if mine:
+                        canvas.create_text(
+                            x0 + self.CELL / 2, y0 + self.CELL / 2,
+                            text="*", fill=C_BLACK, font=FONT_MAIN,
+                        )
+                    else:
+                        count = self.model.adjacent(x, y)
+                        if count:
+                            canvas.create_text(
+                                x0 + self.CELL / 2,
+                                y0 + self.CELL / 2,
+                                text=str(count),
+                                fill=number_colors.get(count, C_BLACK),
+                                font=FONT_MAIN,
+                            )
+                else:
+                    canvas.create_rectangle(
+                        x0, y0, x0 + self.CELL, y0 + self.CELL,
+                        fill=C_GRAY, outline=C_BLACK, width=1,
+                    )
+                    if cell in self.model.flags:
+                        canvas.create_text(
+                            x0 + self.CELL / 2, y0 + self.CELL / 2,
+                            text="F", fill=C_TEAL, font=FONT_MAIN,
+                        )
+        remaining = self.model.mines - len(self.model.flags)
+        if self.model.won:
+            self.status_var.set("CLEARED // 全部扫清！按 R 再来一局")
+        elif not self.model.alive:
+            self.status_var.set("BOOM // 踩雷了，按 R 重开")
+        else:
+            self.status_var.set("剩余雷数 {0}".format(remaining))
+
+    def _finish(self, result):
+        if result == "win":
+            elapsed = max(1, int(time.time() - (self.model.started_at or time.time())))
+            self.time_var.set(format_clock(elapsed))
+            self._cancel_timer()
+            if not self.best or elapsed < self.best:
+                self.best = elapsed
+                try:
+                    self.best_var.set("最快 {0}".format(format_clock(self.best)))
+                except Exception:
+                    pass
+                if self.on_best is not None:
+                    try:
+                        self.on_best(elapsed)
+                    except Exception:
+                        pass
+        else:
+            self._cancel_timer()
+
+    def close(self):
+        self._cancel_timer()
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+
+
+TETRIS_SHAPES = {
+    "I": ("....", "####", "....", "...."),
+    "J": ("#...", "###.", "....", "...."),
+    "L": ("..#.", "###.", "....", "...."),
+    "O": ("##..", "##..", "....", "...."),
+    "S": (".##.", "##..", "....", "...."),
+    "T": (".#..", "###.", "....", "...."),
+    "Z": ("##..", ".##.", "....", "...."),
+}
+
+TETRIS_COLORS = {
+    "I": "#4EC9F0",
+    "J": "#4E6BF0",
+    "L": "#F0A04E",
+    "O": "#F0DC4E",
+    "S": "#5FD35F",
+    "T": "#B05FE0",
+    "Z": "#E05F5F",
+}
+
+
+class TetrisModel:
+    """Classic 10x20 tetris core (bag randomizer, wall kick on rotate)."""
+
+    COLS = 10
+    ROWS = 20
+    LINE_SCORES = {1: 100, 2: 300, 3: 500, 4: 800}
+
+    def __init__(self, rng=None):
+        self.rng = rng or random.Random()
+        self.reset()
+
+    def reset(self):
+        self.board = [[None] * self.COLS for _ in range(self.ROWS)]
+        self.score = 0
+        self.lines = 0
+        self.level = 1
+        self.alive = True
+        self.bag = []
+        self.next_name = self._pick()
+        self.current = None
+        self.spawn()
+
+    def _pick(self):
+        if not self.bag:
+            self.bag = list(TETRIS_SHAPES.keys())
+            self.rng.shuffle(self.bag)
+        return self.bag.pop()
+
+    def spawn(self):
+        name = self.next_name
+        self.next_name = self._pick()
+        matrix = [list(row) for row in TETRIS_SHAPES[name]]
+        self.current = {
+            "name": name,
+            "matrix": matrix,
+            "x": self.COLS // 2 - 2,
+            "y": 0,
+        }
+        if self.collides(matrix, self.current["x"], self.current["y"]):
+            self.alive = False
+
+    def collides(self, matrix, offset_x, offset_y):
+        for row_index, row in enumerate(matrix):
+            for column_index, cell in enumerate(row):
+                if cell != "#":
+                    continue
+                x = offset_x + column_index
+                y = offset_y + row_index
+                if x < 0 or x >= self.COLS or y >= self.ROWS:
+                    return True
+                if y >= 0 and self.board[y][x]:
+                    return True
+        return False
+
+    def cells(self):
+        result = []
+        if not self.current:
+            return result
+        matrix = self.current["matrix"]
+        for row_index, row in enumerate(matrix):
+            for column_index, cell in enumerate(row):
+                if cell == "#":
+                    result.append(
+                        (
+                            self.current["x"] + column_index,
+                            self.current["y"] + row_index,
+                            self.current["name"],
+                        )
+                    )
+        return result
+
+    def move(self, delta):
+        if not self.alive or not self.current:
+            return False
+        if not self.collides(
+            self.current["matrix"], self.current["x"] + delta, self.current["y"]
+        ):
+            self.current["x"] += delta
+            return True
+        return False
+
+    def rotate(self):
+        if not self.alive or not self.current:
+            return False
+        matrix = [list(row) for row in zip(*self.current["matrix"][::-1])]
+        for kick in (0, -1, 1, -2, 2):
+            if not self.collides(matrix, self.current["x"] + kick, self.current["y"]):
+                self.current["matrix"] = matrix
+                self.current["x"] += kick
+                return True
+        return False
+
+    def soft_drop(self):
+        if not self.alive or not self.current:
+            return "dead"
+        if not self.collides(
+            self.current["matrix"], self.current["x"], self.current["y"] + 1
+        ):
+            self.current["y"] += 1
+            self.score += 1
+            return "moved"
+        self.lock()
+        return "locked"
+
+    def hard_drop(self):
+        if not self.alive or not self.current:
+            return "dead"
+        while not self.collides(
+            self.current["matrix"], self.current["x"], self.current["y"] + 1
+        ):
+            self.current["y"] += 1
+            self.score += 2
+        self.lock()
+        return "locked"
+
+    def ghost_y(self):
+        if not self.current:
+            return 0
+        y = self.current["y"]
+        while not self.collides(self.current["matrix"], self.current["x"], y + 1):
+            y += 1
+        return y
+
+    def lock(self):
+        for x, y, name in self.cells():
+            if 0 <= y < self.ROWS and 0 <= x < self.COLS:
+                self.board[y][x] = name
+        self.clear_lines()
+        self.spawn()
+
+    def clear_lines(self):
+        kept = [row for row in self.board if any(cell is None for cell in row)]
+        cleared = self.ROWS - len(kept)
+        if not cleared:
+            return 0
+        for _ in range(cleared):
+            kept.insert(0, [None] * self.COLS)
+        self.board = kept
+        self.lines += cleared
+        self.score += self.LINE_SCORES.get(cleared, 800) * self.level
+        self.level = 1 + self.lines // 10
+        return cleared
+
+    @property
+    def speed_ms(self):
+        return max(80, 520 - (self.level - 1) * 40)
+
+
+class TetrisWindow:
+    """Tk view for tetris (arrows / WASD, space hard drop, P pause)."""
+
+    CELL = 24
+
+    def __init__(self, master, best=0, on_best=None, model=None):
+        self.best = int(best or 0)
+        self.on_best = on_best
+        self.model = model or TetrisModel()
+        self.paused = False
+        self._after_id = None
+        self.win = tk.Toplevel(master)
+        self.win.title("TETRIS // 俄罗斯方块")
+        self.win.configure(bg=C_WHITE)
+        self.win.resizable(False, False)
+        self.win.protocol("WM_DELETE_WINDOW", self.close)
+
+        head = tk.Frame(self.win, bg=C_TEAL, bd=1, relief="solid")
+        head.pack(fill="x", padx=6, pady=(6, 0))
+        tk.Label(
+            head,
+            text=title_text("TETRIS // 经典俄罗斯方块"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=3,
+        ).pack(side="left")
+        self.best_var = tk.StringVar(value="最高 {0}".format(self.best))
+        tk.Label(
+            head,
+            textvariable=self.best_var,
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_SMALL,
+            anchor="e",
+            padx=6,
+        ).pack(side="right")
+
+        body = tk.Frame(self.win, bg=C_WHITE)
+        body.pack(padx=6, pady=6)
+        self.canvas = tk.Canvas(
+            body,
+            width=self.model.COLS * self.CELL,
+            height=self.model.ROWS * self.CELL,
+            bg=C_BLACK,
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=C_BLACK,
+        )
+        self.canvas.grid(row=0, column=0, sticky="nw")
+
+        side = tk.Frame(body, bg=C_GRAY, bd=1, relief="solid", padx=6, pady=6)
+        side.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        tk.Label(
+            side, text="NEXT", bg=C_GRAY, fg=C_BLACK, font=FONT_SMALL, anchor="w"
+        ).pack(fill="x")
+        self.next_canvas = tk.Canvas(
+            side, width=self.CELL * 4, height=self.CELL * 4, bg=C_WHITE,
+            bd=1, relief="solid", highlightthickness=0,
+        )
+        self.next_canvas.pack(pady=(2, 8))
+        self.score_var = tk.StringVar(value="SCORE 0")
+        self.lines_var = tk.StringVar(value="LINES 0")
+        self.level_var = tk.StringVar(value="LEVEL 1")
+        for var in (self.score_var, self.lines_var, self.level_var):
+            tk.Label(
+                side,
+                textvariable=var,
+                bg=C_GRAY,
+                fg=C_BLACK,
+                font=FONT_MAIN,
+                anchor="w",
+                pady=2,
+            ).pack(fill="x")
+        tk.Label(
+            side,
+            text="← → 移动\n↑ / W 旋转\n↓ 软降\n空格 硬降\nP 暂停 · R 重开",
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            pady=4,
+        ).pack(fill="x", pady=(8, 0))
+
+        tk.Label(
+            self.win,
+            text="Esc 关闭",
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            padx=6,
+            pady=3,
+        ).pack(fill="x", padx=6, pady=(0, 6))
+
+        for key, handler in (
+            ("<Left>", lambda: self._move(-1)),
+            ("<a>", lambda: self._move(-1)),
+            ("<A>", lambda: self._move(-1)),
+            ("<Right>", lambda: self._move(1)),
+            ("<d>", lambda: self._move(1)),
+            ("<D>", lambda: self._move(1)),
+            ("<Up>", self.rotate),
+            ("<w>", self.rotate),
+            ("<W>", self.rotate),
+            ("<Down>", self.soft_drop),
+            ("<s>", self.soft_drop),
+            ("<S>", self.soft_drop),
+            ("<space>", self.hard_drop),
+        ):
+            self.win.bind(key, lambda _event, action=handler: action())
+        self.win.bind("<p>", lambda _event: self.toggle_pause())
+        self.win.bind("<P>", lambda _event: self.toggle_pause())
+        self.win.bind("<r>", lambda _event: self.restart())
+        self.win.bind("<R>", lambda _event: self.restart())
+        self.win.bind("<Escape>", lambda _event: self.close())
+
+        try:
+            self.win.update_idletasks()
+            self.win.geometry(
+                "+{0}+{1}".format(
+                    max(20, master.winfo_rootx() + 160),
+                    max(10, master.winfo_rooty() + 20),
+                )
+            )
+        except Exception:
+            pass
+        self.win.focus_force()
+        self.draw()
+        self.schedule()
+
+    def _move(self, delta):
+        if self.paused or not self.model.alive:
+            return
+        if self.model.move(delta):
+            self.draw()
+
+    def rotate(self):
+        if self.paused or not self.model.alive:
+            return
+        if self.model.rotate():
+            self.draw()
+
+    def soft_drop(self):
+        if self.paused or not self.model.alive:
+            return
+        self.model.soft_drop()
+        self.draw()
+        if not self.model.alive:
+            self._finish()
+
+    def hard_drop(self):
+        if self.paused or not self.model.alive:
+            return
+        self.model.hard_drop()
+        self.draw()
+        if not self.model.alive:
+            self._finish()
+
+    def toggle_pause(self):
+        if not self.model.alive:
+            self.restart()
+            return
+        self.paused = not self.paused
+        self.draw()
+
+    def restart(self):
+        self.model.reset()
+        self.paused = False
+        self.draw()
+        self.schedule()
+
+    def schedule(self):
+        self.cancel()
+        try:
+            self._after_id = self.win.after(self.model.speed_ms, self.tick)
+        except Exception:
+            self._after_id = None
+
+    def cancel(self):
+        if self._after_id is None:
+            return
+        try:
+            self.win.after_cancel(self._after_id)
+        except Exception:
+            pass
+        self._after_id = None
+
+    def tick(self):
+        self._after_id = None
+        try:
+            if not self.win.winfo_exists():
+                return
+        except Exception:
+            return
+        if self.paused:
+            self.schedule()
+            return
+        self.model.soft_drop()
+        self.draw()
+        if not self.model.alive:
+            self._finish()
+            return
+        self.schedule()
+
+
+    def _cell(self, x, y, name, outline=None):
+        size = self.CELL
+        self.canvas.create_rectangle(
+            x * size,
+            y * size,
+            x * size + size,
+            y * size + size,
+            fill=TETRIS_COLORS.get(name, C_GRAY),
+            outline=outline or C_BLACK,
+            width=1,
+        )
+
+    def draw(self):
+        try:
+            if not self.win.winfo_exists():
+                return
+        except Exception:
+            return
+        canvas = self.canvas
+        canvas.delete("all")
+        canvas.configure(bg=C_BLACK, highlightbackground=C_BLACK)
+        size = self.CELL
+        for y in range(self.model.ROWS):
+            for x in range(self.model.COLS):
+                name = self.model.board[y][x]
+                if name:
+                    self._cell(x, y, name)
+                elif (x + y) % 2 == 0:
+                    canvas.create_rectangle(
+                        x * size,
+                        y * size,
+                        x * size + size,
+                        y * size + size,
+                        fill="#151515",
+                        width=0,
+                    )
+        if self.model.current and self.model.alive:
+            ghost_y = self.model.ghost_y()
+            for x, y, name in self.model.cells():
+                offset = ghost_y - self.model.current["y"]
+                canvas.create_rectangle(
+                    x * size + 4,
+                    (y + offset) * size + 4,
+                    x * size + size - 4,
+                    (y + offset) * size + size - 4,
+                    outline=TETRIS_COLORS.get(name, C_GRAY),
+                    width=1,
+                )
+        for x, y, name in self.model.cells():
+            if y >= 0:
+                self._cell(x, y, name)
+        width = self.model.COLS * size
+        height = self.model.ROWS * size
+        if self.paused and self.model.alive:
+            canvas.create_rectangle(
+                width * 0.1,
+                height * 0.42,
+                width * 0.9,
+                height * 0.58,
+                fill=C_BLACK,
+                outline=C_TEAL,
+                width=2,
+            )
+            canvas.create_text(
+                width / 2, height / 2, text=title_text("PAUSED // P 继续"),
+                fill=C_WHITE, font=FONT_MAIN,
+            )
+        if not self.model.alive:
+            canvas.create_rectangle(
+                width * 0.06,
+                height * 0.4,
+                width * 0.94,
+                height * 0.6,
+                fill=C_BLACK,
+                outline=C_TEAL,
+                width=2,
+            )
+            canvas.create_text(
+                width / 2,
+                height / 2,
+                text=title_text("GAME OVER // {0} 分\n按 R 再来一局".format(self.model.score)),
+                fill=C_WHITE,
+                font=FONT_MAIN,
+                justify="center",
+            )
+        preview = self.next_canvas
+        preview.delete("all")
+        matrix = TETRIS_SHAPES.get(self.model.next_name, ())
+        for row_index, row in enumerate(matrix):
+            for column_index, cell in enumerate(row):
+                if cell != "#":
+                    continue
+                preview.create_rectangle(
+                    column_index * size,
+                    row_index * size,
+                    column_index * size + size,
+                    row_index * size + size,
+                    fill=TETRIS_COLORS.get(self.model.next_name, C_GRAY),
+                    outline=C_BLACK,
+                )
+        try:
+            self.score_var.set("SCORE {0}".format(self.model.score))
+            self.lines_var.set("LINES {0}".format(self.model.lines))
+            self.level_var.set("LEVEL {0}".format(self.model.level))
+        except Exception:
+            pass
+
+    def _finish(self):
+        self.cancel()
+        score = int(self.model.score)
+        if score > self.best:
+            self.best = score
+            try:
+                self.best_var.set("最高 {0}".format(self.best))
+            except Exception:
+                pass
+            if self.on_best is not None:
+                try:
+                    self.on_best(score)
+                except Exception:
+                    pass
+
+    def close(self):
+        self.cancel()
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+
+
+class Win1App:
+    def __init__(self):
+        self._enable_dpi()
+        self.config, self.auth, self.alias = bootstrap_files()
+        set_language(self.config.get("language"))
+        self._relaunch_ui = False
+        self.theme = set_global_theme(self.config.get("theme"))
+        self.ui_style, self.ui_palette = set_ui_style(
+            self.config.get("ui_style"),
+            self.config.get("ui_style_palette"),
+            theme=self.theme,
+        )
+        self.mc_dir = resolve_path(self.config.get("minecraft_dir"))
+        self.mods_dir = os.path.join(self.mc_dir, "mods")
+        ensure_dir(self.mods_dir)
+
+        self.current_hits = []
+        self._search_state = {}
+        self._shelf_loader_var = None
+        self._shelf_filter_var = None
+        self._shelf_loader_value = str(self.config.get("mod_filter_loader") or "auto")
+        self._isolation_var = None
+        self._pack_win = None
+        self._pack_status_var = None
+        self._pack_progress_var = None
+        self._pack_busy = False
+        self._pack_cancel = threading.Event()
+        self._pack_close_btn = None
+        self._tutorial_win = None
+        self._update_win = None
+        self._update_status_var = None
+        self._update_progress_var = None
+        self._update_checking = False
+        self._update_manifest = None
+        self._update_downloading = False
+        self._content_win = None
+        self._content_kind_var = None
+        self._content_mc_var = None
+        self._content_query_var = None
+        self._content_list = None
+        self._content_hits = []
+        self._content_status_var = None
+        self._content_progress_var = None
+        self._content_busy = False
+        self._content_kind = "shader"
+        self._content_download_btn = None
+        self._content_global_var = None
+        self.version_bar_box = None
+        self.btn_version_bar = None
+        self._version_bar_summary_var = None
+        self._version_bar_open = bool(self.config.get("mod_version_bar_open", True))
+        self._mc_tags = []
+        self._mc_tags_loading = False
+        self.local_versions = []
+        self.version_rows = [""]
+        self._updating_versions = False
+        self.history = []
+        self._ui_queue = queue.Queue()
+        self._busy = False
+        self._launching = False
+        self._login_in_progress = False
+        self._code_win = None
+        self._code_value = ""
+        self._code_uri = ""
+        self._code_var = None
+        self._code_uri_var = None
+        self._code_note_var = None
+        self._donate_win = None
+        self._donate_photo = None
+        self._device_cancel = threading.Event()
+        self._device_poll_now = threading.Event()
+        self._device_legacy = True
+        self._client_win = None
+        self._client_var = None
+        self._browser_win = None
+        self._browser_entry = None
+        self._browser_input_var = None
+        self._browser_code_event = threading.Event()
+        self._browser_code_value = ""
+        self._login_flow = str(self.config.get("auth_flow") or "browser")
+        self._vanilla_win = None
+        self._vanilla_version_list = None
+        self._vanilla_manifest_var = None
+        self._vanilla_status_var = None
+        self._vanilla_progress_var = None
+        self._vanilla_version_var = None
+        self._vanilla_source_var = None
+        self._vanilla_start_btn = None
+        self._vanilla_refresh_btn = None
+        self._vanilla_cancel_btn = None
+        self._vanilla_versions = []
+        self._vanilla_downloading = False
+        self._vanilla_fetching = False
+        self._vanilla_cancel = threading.Event()
+        self._vanilla_last_phase = ""
+        self._vanilla_phase_clock = 0.0
+        self._detail_win = None
+        self._detail_text = None
+        self._detail_job = None
+        self._detail_task_var = None
+        self._detail_summary_var = None
+        self._detail_clipboard = ""
+        self._vanilla_loader_var = None
+        self._vanilla_loader_list = None
+        self._vanilla_loader_rows = []
+        self._vanilla_loader_cache = {}
+        self._vanilla_loader_fetching = False
+        self._vanilla_install_loader = "vanilla"
+        self._loader_win = None
+        self._loader_id_var = None
+        self._loader_mc_list = None
+        self._loader_version_list = None
+        self._loader_mc_versions = []
+        self._loader_version_rows = []
+        self._loader_selected_mc = ""
+        self._loader_selected_loader_version = ""
+        self._loader_status_var = None
+        self._loader_progress_var = None
+        self._loader_start_btn = None
+        self._loader_refresh_btn = None
+        self._loader_installing = False
+        self._loader_fetching_mc = False
+        self._loader_fetching_versions = False
+        self._loader_fetch_key = None
+        self._loader_cancel = threading.Event()
+        self._loader_mc_cache = {}
+        self._loader_versions_cache = {}
+        self._loader_neoforge_map = {}
+        self._loader_last_phase = ""
+        self._java_win = None
+        self._java_list = None
+        self._java_rows = []
+        self._java_status_var = None
+        self._java_progress_var = None
+        self._java_busy = False
+        self._java_cancel = threading.Event()
+        self._java_buttons = []
+        self._memory_min_var = None
+        self._memory_max_var = None
+        self._memory_hint_var = None
+        self._launch_started_at = 0.0
+        self._launch_ticker_id = None
+        self._last_launch_log = ""
+        self._all_menus = []
+        self._launch_state_mode = "idle"
+        self._toolbox_win = None
+        self._toolbox_list = None
+        self._toolbox_detail_var = None
+        self._toolbox_search_var = None
+        self._toolbox_rows = []
+        self._settings_win = None
+        self._settings_vars = {}
+        self._settings_swatches = {}
+        self._settings_preview = {}
+        self._token_win = None
+        self._token_vars = {}
+        self._token_status_var = None
+        self._token_login_btn = None
+        self._token_source_widgets = []
+        self._accounts_win = None
+        self._accounts_list = None
+        self._accounts_rows = []
+        self._accounts_detail_var = None
+        self.game_process = None
+        self._widgets_ready = False
+        self._last_hot_refresh = 0.0
+        # -- custom wallpaper ---------------------------------------------------
+        self.wallpaper_path = str(self.config.get("wallpaper") or "").strip()
+        self._wallpaper_photos = None
+        self._wallpaper_token = 0
+        self._wallpaper_job = None
+        self._wallpaper_last_size = (0, 0, 0, 0)
+        self._wallpaper_loading = False
+        self._glass_canvases = {}
+        self._glass_photos = {}
+        self._glass_colors = {}
+        self._glass_tones = {}
+        self._glass_tinted = []
+        self._glass_bound = set()
+        self._glass_sizes = {}
+        self._audit_win = None
+        self._create_pack_win = None
+        self._icon_memory = {}
+        self._icon_tokens = {}
+        self._icon_failed = {}
+        self.left_panel = None
+        self.right_panel = None
+        # -- avatar / playtime / download stats --------------------------------
+        self._avatar_token = 0
+        self._avatar_cache = {}
+        self._avatar_fetched = set()
+        self._avatar_photo = None
+        self._dl_last_bytes = downloaded_bytes()
+        self._dl_last_time = time.time()
+        self._running_version_id = ""
+        self._play_version_id = ""
+        self._download_cancel = threading.Event()
+        self._launch_cancel = threading.Event()
+        self._abort_btn = None
+        self._abort_watch = None
+        # -- mini game ---------------------------------------------------------
+        self._snake_game = None
+        self._game2048 = None
+        self._minesweeper = None
+        self._tetris = None
+        self._snake_prompt_win = None
+        self._snake_prompt_at = 0.0
+
+        self.root = tk.Tk()
+        self.root.title("AKM 启动器" if current_language() == "zh" else "AKM Launcher")
+        self.root.configure(bg=C_WHITE)
+        self._apply_app_icon()
+        self._resolve_ui_font()
+        self.root.option_add("*Font", "{{{0}}} {1}".format(UI_FONT, FONT_MAIN[1]))
+        self.root.option_add("*Background", C_GRAY)
+        self.root.option_add("*Foreground", C_BLACK)
+        self.root.option_add("*selectBackground", C_TEAL)
+        self.root.option_add("*selectForeground", C_WHITE)
+        self.menu_font = tkfont.Font(
+            root=self.root, family=UI_FONT, size=9, weight="normal"
+        )
+
+        self.name_var = tk.StringVar(value=str(self.auth.get("username") or "Steve"))
+        self.search_var = tk.StringVar(value="")
+        self.status_var = tk.StringVar(value="[BOOT] AKM 系统初始化 ...")
+        self.launch_state_var = tk.StringVar(value="LAUNCH: IDLE")
+        self.version_var = tk.StringVar(value=str(self.config.get("mc_version") or "1.21.1"))
+        self.loader_var = tk.StringVar(value=str(self.config.get("loader") or "fabric"))
+        source_now = str(self.config.get("download_source") or "mirror").lower()
+        if source_now not in {"mirror", "auto", "official"}:
+            source_now = "mirror"
+        self._source_var = tk.StringVar(value=source_now)
+
+        self._build_ui()
+        self._bind_shortcuts()
+        self._widgets_ready = True
+        self._refresh_identity()
+        self._update_controls()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.after(90, self._poll_ui)
+        self.say("AKM 系统就绪 // 目标 {0} / {1}".format(self.mc_version, self.mod_loader))
+        self.root.after(200, self.refresh_hot)
+        self.root.after(300, self.refresh_versions)
+        self.root.after(600, self._silent_refresh)
+        self.root.after(1500, self._startup_update_check)
+        self.root.after(140, self._refresh_wallpaper)
+        self.root.after(700, self._tick_download_stats)
+
+    # -- window plumbing ----------------------------------------------------
+
+    def _enable_dpi(self):
+        try:
+            import ctypes
+
+            try:
+                ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            except Exception:
+                ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+    def _resolve_ui_font(self):
+        """Pick a comfortable family (monospace for 1985, sans for vector)."""
+        global UI_FONT, FONT_MAIN, FONT_SMALL, FONT_TITLE, FONT_BANNER
+        global FONT_BIG, FONT_CODE, FONT_BODY
+        name = ui_font_for_style("vector" if UI_VECTOR else "retro", self.root)
+        if not name:
+            return
+        UI_FONT = name
+        FONT_MAIN = (UI_FONT, 10)
+        FONT_SMALL = (UI_FONT, 9)
+        FONT_TITLE = (UI_FONT, 10, "bold")
+        FONT_BANNER = (UI_FONT, 13 if UI_VECTOR else 12, "bold")
+        FONT_BIG = (UI_FONT, 15 if UI_VECTOR else 14, "bold")
+        FONT_CODE = (UI_FONT, 16, "bold")
+        FONT_BODY = (UI_FONT, 10)
+
+    def _apply_app_icon(self):
+        """Use the bundled akm_icon.ico for the window and all child dialogs."""
+        self._app_icon_path = ""
+        for name in (APP_ICON_NAME, "akm.ico"):
+            path = resource_path(name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                self.root.iconbitmap(default=path)
+                self._app_icon_path = path
+                return
+            except Exception:
+                try:
+                    self.root.iconbitmap(path)
+                    self._app_icon_path = path
+                    return
+                except Exception:
+                    continue
+
+    @property
+    def mc_version(self):
+        return str(self.config.get("mc_version") or "1.21.1")
+
+    @property
+    def mod_loader(self):
+        loader = str(self.config.get("loader") or "fabric").lower()
+        if loader not in {"fabric", "quilt", "forge", "neoforge"}:
+            return "fabric"
+        return loader
+
+    def run(self):
+        self.root.mainloop()
+
+    def post(self, func, *args, **kwargs):
+        self._ui_queue.put((func, args, kwargs))
+
+    def say(self, text):
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self.post(self._apply_status, "[{0}] {1}".format(stamp, text))
+
+    def _apply_status(self, text):
+        self.status_var.set(text)
+        self.history.append(text)
+        if len(self.history) > 300:
+            del self.history[:100]
+
+    def _set_launch_state(self, text, mode="idle"):
+        self._launch_state_mode = mode
+        if mode in ("idle", "error"):
+            self._set_task_progress(active=False)
+        try:
+            self.launch_state_var.set(text)
+        except Exception:
+            return
+        label = getattr(self, "launch_state_label", None)
+        if label is None:
+            return
+        if mode == "active":
+            background, foreground = C_TEAL, C_WHITE
+        elif mode == "error":
+            background, foreground = C_BLACK, C_WHITE
+        else:
+            background, foreground = C_GRAY, C_BLACK
+        try:
+            label.configure(bg=background, fg=foreground)
+        except Exception:
+            pass
+
+    def _on_game_started(self, pid):
+        self._launch_started_at = time.time()
+        self._play_version_id = self._running_version_id or str(
+            self.config.get("launch_version") or ""
+        )
+        self._set_task_progress(active=False)
+        self._set_launch_state("LAUNCH: RUNNING 00:00", "active")
+        self._tick_launch()
+
+    def _tick_launch(self):
+        process = self.game_process
+        if process is None:
+            return
+        try:
+            if process.poll() is not None:
+                return
+        except Exception:
+            pass
+        elapsed = max(0, int(time.time() - self._launch_started_at))
+        self._set_launch_state(
+            "LAUNCH: RUNNING {0:02d}:{1:02d}".format(
+                elapsed // 60, elapsed % 60
+            ),
+            "active",
+        )
+        try:
+            self._launch_ticker_id = self.root.after(1000, self._tick_launch)
+        except Exception:
+            pass
+
+    def _on_game_exit(self, code, process=None):
+        if process is not None and self.game_process is not process:
+            return
+        self.game_process = None
+        started = float(getattr(self, "_launch_started_at", 0) or 0)
+        if started and self._play_version_id:
+            self._record_playtime(self._play_version_id, time.time() - started)
+        self._play_version_id = ""
+        if code == 0:
+            self._set_launch_state("LAUNCH: EXITED 0", "idle")
+        else:
+            self._set_launch_state(
+                "LAUNCH: CRASH {0}".format(code), "error"
+            )
+            messagebox.showwarning(
+                "游戏异常退出",
+                "Minecraft 退出码: {0}\n\n日志:\n{1}".format(
+                    code, self._last_launch_log or "(未生成日志)"
+                ),
+                parent=self.root,
+            )
+            if messagebox.askyesno(
+                "崩溃分析",
+                "要现在分析崩溃报告并给出修复建议吗？",
+                parent=self.root,
+            ):
+                self.on_analyze_crash()
+        if self._last_launch_log:
+            self.say(
+                "游戏进程结束 exit={0} // 日志: {1}".format(
+                    code, self._last_launch_log
+                )
+            )
+        else:
+            self.say("游戏进程结束 exit={0}".format(code))
+
+    def _poll_ui(self):
+        if getattr(self, "_closing", False):
+            return
+        for _ in range(200):
+            try:
+                func, args, kwargs = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                func(*args, **kwargs)
+            except Exception:
+                log_debug("UI callback failed:\n" + traceback.format_exc())
+        try:
+            self._ui_job = self.root.after(90, self._poll_ui)
+        except Exception:
+            self._ui_job = None
+
+
+    def _mk_button(self, parent, text, command, font=FONT_MAIN, padx=8, pady=4):
+        if UI_VECTOR:
+            button = tk.Button(
+                parent,
+                text=text,
+                command=command,
+                font=font,
+                bg=C_WHITE,
+                fg=C_BLACK,
+                activebackground=C_TEAL,
+                activeforeground=C_WHITE,
+                relief="flat",
+                bd=0,
+                padx=padx + 4,
+                pady=pady + 1,
+                highlightthickness=0,
+                takefocus=0,
+                cursor="hand2",
+            )
+            base_bg = C_WHITE
+
+            def on_enter(_event, widget=button):
+                if str(widget.cget("state")) != "disabled":
+                    widget.configure(bg=C_TEAL, fg="#FFFFFF")
+
+            def on_leave(_event, widget=button):
+                if str(widget.cget("state")) != "disabled":
+                    widget.configure(bg=base_bg, fg=C_BLACK)
+
+            button.bind("<Enter>", on_enter)
+            button.bind("<Leave>", on_leave)
+            return button
+        button = tk.Button(
+            parent,
+            text=text,
+            command=command,
+            font=font,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            activebackground=C_TEAL,
+            activeforeground=C_WHITE,
+            relief="solid",
+            bd=1,
+            padx=padx,
+            pady=pady,
+            highlightthickness=0,
+            takefocus=0,
+            cursor="hand2",
+        )
+
+        def on_enter(_event, widget=button):
+            if str(widget.cget("state")) != "disabled":
+                widget.configure(bg=C_TEAL, fg=C_WHITE)
+
+        def on_leave(_event, widget=button):
+            if str(widget.cget("state")) != "disabled":
+                widget.configure(bg=C_WHITE, fg=C_BLACK)
+
+        button.bind("<Enter>", on_enter)
+        button.bind("<Leave>", on_leave)
+        return button
+
+    def _mk_title(self, parent, text):
+        if UI_VECTOR:
+            return tk.Label(
+                parent,
+                text=title_text(text),
+                bg=C_WHITE,
+                fg=C_TEAL,
+                font=FONT_TITLE,
+                anchor="w",
+                padx=2,
+                pady=2,
+                bd=0,
+                highlightthickness=0,
+            )
+        return tk.Label(
+            parent,
+            text=title_text(text),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=3,
+            bd=1,
+            relief="solid",
+        )
+
+    def _build_ui(self):
+        self.root.columnconfigure(0, weight=0, minsize=340)
+        self.root.columnconfigure(1, weight=1)
+        self.root.rowconfigure(1, weight=1)
+        self.root.rowconfigure(2, minsize=0)
+        self._build_backdrop()
+        self._build_menu()
+        self._build_banner()
+        self._build_left_panel(self.root)
+        self._build_desktop_hint(self.root)
+        self._build_right_panel(self.root)
+        self._build_status_bar()
+        self._center_window(1040, 640)
+        self._style_panel_frames()
+        self._schedule_card_refresh(160)
+
+    def _build_backdrop(self):
+        """Whole-window canvas: shows the custom wallpaper behind every panel."""
+        self.backdrop = tk.Canvas(
+            self.root, bg=UI_PAGE, highlightthickness=0, bd=0
+        )
+        self.backdrop.place(x=0, y=0, relwidth=1, relheight=1)
+        try:
+            self.backdrop.lower()
+        except Exception:
+            pass
+        self.root.bind("<Configure>", self._on_root_configure, add="+")
+
+    def _ui_card_panels(self):
+        panels = []
+        for name in ("left_panel", "right_panel"):
+            widget = getattr(self, name, None)
+            if widget is not None and widget.winfo_exists():
+                panels.append(widget)
+        return panels
+
+    def _refresh_backdrop_cards(self):
+        """Paint the rounded cards the vector panels sit on (B0.5)."""
+        canvas = getattr(self, "backdrop", None)
+        if canvas is None:
+            return
+        try:
+            canvas.delete("ui_card")
+        except Exception:
+            return
+        if not UI_VECTOR:
+            return
+        pad = 4
+        for panel in self._ui_card_panels():
+            try:
+                x = panel.winfo_x()
+                y = panel.winfo_y()
+                width = panel.winfo_width()
+                height = panel.winfo_height()
+            except Exception:
+                continue
+            if width < 60 or height < 60:
+                continue
+            x0, y0 = x - pad, y - pad
+            x1, y1 = x + width + pad, y + height + pad
+            try:
+                draw_round_rect(
+                    canvas,
+                    x0 + 1,
+                    y0 + 3,
+                    x1 + 1,
+                    y1 + 3,
+                    UI_CARD_RADIUS,
+                    fill=UI_SHADOW,
+                    outline="",
+                    tags="ui_card",
+                )
+                draw_round_rect(
+                    canvas,
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    UI_CARD_RADIUS,
+                    fill=C_WHITE,
+                    outline=UI_OUTLINE,
+                    width=1,
+                    tags="ui_card",
+                )
+            except Exception:
+                continue
+        try:
+            canvas.tag_lower("ui_card", "wallpaper")
+        except Exception:
+            pass
+
+    def _schedule_card_refresh(self, delay=90):
+        job = getattr(self, "_card_job", None)
+        try:
+            if job is not None:
+                self.root.after_cancel(job)
+        except Exception:
+            pass
+        try:
+            self._card_job = self.root.after(delay, self._refresh_backdrop_cards)
+        except Exception:
+            self._card_job = None
+
+    def _apply_style_tree(self, vector, old_font=""):
+        """Walk the widget tree and switch borders / fonts for the new style."""
+        family = ui_font_for_style("vector" if vector else "retro")
+        stack = [self.root]
+        while stack:
+            widget = stack.pop()
+            try:
+                stack.extend(widget.winfo_children())
+            except Exception:
+                pass
+            try:
+                klass = widget.winfo_class()
+            except Exception:
+                klass = ""
+            if klass == "Button":
+                if vector:
+                    self._ui_style_mark(
+                        widget, relief="flat", bd=0, highlightthickness=0
+                    )
+                else:
+                    self._ui_style_mark(widget, relief="solid", bd=1)
+            elif klass == "Entry":
+                if vector:
+                    self._ui_style_mark(
+                        widget,
+                        relief="flat",
+                        bd=0,
+                        highlightthickness=1,
+                        highlightbackground=UI_OUTLINE,
+                        highlightcolor=C_TEAL,
+                    )
+                else:
+                    self._ui_style_mark(
+                        widget, relief="solid", bd=1, highlightthickness=0
+                    )
+            elif klass in ("Frame", "Label"):
+                try:
+                    bd = int(widget.cget("bd"))
+                except Exception:
+                    bd = 0
+                if vector and bd:
+                    self._ui_style_mark(widget, bd=0, relief="flat")
+            if old_font and family and family != old_font:
+                try:
+                    spec = str(widget.cget("font"))
+                except Exception:
+                    spec = ""
+                if spec.startswith(old_font):
+                    rest = spec[len(old_font):].strip()
+                    new_spec = "{{{0}}} {1}".format(family, rest) if rest else (
+                        "{{{0}}}".format(family)
+                    )
+                    self._ui_style_mark(widget, font=new_spec)
+
+    def _restyle_menus(self):
+        for menu in getattr(self, "_all_menus", []):
+            try:
+                menu.configure(
+                    bg=C_WHITE if UI_VECTOR else C_GRAY,
+                    fg=C_BLACK,
+                    activebackground=C_TEAL,
+                    activeforeground="#FFFFFF" if UI_VECTOR else C_WHITE,
+                )
+            except Exception:
+                pass
+            try:
+                menu.configure(selectcolor=C_WHITE)
+            except Exception:
+                pass
+
+    def _rebuild_banner_style(self):
+        """Recreate the banner so it matches the current style."""
+        banner = getattr(self, "banner", None)
+        if banner is None:
+            return
+        try:
+            banner.destroy()
+        except Exception:
+            pass
+        try:
+            self._build_banner()
+        except Exception:
+            log_debug("banner rebuild failed:\n" + traceback.format_exc())
+            return
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
+        try:
+            self._layout_banner_text()
+            self._refresh_banner_text_colors()
+        except Exception:
+            pass
+        if getattr(self, "_wallpaper_photos", None) is not None:
+            self._schedule_wallpaper_refresh(220)
+
+    def on_choose_ui_style(self, style, palette=None):
+        if str(style).lower() not in UI_STYLES:
+            return
+        target = str(style).lower()
+        palette = str(palette or self.ui_palette or "indigo").lower()
+        if target == self.ui_style and palette == self.ui_palette:
+            return
+        self._apply_ui_style_live(target, palette)
+        try:
+            if self._settings_win is not None:
+                self._settings_win.lift()
+        except Exception:
+            pass
+        want_font = ui_font_for_style(target)
+        if want_font and want_font != UI_FONT:
+            self.say(
+                "字体族换成了 {0}，重启一次启动器后按钮宽度会完全对齐".format(
+                    want_font
+                )
+            )
+
+    def _apply_ui_style_live(self, style, palette=None):
+        """Switch the look of the running window (B0.5, still beta)."""
+        old = {
+            "surface": C_WHITE,
+            "secondary": C_GRAY,
+            "accent": C_TEAL,
+            "text": C_BLACK,
+        }
+        old_font = UI_FONT
+        self._ui_style_restore()
+        new_style, new_palette = set_ui_style(
+            style, palette or self.ui_palette, theme=self.theme
+        )
+        self.ui_style = new_style
+        self.ui_palette = new_palette
+        self.config["ui_style"] = new_style
+        self.config["ui_style_palette"] = new_palette
+        self._save_config()
+        mapping = {
+            old["surface"].upper(): C_WHITE,
+            old["secondary"].upper(): C_GRAY,
+            old["accent"].upper(): C_TEAL,
+            old["text"].upper(): C_BLACK,
+        }
+        if any(key != value for key, value in mapping.items()):
+            self._recolor_widget_tree(self.root, mapping)
+        self._apply_style_tree(UI_VECTOR, old_font)
+        try:
+            self.root.configure(bg=UI_PAGE)
+        except Exception:
+            pass
+        try:
+            self.backdrop.configure(bg=UI_PAGE)
+        except Exception:
+            pass
+        self._restyle_menus()
+        self._rebuild_banner_style()
+        self._style_panel_frames()
+        self._ensure_window_fits()
+        self._schedule_card_refresh(60)
+        try:
+            if getattr(self, "launch_state_label", None) is not None:
+                self._set_launch_state(
+                    self.launch_state_var.get(), self._launch_state_mode
+                )
+        except Exception:
+            pass
+        self.say(
+            "界面风格已切换 // {0}{1}".format(
+                UI_STYLE_LABELS.get(new_style, new_style),
+                "（测试样式）" if new_style == "vector" else "",
+            )
+        )
+
+    def _style_panel_frames(self):
+        """Vector style drops the hard frames, retro keeps the 1985 box."""
+        for panel in self._ui_card_panels():
+            try:
+                if UI_VECTOR:
+                    panel.configure(
+                        bd=0, relief="flat", highlightthickness=0, bg=C_WHITE
+                    )
+                else:
+                    panel.configure(
+                        bd=1, relief="solid", highlightthickness=0, bg=C_WHITE
+                    )
+            except Exception:
+                pass
+
+    def _ui_style_mark(self, widget, **options):
+        """Apply widget options and remember the old ones for a clean revert."""
+        if not hasattr(self, "_ui_style_backup"):
+            self._ui_style_backup = []
+        saved = {}
+        for key in options:
+            try:
+                saved[key] = widget.cget(key)
+            except Exception:
+                pass
+        if saved:
+            self._ui_style_backup.append((widget, saved))
+        try:
+            widget.configure(**options)
+        except Exception:
+            pass
+
+    def _ui_style_restore(self):
+        """Undo every change the previous style made to individual widgets."""
+        backup = getattr(self, "_ui_style_backup", [])
+        self._ui_style_backup = []
+        for widget, saved in backup:
+            try:
+                if not widget.winfo_exists():
+                    continue
+                widget.configure(**saved)
+            except Exception:
+                continue
+
+    def _center_window(self, width, height):
+        if UI_VECTOR:
+            width = max(width, 1040)
+            height = max(height, 720)
+        self.root.update_idletasks()
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        pos_x = max(0, int((screen_w - width) / 2))
+        pos_y = max(0, int((screen_h - height) / 2) - 20)
+        self.root.geometry("{0}x{1}+{2}+{3}".format(width, height, pos_x, pos_y))
+        self.root.minsize(940, 700 if UI_VECTOR else 660)
+
+    def _ensure_window_fits(self):
+        """Grow the window so the current style is not clipped."""
+        try:
+            self.root.update_idletasks()
+            need_w = max(self.root.winfo_reqwidth(), self.root.winfo_width())
+            need_h = max(self.root.winfo_reqheight(), self.root.winfo_height())
+            if UI_VECTOR:
+                need_h = max(need_h, 720)
+            self.root.minsize(940, 700 if UI_VECTOR else 660)
+            if (
+                need_w > self.root.winfo_width()
+                or need_h > self.root.winfo_height()
+            ):
+                self.root.geometry("{0}x{1}".format(need_w, need_h))
+        except Exception:
+            pass
+
+    BANNER_HEIGHT = 40
+
+    def _build_banner(self):
+        """Single line header: soft teal gradient, window mark, version chip."""
+        if UI_VECTOR:
+            self._build_vector_banner()
+            return
+        banner = tk.Canvas(
+            self.root,
+            height=self.BANNER_HEIGHT,
+            bg=C_TEAL,
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=C_BLACK,
+        )
+        banner.grid(row=0, column=0, columnspan=2, sticky="ew", padx=14, pady=(12, 0))
+        self.banner = banner
+        self._banner_sub_text = BANNER_SUBTITLE
+        # vertical gradient + raised bevel (hidden while a wallpaper strip is on)
+        self.banner_bands = []
+        for color in ("#0A6C6C", "#0C7575", "#0E7E7E", "#0C7575", "#0A6C6C"):
+            self.banner_bands.append(
+                banner.create_rectangle(
+                    1, 1, 10, 2, fill=color, outline="", tags="banner_glass"
+                )
+            )
+        self.banner_bevel_top = banner.create_line(
+            1, 1, 10, 1, fill="#7FD2D2", tags="banner_glass"
+        )
+        self.banner_bevel_left = banner.create_line(
+            1, 1, 1, 30, fill="#7FD2D2", tags="banner_glass"
+        )
+        self.banner_bevel_right = banner.create_line(
+            10, 2, 10, 30, fill="#004848", tags="banner_glass"
+        )
+        # window mark: outlined square with a filled core (1985 window icon)
+        self.banner_mark_id = banner.create_rectangle(
+            8, 11, 27, 30, outline=C_WHITE, width=1
+        )
+        self.banner_mark_core_id = banner.create_rectangle(
+            14, 17, 22, 25, outline=C_WHITE, fill=C_WHITE
+        )
+        self.banner_title_id = banner.create_text(
+            35, 20, anchor="w", text=BANNER_TEXT, fill=C_WHITE, font=FONT_BANNER
+        )
+        # engraved separator: light line + dark line
+        self.banner_divider_id = banner.create_line(120, 11, 120, 29, fill="#B4EEEE")
+        self.banner_divider2_id = banner.create_line(122, 11, 122, 29, fill="#004A4A")
+        self.banner_sub_id = banner.create_text(
+            132, 20, anchor="w", text=BANNER_SUBTITLE, fill="#E9FCFC", font=FONT_SMALL
+        )
+        # dotted leader between the subtitle and the version badge
+        self.banner_leader_id = banner.create_line(
+            10, 20, 20, 20, fill="#3F9E9E", dash=(2, 4)
+        )
+        self.banner_chip_id = banner.create_rectangle(
+            10, 11, 20, 29, fill="#0A6464", outline=C_WHITE
+        )
+        self.banner_version_id = banner.create_text(
+            10,
+            20,
+            anchor="e",
+            text=app_version_tag(),
+            fill=C_WHITE,
+            font=FONT_SMALL,
+        )
+        # bottom shelf: 2px white highlight + black hairline
+        self.banner_accent_id = banner.create_rectangle(
+            0, 36, 10, 38, fill=C_WHITE, outline=""
+        )
+        self.banner_rule_id = banner.create_line(0, 39, 10, 39, fill=C_BLACK)
+        banner.bind("<Configure>", self._layout_banner_text)
+        self.banner_sub_label = None
+        self.banner_version_label = None
+        self._banner_has_image = False
+
+    def _banner_fill(self):
+        return "#FFFFFF" if getattr(self, "_banner_has_image", False) else C_WHITE
+
+    def _build_vector_banner(self):
+        """Rounded, borderless hero bar for the vector style (B0.5)."""
+        banner = tk.Canvas(
+            self.root,
+            height=self.BANNER_HEIGHT + 28,
+            bg=UI_PAGE,
+            bd=0,
+            highlightthickness=0,
+        )
+        banner.grid(row=0, column=0, columnspan=2, sticky="ew", padx=14, pady=(12, 0))
+        self.banner = banner
+        self._banner_sub_text = BANNER_SUBTITLE
+        self.banner_bands = []
+        self.banner_bevel_top = None
+        self.banner_bevel_left = None
+        self.banner_bevel_right = None
+        self.banner_accent_id = None
+        self.banner_rule_id = None
+        self.banner_divider2_id = None
+        self.banner_leader_id = None
+        soft = blend_color(C_TEAL, "#FFFFFF", 0.55)
+        light = blend_color(C_TEAL, "#FFFFFF", 0.82)
+        deep = blend_color(C_TEAL, "#000000", 0.18)
+        self.banner_shadow_id = draw_round_rect(
+            banner, 0, 0, 10, 10, 20, fill=UI_SHADOW, outline=""
+        )
+        self.banner_bar_id = draw_round_rect(
+            banner,
+            0,
+            0,
+            10,
+            10,
+            20,
+            fill=C_TEAL,
+            outline=blend_color(C_TEAL, "#FFFFFF", 0.38),
+            width=1,
+        )
+        self.banner_mark_id = draw_round_rect(
+            banner, 9, 12, 30, 33, 7, outline="#FFFFFF", width=2
+        )
+        self.banner_mark_core_id = draw_round_rect(
+            banner, 15, 18, 24, 27, 3, outline="#FFFFFF", fill="#FFFFFF"
+        )
+        self.banner_title_id = banner.create_text(
+            40,
+            20,
+            anchor="w",
+            text=BANNER_TEXT,
+            fill="#FFFFFF",
+            font=FONT_BANNER,
+        )
+        self.banner_divider_id = banner.create_line(120, 12, 120, 28, fill=soft)
+        self.banner_sub_id = banner.create_text(
+            132, 20, anchor="w", text=BANNER_SUBTITLE, fill=light, font=FONT_SMALL
+        )
+        self.banner_chip_id = draw_round_rect(
+            banner,
+            10,
+            11,
+            20,
+            29,
+            11,
+            fill=deep,
+            outline=blend_color(C_TEAL, "#FFFFFF", 0.6),
+        )
+        self.banner_version_id = banner.create_text(
+            10, 20, anchor="e", text=app_version_tag(), fill="#FFFFFF", font=FONT_SMALL
+        )
+        banner.bind("<Configure>", self._layout_banner_text)
+        self.banner_sub_label = None
+        self.banner_version_label = None
+        self._banner_has_image = False
+
+    def _layout_vector_banner(self, event=None):
+        banner = getattr(self, "banner", None)
+        if banner is None:
+            return
+        try:
+            width = int(banner.winfo_width())
+            height = int(banner.winfo_height())
+            pad = 5
+            top = pad
+            bottom = max(top + 34, height - pad - 4)
+            radius = min(26, (bottom - top) // 2)
+            banner.coords(
+                self.banner_shadow_id,
+                *round_rect_points(pad + 2, top + 5, width - pad + 2, bottom + 5, radius)
+            )
+            banner.coords(
+                self.banner_bar_id,
+                *round_rect_points(pad, top, width - pad, bottom, radius)
+            )
+            center = (top + bottom) // 2
+            size = 26
+            banner.coords(
+                self.banner_mark_id,
+                *round_rect_points(
+                    pad + 16, center - size // 2, pad + 16 + size, center + size // 2, 8
+                )
+            )
+            banner.coords(
+                self.banner_mark_core_id,
+                *round_rect_points(pad + 24, center - 5, pad + 33, center + 5, 3)
+            )
+            banner.coords(self.banner_title_id, pad + 16 + size + 12, center)
+            title_box = banner.bbox(self.banner_title_id)
+            offset = (title_box[2] + 18) if title_box else 170
+            offset = min(max(offset, 140), max(170, width - 200))
+            banner.coords(self.banner_divider_id, offset, center - 11, offset, center + 11)
+            right = max(90, width - pad - 18)
+            banner.coords(self.banner_version_id, right, center)
+            box = banner.bbox(self.banner_version_id)
+            if box:
+                banner.coords(
+                    self.banner_chip_id,
+                    *round_rect_points(
+                        box[0] - 13, center - 12, box[2] + 13, center + 12, 12
+                    )
+                )
+                chip_left = box[0] - 15
+            else:
+                chip_left = width - 40
+            available = max(40, chip_left - (offset + 16) - 12)
+            banner.itemconfigure(
+                self.banner_sub_id,
+                text=shorten_text(self._banner_sub_text, max(6, int(available // 7.6))),
+            )
+            banner.coords(self.banner_sub_id, offset + 16, center)
+        except Exception:
+            pass
+
+    def _refresh_banner_text_colors(self):
+        banner = getattr(self, "banner", None)
+        if banner is None:
+            return
+        fill = self._banner_fill()
+        photo = bool(getattr(self, "_banner_has_image", False))
+        try:
+            for item in (
+                getattr(self, "banner_title_id", None),
+                getattr(self, "banner_version_id", None),
+                getattr(self, "banner_mark_core_id", None),
+                getattr(self, "banner_accent_id", None),
+            ):
+                if item is not None:
+                    banner.itemconfigure(item, fill=fill)
+            if getattr(self, "banner_sub_id", None) is not None:
+                banner.itemconfigure(
+                    self.banner_sub_id, fill=fill if photo else "#E9FCFC"
+                )
+            for item in (
+                getattr(self, "banner_mark_id", None),
+                getattr(self, "banner_chip_id", None),
+            ):
+                if item is not None:
+                    banner.itemconfigure(item, outline=fill)
+            if getattr(self, "banner_chip_id", None) is not None:
+                # let the wallpaper show through the chip when a strip is used
+                banner.itemconfigure(
+                    self.banner_chip_id,
+                    fill=""
+                    if photo
+                    else (
+                        blend_color(C_TEAL, "#000000", 0.18)
+                        if UI_VECTOR
+                        else "#0A6464"
+                    ),
+                )
+            if getattr(self, "banner_divider_id", None) is not None:
+                banner.itemconfigure(
+                    self.banner_divider_id, fill=fill if photo else "#9FE2E2"
+                )
+            if getattr(self, "banner_divider2_id", None) is not None:
+                banner.itemconfigure(
+                    self.banner_divider2_id, fill="#000000" if photo else "#004A4A"
+                )
+            if getattr(self, "banner_leader_id", None) is not None:
+                banner.itemconfigure(
+                    self.banner_leader_id,
+                    fill="#FFFFFF" if photo else "#3F9E9E",
+                    state="hidden" if photo else "normal",
+                )
+            state = "hidden" if photo else "normal"
+            for item in getattr(self, "banner_bands", []) or []:
+                banner.itemconfigure(item, state=state)
+            for item in (
+                getattr(self, "banner_bevel_top", None),
+                getattr(self, "banner_bevel_left", None),
+                getattr(self, "banner_bevel_right", None),
+            ):
+                if item is not None:
+                    banner.itemconfigure(item, state=state)
+        except Exception:
+            pass
+
+    def _layout_banner_text(self, event=None):
+        if UI_VECTOR:
+            self._layout_vector_banner(event)
+            return
+        banner = getattr(self, "banner", None)
+        if banner is None:
+            return
+        try:
+            width = int(banner.winfo_width())
+            height = int(banner.winfo_height())
+            top = 2
+            bottom = max(top + 8, height - 6)
+            bands = getattr(self, "banner_bands", []) or []
+            if bands:
+                step = max(1, (bottom - top) // len(bands))
+                for index, item in enumerate(bands):
+                    band_top = top + index * step
+                    band_bottom = (
+                        bottom if index == len(bands) - 1 else band_top + step
+                    )
+                    banner.coords(item, 1, band_top, width - 1, band_bottom)
+            banner.coords(self.banner_bevel_top, 1, 1, width - 1, 1)
+            banner.coords(self.banner_bevel_left, 1, 1, 1, bottom)
+            banner.coords(self.banner_bevel_right, width - 1, 2, width - 1, bottom)
+            center = (top + bottom) // 2
+            banner.coords(self.banner_mark_id, 8, center - 9, 27, center + 10)
+            banner.coords(self.banner_mark_core_id, 14, center - 4, 22, center + 4)
+            banner.coords(self.banner_title_id, 35, center)
+            title_box = banner.bbox(self.banner_title_id)
+            offset = (title_box[2] + 14) if title_box else 150
+            offset = min(max(offset, 120), max(150, width - 170))
+            banner.coords(
+                self.banner_divider_id, offset, center - 9, offset, center + 9
+            )
+            banner.coords(
+                self.banner_divider2_id, offset + 2, center - 9, offset + 2, center + 9
+            )
+            right = max(80, width - 14)
+            banner.coords(self.banner_version_id, right, center)
+            box = banner.bbox(self.banner_version_id)
+            chip_left = width
+            if box:
+                banner.coords(
+                    self.banner_chip_id,
+                    box[0] - 9,
+                    center - 9,
+                    box[2] + 9,
+                    center + 9,
+                )
+                chip_left = box[0] - 11
+            available = max(40, chip_left - (offset + 12) - 8)
+            banner.itemconfigure(
+                self.banner_sub_id,
+                text=shorten_text(self._banner_sub_text, max(6, int(available // 6.4))),
+            )
+            banner.coords(self.banner_sub_id, offset + 12, center)
+            sub_box = banner.bbox(self.banner_sub_id)
+            leader_left = (sub_box[2] + 12) if sub_box else offset + 40
+            leader_right = chip_left - 12
+            if leader_right - leader_left < 8:
+                leader_right = leader_left
+            banner.coords(
+                self.banner_leader_id, leader_left, center, leader_right, center
+            )
+            banner.coords(self.banner_accent_id, 0, height - 4, width, height - 2)
+            banner.coords(self.banner_rule_id, 0, height - 1, width, height - 1)
+        except Exception:
+            pass
+
+    def _build_status_bar(self):
+        divider = tk.Frame(self.root, bg=C_BLACK, height=1, bd=0)
+        divider.grid(row=3, column=0, columnspan=2, sticky="ew", padx=14, pady=(8, 0))
+        bar = tk.Frame(self.root, bg=C_GRAY, bd=1, relief="solid", padx=6, pady=4)
+        bar.grid(row=4, column=0, columnspan=2, sticky="ew", padx=14, pady=(0, 12))
+        bar.columnconfigure(0, weight=1)
+
+        strip = tk.Frame(bar, bg=C_GRAY)
+        strip.grid(row=0, column=0, sticky="ew")
+        strip.columnconfigure(6, weight=1)
+
+        self.launch_state_label = tk.Label(
+            strip,
+            textvariable=self.launch_state_var,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            padx=6,
+            pady=2,
+            bd=1,
+            relief="solid",
+        )
+        self.launch_state_label.grid(row=0, column=0, sticky="w", padx=(0, 5))
+
+        self.chip_mc = self._mk_chip(strip, "MC --")
+        self.chip_mc.grid(row=0, column=1, sticky="w", padx=(0, 5))
+        self.chip_loader = self._mk_chip(strip, "LOADER --")
+        self.chip_loader.grid(row=0, column=2, sticky="w", padx=(0, 5))
+        self.chip_instances = self._mk_chip(strip, "实例 0")
+        self.chip_instances.grid(row=0, column=3, sticky="w", padx=(0, 5))
+        self.chip_playtime = self._mk_chip(strip, "已玩 --")
+        self.chip_playtime.grid(row=0, column=4, sticky="w", padx=(0, 8))
+
+        self.task_bar = tk.Canvas(
+            strip,
+            width=150,
+            height=12,
+            bg=C_WHITE,
+            bd=1,
+            relief="solid",
+            highlightthickness=0,
+        )
+        self.task_bar.grid(row=0, column=5, sticky="w", padx=(0, 6))
+        self.task_bar_fill = self.task_bar.create_rectangle(
+            0, 0, 0, 12, fill=C_TEAL, width=0
+        )
+        self.task_pct_var = tk.StringVar(value="")
+        self.task_pct_label = tk.Label(
+            strip,
+            textvariable=self.task_pct_var,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            width=4,
+        )
+        self.task_pct_label.grid(row=0, column=6, sticky="w")
+        self.task_bar.grid_remove()
+        self.task_pct_label.grid_remove()
+
+        self.speed_var = tk.StringVar(value="")
+        self.speed_label = tk.Label(
+            strip,
+            textvariable=self.speed_var,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="e",
+            padx=5,
+            pady=1,
+            bd=1,
+            relief="solid",
+        )
+        self.speed_label.grid(row=0, column=7, sticky="e")
+        self.speed_label.grid_remove()
+
+        self._abort_btn = self._mk_button(
+            strip,
+            "[ 终止 ]",
+            self.on_abort_task,
+            font=FONT_SMALL,
+            padx=6,
+            pady=2,
+        )
+        self._abort_btn.configure(bg=C_BLACK, fg=C_WHITE)
+        self._abort_btn.grid(row=0, column=8, sticky="e", padx=(6, 0))
+        self._abort_btn.grid_remove()
+
+        label = tk.Label(
+            bar,
+            textvariable=self.status_var,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+            justify="left",
+        )
+        label.grid(row=1, column=0, sticky="ew", pady=(3, 0))
+        self.status_label = label
+
+    def _mk_chip(self, parent, text):
+        return tk.Label(
+            parent,
+            text=text,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            padx=6,
+            pady=2,
+            bd=1,
+            relief="solid",
+        )
+
+    def _refresh_chips(self):
+        try:
+            self.chip_mc.configure(text="MC {0}".format(self.mc_version))
+            self.chip_loader.configure(text=(self.mod_loader or "vanilla").upper())
+            instances = self.config.get("instances")
+            if not isinstance(instances, dict):
+                instances = {}
+            total = sum(
+                int(row.get("play_seconds") or 0)
+                for row in instances.values()
+                if isinstance(row, dict)
+            )
+            self.chip_instances.configure(
+                text="实例 {0}".format(len(self.local_versions))
+            )
+            self.chip_playtime.configure(
+                text="已玩 {0}".format(format_playtime(total) or "--")
+            )
+        except Exception:
+            pass
+
+    def _set_task_progress(self, current=None, total=None, active=None):
+        """Bottom-strip progress bar: pass active=False to hide it."""
+        bar = getattr(self, "task_bar", None)
+        if bar is None:
+            return
+        try:
+            if active is False:
+                bar.grid_remove()
+                self.task_pct_label.grid_remove()
+                self.task_pct_var.set("")
+                return
+            bar.grid()
+            self.task_pct_label.grid()
+            if total and total > 0:
+                ratio = max(0.0, min(1.0, float(current or 0) / float(total)))
+                width = int(bar.winfo_width() - 2) if bar.winfo_width() > 4 else 148
+                bar.coords(self.task_bar_fill, 1, 1, 1 + int(width * ratio), 11)
+                self.task_pct_var.set("{0}%".format(int(ratio * 100)))
+            else:
+                bar.coords(self.task_bar_fill, 1, 1, 30, 11)
+                self.task_pct_var.set("")
+        except Exception:
+            pass
+
+    def _tick_download_stats(self):
+        now = time.time()
+        total = downloaded_bytes()
+        delta = max(0, total - self._dl_last_bytes)
+        elapsed = max(0.001, now - self._dl_last_time)
+        speed = delta / elapsed if delta else 0
+        self._dl_last_bytes = total
+        self._dl_last_time = now
+        try:
+            if speed > 2048:
+                self.speed_var.set(format_speed(speed))
+                self.speed_label.grid()
+            elif speed <= 1:
+                self.speed_var.set("")
+                self.speed_label.grid_remove()
+        except Exception:
+            pass
+        self._refresh_abort_button()
+        if getattr(self, "_closing", False):
+            return
+        try:
+            self._download_tick_job = self.root.after(700, self._tick_download_stats)
+        except Exception:
+            self._download_tick_job = None
+
+    # -- abort / cancel -------------------------------------------------------
+
+    def _task_running(self):
+        """Return the kind of long task currently running ('' when idle)."""
+        if self._vanilla_downloading or self._loader_installing:
+            return "download"
+        if self._busy:
+            return "mods"
+        if self._launching:
+            return "launch"
+        process = self.game_process
+        if process is not None:
+            try:
+                if process.poll() is None:
+                    return "game"
+            except Exception:
+                return ""
+        return ""
+
+    def _refresh_abort_button(self):
+        button = getattr(self, "_abort_btn", None)
+        if button is None:
+            return
+        kind = self._task_running()
+        try:
+            if not kind:
+                button.grid_remove()
+                return
+            label = {
+                "download": "[ 终止下载 ]",
+                "mods": "[ 终止下载 ]",
+                "launch": "[ 终止启动 ]",
+                "game": "[ 结束游戏 ]",
+            }.get(kind, "[ 终止 ]")
+            button.configure(text=label)
+            button.grid()
+        except Exception:
+            pass
+
+    def on_abort_task(self):
+        if self._vanilla_downloading:
+            if not messagebox.askyesno(
+                "终止下载",
+                "原版下载正在进行，确定要终止吗？\n\n"
+                "已经下载好的文件会保留，可以再次开始下载继续。",
+                parent=self.root,
+            ):
+                return
+            self._vanilla_cancel.set()
+            if self._vanilla_status_var is not None:
+                self._vanilla_status_var.set(
+                    "CANCELLING // 正在停止下载，请稍候 ..."
+                )
+            if self._vanilla_cancel_btn is not None:
+                try:
+                    self._vanilla_cancel_btn.configure(state="disabled")
+                except Exception:
+                    pass
+            self.say("已发送终止信号 // 原版下载正在停止")
+            return
+        if self._loader_installing:
+            if not messagebox.askyesno(
+                "终止安装",
+                "模组加载器正在安装，确定要终止吗？",
+                parent=self.root,
+            ):
+                return
+            self._loader_cancel.set()
+            self.say("已发送终止信号 // 加载器安装正在停止")
+            return
+        if self._busy:
+            self._download_cancel.set()
+            self.say("已发送终止信号 // 模组下载正在停止（已完成的保留）")
+            return
+        if self._launching:
+            self._launch_cancel.set()
+            self.say("已发送终止信号 // 启动序列正在停止")
+            return
+        process = self.game_process
+        if process is not None:
+            try:
+                if process.poll() is not None:
+                    return
+            except Exception:
+                return
+            if not messagebox.askyesno(
+                "结束游戏",
+                "Minecraft 正在运行，确定要结束游戏进程吗？\n（未保存的进度可能丢失）",
+                parent=self.root,
+            ):
+                return
+            try:
+                process.terminate()
+                self.say("已发送结束信号 // 游戏进程")
+            except Exception as exc:
+                self.say("结束游戏失败 // {0}".format(exc))
+            return
+        self.say("当前没有可以终止的任务")
+
+
+    def _build_menu(self):
+        menubar = tk.Menu(self.root, tearoff=0, font=self.menu_font)
+        self.root.configure(menu=menubar)
+
+        game_menu = tk.Menu(menubar, tearoff=0, font=self.menu_font)
+        game_menu.add_command(
+            label=tr("game.abort"), command=self.on_abort_task
+        )
+        game_menu.add_command(
+            label=tr("game.detail"),
+            command=lambda: self.on_open_download_detail(),
+        )
+        game_menu.add_separator()
+        game_menu.add_command(
+            label=tr("game.install"),
+            command=self.on_open_vanilla_dialog,
+        )
+        game_menu.add_command(
+            label=tr("game.loader_adv"), command=self.on_open_loader_dialog
+        )
+        game_menu.add_command(label=tr("game.java"), command=self.on_open_java_dialog)
+        game_menu.add_command(label=tr("game.import"), command=self.on_import_modpack)
+        game_menu.add_separator()
+        game_menu.add_command(
+            label=tr("game.instances"), command=self.on_open_instances
+        )
+        game_menu.add_command(
+            label=tr("game.mod_update"), command=self.on_open_mod_updates
+        )
+        game_menu.add_command(
+            label="模组版本体检（拖入 jar）...", command=self.on_open_mod_audit
+        )
+        game_menu.add_separator()
+        version_menu = tk.Menu(game_menu, tearoff=0, font=self.menu_font)
+        for version in MC_VERSION_CHOICES:
+            version_menu.add_radiobutton(
+                label=version,
+                value=version,
+                variable=self.version_var,
+                command=lambda chosen=version: self.on_change_version(chosen),
+            )
+        game_menu.add_cascade(label=tr("game.version"), menu=version_menu)
+        loader_menu = tk.Menu(game_menu, tearoff=0, font=self.menu_font)
+        for label, value in LOADER_CHOICES:
+            loader_menu.add_radiobutton(
+                label=label,
+                value=value,
+                variable=self.loader_var,
+                command=lambda chosen=value: self.on_change_loader(chosen),
+            )
+        game_menu.add_cascade(label=tr("game.loader"), menu=loader_menu)
+        game_menu.add_separator()
+        content_menu = tk.Menu(game_menu, tearoff=0, font=self.menu_font)
+        content_menu.add_command(
+            label=tr("game.shader"),
+            command=lambda: self.on_open_content_dialog("shader"),
+        )
+        content_menu.add_command(
+            label=tr("game.pack"),
+            command=lambda: self.on_open_content_dialog("resourcepack"),
+        )
+        content_menu.add_separator()
+        content_menu.add_command(
+            label=tr("game.open_shaderpacks"),
+            command=lambda: self._open_folder(
+                os.path.join(self.effective_game_dir(), "shaderpacks")
+            ),
+        )
+        content_menu.add_command(
+            label=tr("game.open_resourcepacks"),
+            command=lambda: self._open_folder(
+                os.path.join(self.effective_game_dir(), "resourcepacks")
+            ),
+        )
+        game_menu.add_cascade(label=tr("game.media"), menu=content_menu)
+        game_menu.add_separator()
+        game_menu.add_command(label=tr("game.refresh"), command=self.refresh_hot)
+        game_menu.add_command(label=tr("game.clear"), command=self.on_clear_selection)
+        menubar.add_cascade(label=tr("menu.game"), menu=game_menu)
+
+        account_menu = tk.Menu(menubar, tearoff=0, font=self.menu_font)
+        account_menu.add_command(
+            label=tr("acc.device"), command=self.on_device_login
+        )
+        account_menu.add_command(
+            label=tr("acc.saved"), command=self.on_open_accounts
+        )
+        account_menu.add_separator()
+        account_menu.add_command(
+            label=tr("acc.browser"),
+            command=lambda: self.on_ms_login("browser"),
+        )
+        account_menu.add_command(label=tr("acc.refresh"), command=self.on_refresh_token)
+        account_menu.add_command(label=tr("acc.offline"), command=self.on_offline_mode)
+        account_menu.add_separator()
+        account_menu.add_command(label=tr("acc.uuid"), command=self.on_copy_uuid)
+        account_menu.add_command(label=tr("acc.logout"), command=self.on_logout)
+        menubar.add_cascade(label=tr("menu.account"), menu=account_menu)
+
+        tools_menu = tk.Menu(menubar, tearoff=0, font=self.menu_font)
+        tools_menu.add_command(label=tr("tools.toolbox"), command=self.on_open_toolbox)
+        links_menu = tk.Menu(tools_menu, tearoff=0, font=self.menu_font)
+        for category, name, url, description in TOOLBOX_LINKS:
+            links_menu.add_command(
+                label="{0} // {1}".format(category, name),
+                command=lambda target=url, label=name: self.open_external_url(
+                    target, label
+                ),
+            )
+        tools_menu.add_cascade(label=tr("tools.links"), menu=links_menu)
+        tools_menu.add_command(
+            label=tr("tools.online"), command=self.on_open_online_guide
+        )
+        tools_menu.add_command(label=tr("tools.ip"), command=self.on_copy_local_ip)
+        tools_menu.add_separator()
+        tools_menu.add_command(
+            label=tr("tools.saves"), command=self.on_open_saves
+        )
+        tools_menu.add_command(
+            label=tr("tools.crash"), command=self.on_analyze_crash
+        )
+        tools_menu.add_separator()
+        tools_menu.add_command(label=tr("tools.game_dir"), command=self.on_open_game_dir)
+        tools_menu.add_command(label=tr("tools.mods_dir"), command=self.on_open_mods_dir)
+        tools_menu.add_command(label=tr("tools.logs"), command=self.on_open_logs)
+        menubar.add_cascade(label=tr("menu.tools"), menu=tools_menu)
+
+        mini_menu = tk.Menu(menubar, tearoff=0, font=self.menu_font)
+        mini_menu.add_command(label=tr("mini.snake"), command=self.on_open_snake)
+        mini_menu.add_command(label="2048...", command=self.on_open_2048)
+        mini_menu.add_command(label=tr("mini.mines"), command=self.on_open_minesweeper)
+        mini_menu.add_command(label=tr("mini.tetris"), command=self.on_open_tetris)
+        mini_menu.add_separator()
+        mini_menu.add_command(
+            label=tr("mini.info"), command=self.on_mini_game_info
+        )
+        self._mini_game_var = tk.BooleanVar(
+            value=bool(self.config.get("mini_game_prompt", True))
+        )
+        mini_menu.add_checkbutton(
+            label=tr("mini.toggle"),
+            variable=self._mini_game_var,
+            command=self._toggle_mini_game_prompt,
+        )
+        mini_menu.add_command(label=tr("mini.close"), command=self._close_snake_prompt)
+        mini_menu.add_separator()
+        mini_menu.add_command(
+            label=tr("mini.reset"), command=self.on_reset_game_bests
+        )
+        menubar.add_cascade(label=tr("menu.minigame"), menu=mini_menu)
+
+        settings_menu = tk.Menu(menubar, tearoff=0, font=self.menu_font)
+        settings_menu.add_command(
+            label=tr("set.appearance"), command=self.on_open_settings
+        )
+        settings_menu.add_command(
+            label=tr("set.wallpaper"), command=self.on_pick_wallpaper
+        )
+        settings_menu.add_command(
+            label=tr("set.clear_wallpaper"), command=self.on_clear_wallpaper
+        )
+        source_menu = tk.Menu(settings_menu, tearoff=0, font=self.menu_font)
+        for text, value in VANILLA_SOURCE_CHOICES:
+            source_menu.add_radiobutton(
+                label=text,
+                value=value,
+                variable=self._source_var,
+                command=lambda chosen=value: self.on_change_download_source(chosen),
+            )
+        settings_menu.add_cascade(label=tr("set.source"), menu=source_menu)
+        language_menu = tk.Menu(settings_menu, tearoff=0, font=self.menu_font)
+        self._language_var = tk.StringVar(
+            value=str(self.config.get("language") or current_language())
+        )
+        for code, label in LANGUAGE_CHOICES:
+            language_menu.add_radiobutton(
+                label=label,
+                value=code,
+                variable=self._language_var,
+                command=lambda chosen=code: self.on_change_language(chosen),
+            )
+        settings_menu.add_cascade(label=tr("set.language"), menu=language_menu)
+        settings_menu.add_command(
+            label="打开语言包目录", command=self.on_open_lang_dir
+        )
+        settings_menu.add_command(
+            label="重新加载语言包", command=self.on_reload_lang_packs
+        )
+        settings_menu.add_command(
+            label="导出未翻译文本...", command=self.on_export_untranslated
+        )
+        settings_menu.add_command(label=tr("set.reset_theme"), command=self.on_reset_theme)
+        settings_menu.add_separator()
+        settings_menu.add_command(label=tr("set.update"), command=self.on_check_updates)
+        settings_menu.add_command(
+            label=tr("set.update_settings"), command=self.on_update_settings
+        )
+        settings_menu.add_separator()
+        settings_menu.add_command(
+            label=tr("set.reload"), command=self.on_reload_config
+        )
+        settings_menu.add_command(
+            label=tr("set.open_config"), command=self.on_open_config_file
+        )
+        menubar.add_cascade(label=tr("menu.settings"), menu=settings_menu)
+
+        about_menu = tk.Menu(menubar, tearoff=0, font=self.menu_font)
+        about_menu.add_command(label=tr("about.about"), command=self.on_about)
+        about_menu.add_command(label=tr("about.diag"), command=self.on_diag)
+        about_menu.add_command(label=tr("about.open"), command=self.on_open_base_dir)
+        about_menu.add_separator()
+        about_menu.add_command(
+            label=tr("about.donate"), command=self.show_donate_dialog
+        )
+        about_menu.add_command(label=tr("about.afdian"), command=self._open_afdian)
+        about_menu.add_separator()
+        about_menu.add_command(
+            label=tr("about.dep"),
+            command=self.on_install_dependency,
+        )
+        about_menu.add_command(label=tr("about.quit"), command=self.on_close)
+        menubar.add_cascade(label=tr("menu.about"), menu=about_menu)
+
+
+        self._all_menus = [
+            menubar,
+            game_menu,
+            version_menu,
+            loader_menu,
+            content_menu,
+            account_menu,
+            tools_menu,
+            links_menu,
+            mini_menu,
+            settings_menu,
+            source_menu,
+            about_menu,
+        ]
+
+
+    def _build_left_panel(self, parent):
+        panel = tk.Frame(parent, bg=C_WHITE, bd=1, relief="solid", padx=8, pady=8)
+        panel.grid(row=1, column=0, sticky="new", padx=(14, 6), pady=(10, 0))
+        panel.columnconfigure(0, weight=1)
+        self.left_panel = panel
+        self._build_glass_canvas(panel, "left")
+
+        self._mk_title(panel, tr("ui.control")).grid(
+            row=0, column=0, sticky="ew", pady=(0, 6)
+        )
+
+        account_box = tk.Frame(panel, bg=C_WHITE)
+        account_box.grid(row=1, column=0, sticky="ew")
+        account_box.columnconfigure(1, weight=1)
+
+        self.avatar_label = tk.Label(
+            account_box,
+            text="AKM",
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            bd=1,
+            relief="solid",
+            cursor="hand2",
+        )
+        self.avatar_label.grid(row=0, column=0, rowspan=2, sticky="nw", padx=(0, 8))
+        self.avatar_label.bind("<Button-1>", self._on_avatar_click)
+
+        self.commander_label = tk.Label(
+            account_box,
+            text=tr("ui.offline"),
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+            justify="left",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        )
+        self.commander_label.grid(row=0, column=1, sticky="ew")
+
+        self.identity_label = tk.Label(
+            account_box,
+            text="",
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            padx=6,
+            pady=3,
+            wraplength=270,
+        )
+        self.identity_label.grid(row=1, column=1, sticky="ew", pady=(4, 0))
+
+        ign_row = tk.Frame(panel, bg=C_WHITE)
+        ign_row.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        ign_row.columnconfigure(1, weight=1)
+        tk.Label(
+            ign_row,
+            text="IGN",
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            padx=4,
+        ).grid(row=0, column=0, sticky="w")
+
+        self.name_entry = tk.Entry(
+            ign_row,
+            textvariable=self.name_var,
+            width=14,
+            font=FONT_MAIN,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            insertbackground=C_BLACK,
+            relief="solid",
+            bd=1,
+            highlightthickness=0,
+            disabledbackground=C_GRAY,
+            disabledforeground=C_BLACK,
+        )
+        self.name_entry.grid(row=0, column=1, sticky="ew", ipady=3, ipadx=4)
+        self.name_entry.bind("<Return>", lambda _event: self.on_ignite())
+        self.name_entry.bind("<KeyRelease>", self._update_uuid_preview)
+
+        self.uuid_preview_label = tk.Label(
+            ign_row,
+            text="UUID -",
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            padx=4,
+        )
+        self.uuid_preview_label.grid(row=0, column=2, sticky="w", padx=(4, 0))
+
+        self.btn_login = self._mk_button(
+            ign_row,
+            tr("ui.login"),
+            self.on_device_login,
+            font=FONT_SMALL,
+            padx=4,
+            pady=2,
+        )
+        self.btn_login.grid(row=0, column=3, padx=(6, 0))
+
+        version_header = tk.Frame(panel, bg=C_WHITE)
+        version_header.grid(row=4, column=0, sticky="ew", pady=(8, 2))
+        version_header.columnconfigure(0, weight=1)
+        self.version_info_var = tk.StringVar(value="VERSION // AUTO")
+        self.version_info_label = tk.Label(
+            version_header,
+            textvariable=self.version_info_var,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+        )
+        self.version_info_label.grid(row=0, column=0, sticky="ew")
+        self.btn_ver_refresh = self._mk_button(
+            version_header,
+            tr("ui.refresh"),
+            self.refresh_versions,
+            font=FONT_SMALL,
+            padx=4,
+            pady=1,
+        )
+        self.btn_ver_refresh.grid(row=0, column=1, padx=(4, 0))
+        self.btn_ver_browse = self._mk_button(
+            version_header,
+            tr("ui.browse"),
+            self.on_browse_game_dir,
+            font=FONT_SMALL,
+            padx=4,
+            pady=1,
+        )
+        self.btn_ver_browse.grid(row=0, column=2, padx=(4, 0))
+
+        version_frame = tk.Frame(panel, bg=C_WHITE, bd=1, relief="solid")
+        version_frame.grid(row=5, column=0, sticky="ew")
+        version_frame.columnconfigure(0, weight=1)
+        self.version_listbox = tk.Listbox(
+            version_frame,
+            selectmode="browse",
+            height=3,
+            width=30,
+            font=FONT_MAIN,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            selectbackground=C_TEAL,
+            selectforeground=C_WHITE,
+            activestyle="none",
+            exportselection=False,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            yscrollcommand=self._version_scroll_set,
+        )
+        self.version_listbox.grid(row=0, column=0, sticky="ew", padx=(2, 0), pady=2)
+        self.version_listbox.bind("<<ListboxSelect>>", self.on_version_select)
+        self.version_scrollbar = tk.Scrollbar(
+            version_frame,
+            orient="vertical",
+            command=self.version_listbox.yview,
+            width=14,
+            bg=C_GRAY,
+            activebackground=C_TEAL,
+            troughcolor=C_WHITE,
+            bd=1,
+            relief="solid",
+            highlightthickness=0,
+        )
+        self.version_scrollbar.grid(row=0, column=1, sticky="ns")
+
+        self._isolation_var = tk.BooleanVar(
+            value=bool(self.config.get("version_isolation"))
+        )
+        bottom_row = tk.Frame(panel, bg=C_WHITE)
+        bottom_row.grid(row=6, column=0, sticky="ew", pady=(6, 0))
+        bottom_row.columnconfigure(0, weight=1)
+        isolation_box = tk.Frame(bottom_row, bg=C_GRAY, bd=1, relief="solid")
+        isolation_box.grid(row=0, column=0, sticky="w")
+        tk.Checkbutton(
+            isolation_box,
+            text=tr("ui.isolation"),
+            variable=self._isolation_var,
+            command=self.on_toggle_isolation,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            activebackground=C_GRAY,
+            activeforeground=C_BLACK,
+            selectcolor=C_WHITE,
+            font=FONT_SMALL,
+            anchor="w",
+            highlightthickness=0,
+            bd=0,
+            takefocus=0,
+            cursor="hand2",
+        ).pack(side="left", fill="x", padx=2, pady=2)
+
+        self.btn_offline = self._mk_button(
+            bottom_row,
+            tr("ui.logout"),
+            self.on_logout,
+            font=FONT_SMALL,
+            padx=4,
+            pady=3,
+        )
+        self.btn_offline.grid(row=0, column=1, padx=(6, 0))
+
+        self.btn_sponsor = self._mk_button(
+            bottom_row,
+            tr("ui.sponsor"),
+            self.show_donate_dialog,
+            font=FONT_SMALL,
+            padx=4,
+            pady=3,
+        )
+        self.btn_sponsor.grid(row=0, column=2, padx=(4, 0))
+
+        installer_row = tk.Frame(panel, bg=C_WHITE)
+        installer_row.grid(row=7, column=0, sticky="ew", pady=(6, 0))
+        installer_row.columnconfigure(0, weight=1, uniform="installer")
+        installer_row.columnconfigure(1, weight=1, uniform="installer")
+        self.btn_vanilla = self._mk_button(
+            installer_row,
+            tr("ui.install_btn"),
+            self.on_open_vanilla_dialog,
+            pady=5,
+        )
+        self.btn_vanilla.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        self.btn_loader = self._mk_button(
+            installer_row,
+            tr("ui.loader_btn"),
+            lambda: self.on_open_vanilla_dialog("fabric"),
+            pady=5,
+        )
+        self.btn_loader.grid(row=0, column=1, sticky="ew", padx=(3, 0))
+
+        self.btn_ignite = self._mk_button(
+            panel, tr("ui.ignite"), self.on_ignite, font=FONT_BIG, pady=10
+        )
+        self.btn_ignite.grid(row=8, column=0, sticky="ew", pady=(8, 0))
+
+    def _version_scroll_set(self, first, last):
+        self.version_scrollbar.set(first, last)
+
+    def _refresh_version_info(self, version_id=None):
+        if version_id is None:
+            picked = ""
+            if self.version_listbox is not None:
+                selection = self.version_listbox.curselection()
+                if selection:
+                    index = int(selection[0])
+                    if 0 <= index < len(self.version_rows):
+                        picked = self.version_rows[index]
+            version_id = picked or str(self.config.get("launch_version") or "")
+        if not version_id:
+            text = "VERSION // AUTO ({0})".format(self.mc_version)
+            if self.isolation_enabled():
+                text = "VERSION // AUTO // 隔离需先选具体版本"
+            self.version_info_var.set(text)
+            return
+        text = "VERSION // {0}".format(version_id)
+        if self.isolation_enabled():
+            text += " // ISO"
+        row = self._instance_row(version_id)
+        played = format_playtime(int(row.get("play_seconds") or 0))
+        last = relative_time(int(row.get("last_played") or 0))
+        extra = []
+        if played:
+            extra.append("累计 {0}".format(played))
+        if last:
+            extra.append("上次 {0}".format(last))
+        if extra:
+            text += "  ·  " + " · ".join(extra)
+        if len(text) > 38:
+            text = text[:37] + "\u2026"
+        self.version_info_var.set(text)
+
+    def _format_version_row(self, version_id):
+        lowered = str(version_id).lower()
+        if lowered.startswith("fabric-loader-"):
+            tag = "[FABRIC]"
+        elif lowered.startswith("quilt-loader-"):
+            tag = "[QUILT]"
+        elif "neoforge" in lowered:
+            tag = "[NEOFRG]"
+        elif "forge" in lowered:
+            tag = "[FORGE]"
+        else:
+            tag = "[VANILLA]"
+        played = self._instance_playtime_text(version_id)
+        suffix = "  ·  {0}".format(played) if played else ""
+        return "{0} {1}{2}".format(tag, version_id, suffix)
+
+    def refresh_versions(self):
+        versions = list_local_versions(self.mc_dir)
+        self.local_versions = versions
+        self._updating_versions = True
+        try:
+            self.version_listbox.delete(0, tk.END)
+            self.version_rows = [""]
+            self.version_listbox.insert(
+                tk.END,
+                "[AUTO] 自动安装 / 匹配 {0}".format(self.mc_version),
+            )
+            for version_id in versions:
+                self.version_rows.append(version_id)
+                self.version_listbox.insert(tk.END, self._format_version_row(version_id))
+            selected = str(self.config.get("launch_version") or "")
+            if selected and selected in self.version_rows:
+                index = self.version_rows.index(selected)
+            else:
+                index = 0
+                if selected:
+                    self.config["launch_version"] = ""
+                    self._save_config()
+            self.version_listbox.selection_clear(0, tk.END)
+            self.version_listbox.selection_set(index)
+            self.version_listbox.activate(index)
+            self.version_listbox.see(index)
+            self._set_version_info(index, persist=False)
+        finally:
+            self._updating_versions = False
+        self._refresh_version_bar()
+        self._refresh_chips()
+        self.say(
+            "版本档案: {0} 个本地版本 // {1}".format(len(versions), self.mc_dir)
+        )
+
+    def _set_version_info(self, index, persist=True):
+        if 0 <= index < len(self.version_rows):
+            version_id = self.version_rows[index]
+        else:
+            version_id = ""
+        if version_id:
+            self._refresh_version_info(version_id)
+        else:
+            self._refresh_version_info("")
+        if not persist:
+            return
+        self.config["launch_version"] = version_id
+        self.config["minecraft_dir"] = self.mc_dir
+        changed = False
+        if version_id:
+            parsed = parse_version_id(version_id, self.mc_dir)
+            guess = str(parsed.get("mc") or "")
+            if guess and guess != self.mc_version:
+                self.config["mc_version"] = guess
+                self.config["loader_version"] = ""
+                self.version_var.set(guess)
+                changed = True
+            loader = str(parsed.get("loader") or "").lower()
+            if loader and loader != self.mod_loader:
+                self.config["loader"] = loader
+                self.config["loader_version"] = str(
+                    parsed.get("loader_version") or ""
+                )
+                self.loader_var.set(loader)
+                changed = True
+            if changed:
+                self._update_window_title()
+                self._refresh_shelf_label()
+                self.refresh_hot()
+        self._save_config()
+        if version_id:
+            self.say("点火目标已锁定: {0}".format(version_id))
+        else:
+            self.say("点火目标: 自动模式")
+        self._refresh_version_bar()
+
+    def on_version_select(self, _event=None):
+        if self._updating_versions or self._vanilla_downloading or self._loader_installing:
+            return
+        selection = self.version_listbox.curselection()
+        index = int(selection[0]) if selection else 0
+        self._set_version_info(index, persist=True)
+
+    def on_browse_game_dir(self):
+        if self._vanilla_downloading or self._loader_installing:
+            messagebox.showwarning(
+                "安装进行中",
+                "安装期间不能切换游戏目录，请先取消下载。",
+                parent=self.root,
+            )
+            return
+        initial = self.mc_dir if os.path.isdir(self.mc_dir) else "D:\\"
+        try:
+            selected = filedialog.askdirectory(
+                parent=self.root,
+                title="选择 .Minecraft 游戏目录或 versions 文件夹",
+                initialdir=initial,
+                mustexist=True,
+            )
+        except Exception as exc:
+            messagebox.showerror("浏览失败", str(exc), parent=self.root)
+            return
+        if not selected:
+            return
+        path = os.path.abspath(selected)
+        picked_version = ""
+        if os.path.basename(path).lower() == "versions":
+            candidate = os.path.dirname(path)
+        elif os.path.basename(os.path.dirname(path)).lower() == "versions":
+            candidate = os.path.dirname(os.path.dirname(path))
+            picked_version = os.path.basename(path)
+        else:
+            candidate = path
+        if not os.path.isdir(os.path.join(candidate, "versions")):
+            confirmed = messagebox.askyesno(
+                "目录确认",
+                "所选目录下没有 versions 文件夹：\n{0}\n\n"
+                "仍将其设为游戏目录吗？\n"
+                "（点火时会自动创建并安装核心）".format(candidate),
+                parent=self.root,
+            )
+            if not confirmed:
+                return
+        self.mc_dir = candidate
+        self.mods_dir = os.path.join(candidate, "mods")
+        ensure_dir(self.mods_dir)
+        self.config["minecraft_dir"] = candidate
+        self.config["launch_version"] = picked_version
+        self._save_config()
+        self._update_window_title()
+        self.refresh_versions()
+        self.refresh_hot()
+        self.say("游戏目录已切换: {0}".format(candidate))
+
+    # -- download detail window ----------------------------------------------
+
+    def on_open_download_detail(self, title=None):
+        """Show the live file list of the running install (PCL/HMCL style)."""
+        win = self._detail_win
+        if win is not None:
+            try:
+                if win.winfo_exists():
+                    win.deiconify()
+                    win.lift()
+                    win.focus_force()
+                    return win
+            except Exception:
+                pass
+            self._detail_win = None
+
+        win = tk.Toplevel(self.root)
+        win.title(tr("dl.title"))
+        win.configure(bg=C_WHITE)
+        win.transient(self.root)
+        win.protocol("WM_DELETE_WINDOW", self._close_download_detail)
+        win.resizable(True, True)
+
+        wrap = tk.Frame(win, bg=C_WHITE, bd=1, relief="solid", padx=10, pady=10)
+        wrap.pack(fill="both", expand=True, padx=8, pady=8)
+
+        tk.Label(
+            wrap,
+            text=tr("dl.title"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        ).pack(fill="x")
+
+        self._detail_task_var = tk.StringVar(value="TASK // 等待任务")
+        tk.Label(
+            wrap,
+            textvariable=self._detail_task_var,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+        ).pack(fill="x", pady=(6, 0))
+
+        self._detail_summary_var = tk.StringVar(value="PHASE // IDLE")
+        tk.Label(
+            wrap,
+            textvariable=self._detail_summary_var,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            padx=6,
+            pady=3,
+            bd=1,
+            relief="solid",
+            wraplength=680,
+        ).pack(fill="x", pady=(4, 0))
+
+        text_frame = tk.Frame(wrap, bg=C_WHITE, bd=1, relief="solid")
+        text_frame.pack(fill="both", expand=True, pady=(6, 0))
+        self._detail_text = tk.Text(
+            text_frame,
+            height=15,
+            width=72,
+            font=FONT_SMALL,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            wrap="none",
+        )
+        self._detail_text.pack(
+            side="left", fill="both", expand=True, padx=(4, 0), pady=4
+        )
+        detail_scroll = tk.Scrollbar(
+            text_frame,
+            orient="vertical",
+            command=self._detail_text.yview,
+            width=14,
+            bg=C_GRAY,
+            activebackground=C_TEAL,
+            troughcolor=C_WHITE,
+            bd=1,
+            relief="solid",
+            highlightthickness=0,
+        )
+        detail_scroll.pack(side="right", fill="y")
+        self._detail_text.configure(yscrollcommand=detail_scroll.set)
+        self._detail_text.configure(state="disabled")
+
+        row = tk.Frame(wrap, bg=C_WHITE)
+        row.pack(fill="x", pady=(8, 0))
+        self._mk_button(
+            row, tr("dl.copy"), self._copy_download_detail
+        ).pack(side="left", expand=True, fill="x", padx=2)
+        self._mk_button(
+            row, tr("inst.close"), self._close_download_detail
+        ).pack(side="left", expand=True, fill="x", padx=2)
+
+        self._detail_win = win
+        if title:
+            try:
+                DOWNLOAD_MONITOR.set_notes(str(title))
+            except Exception:
+                pass
+        self._detail_job = None
+        self._download_detail_tick()
+        win.update_idletasks()
+        pos_x = self.root.winfo_rootx() + 40
+        pos_y = self.root.winfo_rooty() + 40
+        win.geometry("+{0}+{1}".format(pos_x, pos_y))
+        win.minsize(620, 440)
+        return win
+
+    def _download_detail_tick(self):
+        win = self._detail_win
+        if win is None:
+            return
+        try:
+            if not win.winfo_exists():
+                self._detail_win = None
+                return
+        except Exception:
+            self._detail_win = None
+            return
+        try:
+            self._render_download_detail(DOWNLOAD_MONITOR.snapshot())
+        except Exception:
+            log_debug("download detail render failed:\n" + traceback.format_exc())
+        try:
+            self._detail_job = win.after(350, self._download_detail_tick)
+        except Exception:
+            self._detail_job = None
+
+    def _render_download_detail(self, snap):
+        phase, current, total, detail = snap["phase"]
+        phase_label = VANILLA_PHASE_LABELS.get(
+            phase, phase.upper() if phase else "IDLE"
+        )
+        if phase == "loader":
+            phase_label = "MOD LOADER"
+        if self._detail_task_var is not None:
+            self._detail_task_var.set(
+                "TASK // {0}".format(snap["title"] or "等待任务")
+            )
+        counts = snap["counts"]
+        if total:
+            counter = "{0} / {1}".format(current, total)
+        elif detail:
+            counter = str(detail)[:60]
+        else:
+            counter = "-"
+        if self._detail_summary_var is not None:
+            self._detail_summary_var.set(
+                "PHASE // {0}   {1}   速度 {2}/s   已用 {3:.0f}s   "
+                "新下载 {4} / 缓存 {5} / 失败 {6}".format(
+                    phase_label,
+                    counter,
+                    format_bytes(snap["speed"]),
+                    snap["elapsed"],
+                    counts.get("done", 0),
+                    counts.get("cached", 0),
+                    counts.get("failed", 0),
+                )
+            )
+
+        lines = []
+        for row in snap["active"]:
+            size = int(row.get("size") or 0)
+            done = int(row.get("done") or 0)
+            label = str(row.get("label") or "")[:52]
+            if size > 0:
+                bar = ascii_progress_bar(done, size, 14)
+                amount = "{0}/{1}".format(format_bytes(done), format_bytes(size))
+            else:
+                bar = "[" + "." * 14 + "]   ?"
+                amount = format_bytes(done) if done else "?"
+            lines.append("{0}  {1:>15}  {2}".format(bar, amount, label))
+        if not lines:
+            lines.append("(当前没有正在传输的文件，等待队列中 ...)")
+        if snap.get("queued"):
+            lines.append("... 另外 {0} 个文件在后台并发下载".format(snap["queued"]))
+        if snap.get("notes"):
+            lines.append("")
+            lines.append(str(snap["notes"]))
+        recent = snap.get("recent") or []
+        if recent:
+            lines.append("")
+            lines.append("最近完成 //")
+            for row in reversed(recent):
+                lines.append(
+                    "  [{0:<7}] {1:<52} {2}".format(
+                        str(row.get("status") or "").upper(),
+                        str(row.get("label") or "")[:52],
+                        format_bytes(row.get("size") or 0),
+                    )
+                )
+        text = "\n".join(lines)
+        self._detail_clipboard = text
+        widget = self._detail_text
+        if widget is None:
+            return
+        try:
+            position = widget.yview()[0]
+            widget.configure(state="normal")
+            widget.delete("1.0", tk.END)
+            widget.insert("1.0", text)
+            widget.configure(state="disabled")
+            widget.yview_moveto(position)
+        except Exception:
+            pass
+
+    def _copy_download_detail(self):
+        text = self._detail_clipboard or ""
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.say("下载清单已复制到剪贴板 ({0} 行)".format(text.count("\n") + 1))
+        except Exception as exc:
+            self.say("复制失败: {0}".format(exc))
+
+    def _close_download_detail(self):
+        job = self._detail_job
+        self._detail_job = None
+        win = self._detail_win
+        self._detail_win = None
+        self._detail_text = None
+        self._detail_task_var = None
+        self._detail_summary_var = None
+        if win is not None:
+            try:
+                if job is not None:
+                    win.after_cancel(job)
+            except Exception:
+                pass
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+    # -- vanilla installer dialog -------------------------------------------
+
+    def on_open_vanilla_dialog(self, preselect_loader=None):
+        preset = str(preselect_loader or "").lower()
+        if preset not in LOADER_LABELS:
+            preset = ""
+        if self._vanilla_downloading or self._loader_installing:
+            messagebox.showinfo(
+                "安装进行中",
+                "请等待当前安装结束，或先在浮窗中取消。",
+                parent=self.root,
+            )
+            return
+        if self._vanilla_win is not None:
+            try:
+                self._vanilla_win.deiconify()
+                self._vanilla_win.lift()
+                self._vanilla_win.focus_force()
+                if preset and self._vanilla_loader_var is not None:
+                    self._vanilla_loader_var.set(preset)
+                    self._vanilla_on_loader_change()
+                return
+            except Exception:
+                self._vanilla_win = None
+
+        win = tk.Toplevel(self.root)
+        win.title(tr("inst.title") + " // " + tr("menu.game"))
+        win.configure(bg=C_WHITE)
+        win.transient(self.root)
+        win.protocol("WM_DELETE_WINDOW", self._vanilla_cancel_or_close)
+        win.resizable(True, True)
+
+        wrap = tk.Frame(win, bg=C_WHITE, bd=1, relief="solid", padx=10, pady=10)
+        wrap.pack(fill="both", expand=True, padx=8, pady=8)
+
+        tk.Label(
+            wrap,
+            text=tr("inst.title"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        ).pack(fill="x")
+
+        source_box = tk.Frame(wrap, bg=C_WHITE)
+        source_box.pack(fill="x", pady=(8, 2))
+        tk.Label(
+            source_box,
+            text=tr("inst.source"),
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+        ).pack(fill="x")
+        radio_row = tk.Frame(source_box, bg=C_WHITE)
+        radio_row.pack(fill="x", pady=(2, 0))
+        source_default = str(
+            self.config.get("download_source") or "auto"
+        ).lower()
+        if source_default not in {"auto", "official", "mirror"}:
+            source_default = "auto"
+        self._vanilla_source_var = tk.StringVar(value=source_default)
+        for text, value in VANILLA_SOURCE_CHOICES:
+            tk.Radiobutton(
+                radio_row,
+                text=text,
+                value=value,
+                variable=self._vanilla_source_var,
+                bg=C_WHITE,
+                fg=C_BLACK,
+                activebackground=C_GRAY,
+                activeforeground=C_BLACK,
+                selectcolor=C_WHITE,
+                font=FONT_MAIN,
+                anchor="w",
+                highlightthickness=0,
+                bd=0,
+            ).pack(side="left", padx=(0, 12))
+
+        tk.Label(
+            wrap,
+            text=tr("inst.target"),
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+        ).pack(fill="x", pady=(8, 2))
+        self._vanilla_version_var = tk.StringVar(value=self.mc_version)
+        version_entry = tk.Entry(
+            wrap,
+            textvariable=self._vanilla_version_var,
+            font=FONT_MAIN,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            insertbackground=C_BLACK,
+            relief="solid",
+            bd=1,
+            highlightthickness=0,
+        )
+        version_entry.pack(fill="x", ipady=4, ipadx=4)
+        version_entry.bind("<Return>", lambda _event: self._vanilla_start())
+
+        list_frame = tk.Frame(wrap, bg=C_WHITE, bd=1, relief="solid")
+        list_frame.pack(fill="both", expand=True, pady=(6, 0))
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+        self._vanilla_version_list = tk.Listbox(
+            list_frame,
+            height=6,
+            selectmode="browse",
+            font=FONT_MAIN,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            selectbackground=C_TEAL,
+            selectforeground=C_WHITE,
+            activestyle="none",
+            exportselection=False,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+        )
+        self._vanilla_version_list.grid(
+            row=0, column=0, sticky="nsew", padx=(2, 0), pady=2
+        )
+        self._vanilla_version_list.bind(
+            "<<ListboxSelect>>", self._vanilla_select_version
+        )
+        vanilla_scroll = tk.Scrollbar(
+            list_frame,
+            orient="vertical",
+            command=self._vanilla_version_list.yview,
+            width=14,
+            bg=C_GRAY,
+            activebackground=C_TEAL,
+            troughcolor=C_WHITE,
+            bd=1,
+            relief="solid",
+            highlightthickness=0,
+        )
+        vanilla_scroll.grid(row=0, column=1, sticky="ns")
+        self._vanilla_version_list.configure(yscrollcommand=vanilla_scroll.set)
+
+        content_box = tk.Frame(wrap, bg=C_WHITE)
+        content_box.pack(fill="x", pady=(8, 0))
+        tk.Label(
+            content_box,
+            text=tr("inst.content"),
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+        ).pack(fill="x")
+        content_row = tk.Frame(content_box, bg=C_WHITE)
+        content_row.pack(fill="x", pady=(2, 0))
+        self._vanilla_loader_var = tk.StringVar(value=preset or "vanilla")
+        for loader_id, text in [("vanilla", tr("inst.only_vanilla"))] + [
+            (lid, LOADER_LABELS[lid]) for lid in LOADER_INSTALL_ORDER
+        ]:
+            tk.Radiobutton(
+                content_row,
+                text=text,
+                value=loader_id,
+                variable=self._vanilla_loader_var,
+                command=self._vanilla_on_loader_change,
+                bg=C_WHITE,
+                fg=C_BLACK,
+                activebackground=C_GRAY,
+                activeforeground=C_BLACK,
+                selectcolor=C_WHITE,
+                font=FONT_MAIN,
+                anchor="w",
+                highlightthickness=0,
+                bd=0,
+            ).pack(side="left", padx=(0, 10))
+        self._vanilla_detail_btn = self._mk_button(
+            content_row,
+            tr("inst.detail"),
+            lambda: self.on_open_download_detail(),
+        )
+        self._vanilla_detail_btn.pack(side="right")
+
+        loader_box = tk.Frame(wrap, bg=C_WHITE)
+        loader_box.pack(fill="x", pady=(6, 0))
+        self._vanilla_loader_hint = tk.StringVar(
+            value=tr("inst.loader_none")
+        )
+        tk.Label(
+            loader_box,
+            textvariable=self._vanilla_loader_hint,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+        ).pack(fill="x")
+        loader_list_frame = tk.Frame(loader_box, bg=C_WHITE, bd=1, relief="solid")
+        loader_list_frame.pack(fill="x", pady=(2, 0))
+        self._vanilla_loader_list = tk.Listbox(
+            loader_list_frame,
+            height=3,
+            selectmode="browse",
+            font=FONT_SMALL,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            selectbackground=C_TEAL,
+            selectforeground=C_WHITE,
+            activestyle="none",
+            exportselection=False,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            state="disabled",
+        )
+        self._vanilla_loader_list.pack(
+            side="left", fill="both", expand=True, padx=(2, 0), pady=2
+        )
+        loader_scroll = tk.Scrollbar(
+            loader_list_frame,
+            orient="vertical",
+            command=self._vanilla_loader_list.yview,
+            width=14,
+            bg=C_GRAY,
+            activebackground=C_TEAL,
+            troughcolor=C_WHITE,
+            bd=1,
+            relief="solid",
+            highlightthickness=0,
+        )
+        loader_scroll.pack(side="right", fill="y")
+        self._vanilla_loader_list.configure(yscrollcommand=loader_scroll.set)
+
+        self._vanilla_manifest_var = tk.StringVar(value="MANIFEST // LOADING ...")
+        tk.Label(
+            wrap,
+            textvariable=self._vanilla_manifest_var,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+        ).pack(fill="x", pady=(4, 0))
+
+        self._vanilla_status_var = tk.StringVar(
+            value="READY // 选择版本后开始下载"
+        )
+        tk.Label(
+            wrap,
+            textvariable=self._vanilla_status_var,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            wraplength=600,
+        ).pack(fill="x", pady=(6, 0))
+        self._vanilla_progress_var = tk.StringVar(value=ascii_progress_bar(0, 0))
+        tk.Label(
+            wrap,
+            textvariable=self._vanilla_progress_var,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        ).pack(fill="x", pady=(4, 0))
+
+        button_row = tk.Frame(wrap, bg=C_WHITE)
+        button_row.pack(fill="x", pady=(8, 0))
+        self._vanilla_refresh_btn = self._mk_button(
+            button_row, tr("inst.refresh"), self._vanilla_fetch_manifest
+        )
+        self._vanilla_refresh_btn.pack(
+            side="left", expand=True, fill="x", padx=2
+        )
+        self._vanilla_start_btn = self._mk_button(
+            button_row, tr("inst.start"), self._vanilla_start
+        )
+        self._vanilla_start_btn.pack(
+            side="left", expand=True, fill="x", padx=2
+        )
+        self._vanilla_cancel_btn = self._mk_button(
+            button_row, tr("inst.cancel"), self._vanilla_request_cancel
+        )
+        self._vanilla_cancel_btn.configure(state="disabled")
+        self._vanilla_cancel_btn.pack(
+            side="left", expand=True, fill="x", padx=2
+        )
+        self._mk_button(
+            button_row, tr("inst.close"), self._vanilla_cancel_or_close
+        ).pack(side="left", expand=True, fill="x", padx=2)
+
+        self._vanilla_win = win
+        win.update_idletasks()
+        pos_x = self.root.winfo_rootx() + max(
+            0, (self.root.winfo_width() - win.winfo_reqwidth()) // 2
+        )
+        pos_y = self.root.winfo_rooty() + max(
+            0, (self.root.winfo_height() - win.winfo_reqheight()) // 2
+        )
+        win.geometry("+{0}+{1}".format(pos_x, pos_y))
+        win.minsize(640, 600)
+        self._vanilla_fetch_manifest()
+        self._vanilla_on_loader_change()
+
+    def _vanilla_fetch_manifest(self):
+        if self._vanilla_downloading or self._vanilla_fetching:
+            return
+        if self._vanilla_version_list is None:
+            return
+        self._vanilla_fetching = True
+        if self._vanilla_refresh_btn is not None:
+            self._vanilla_refresh_btn.configure(state="disabled")
+        if self._vanilla_manifest_var is not None:
+            self._vanilla_manifest_var.set("MANIFEST // LOADING ...")
+        source = "auto"
+        if self._vanilla_source_var is not None:
+            source = str(self._vanilla_source_var.get() or "auto")
+        threading.Thread(
+            target=self._vanilla_manifest_worker,
+            args=(source,),
+            daemon=True,
+        ).start()
+
+    def _vanilla_manifest_worker(self, source):
+        try:
+            manifest, tag = fetch_version_manifest(source)
+            versions = [
+                item
+                for item in manifest.get("versions", [])
+                if isinstance(item, dict) and item.get("id")
+            ]
+            self.post(self._vanilla_populate_versions, versions, tag)
+        except Exception as exc:
+            log_debug("vanilla manifest failed:\n" + traceback.format_exc())
+            self.post(self._vanilla_manifest_failed, str(exc))
+
+    def _vanilla_populate_versions(self, versions, tag):
+        self._vanilla_fetching = False
+        if self._vanilla_refresh_btn is not None:
+            self._vanilla_refresh_btn.configure(state="normal")
+        self._vanilla_versions = versions
+        if self._vanilla_version_list is None:
+            return
+        self._vanilla_version_list.delete(0, tk.END)
+        type_tags = {
+            "release": "REL",
+            "snapshot": "SNAP",
+            "old_beta": "BETA",
+            "old_alpha": "ALPHA",
+        }
+        for item in versions:
+            version_type = str(item.get("type") or "release")
+            tag_text = type_tags.get(version_type, "REL")
+            release_time = str(item.get("releaseTime") or "")[:10]
+            self._vanilla_version_list.insert(
+                tk.END,
+                "[{0:<5}] {1:<18} {2}".format(
+                    tag_text, str(item.get("id") or ""), release_time
+                ),
+            )
+        self._vanilla_manifest_var.set(
+            "MANIFEST OK // {0} // {1} versions".format(
+                str(tag).upper(), len(versions)
+            )
+        )
+        target = ""
+        if self._vanilla_version_var is not None:
+            target = str(self._vanilla_version_var.get() or "").strip()
+        index = 0
+        if target:
+            for position, item in enumerate(versions):
+                if item.get("id") == target:
+                    index = position
+                    break
+        else:
+            for position, item in enumerate(versions):
+                if item.get("type") == "release":
+                    index = position
+                    break
+            if versions:
+                self._vanilla_version_var.set(
+                    str(versions[index].get("id") or "")
+                )
+        self._vanilla_version_list.selection_clear(0, tk.END)
+        self._vanilla_version_list.selection_set(index)
+        self._vanilla_version_list.activate(index)
+        self._vanilla_version_list.see(index)
+
+    def _vanilla_manifest_failed(self, message):
+        self._vanilla_fetching = False
+        if self._vanilla_refresh_btn is not None:
+            self._vanilla_refresh_btn.configure(state="normal")
+        if self._vanilla_manifest_var is not None:
+            self._vanilla_manifest_var.set(
+                "MANIFEST FAILED // 可手动输入版本号后开始"
+            )
+        if self._vanilla_status_var is not None:
+            self._vanilla_status_var.set(
+                "ERROR // {0}".format(str(message)[:160])
+            )
+
+    def _vanilla_select_version(self, _event=None):
+        if self._vanilla_downloading or self._vanilla_version_list is None:
+            return
+        selection = self._vanilla_version_list.curselection()
+        if not selection:
+            return
+        index = int(selection[0])
+        if 0 <= index < len(self._vanilla_versions):
+            version_id = str(self._vanilla_versions[index].get("id") or "")
+            if version_id and self._vanilla_version_var is not None:
+                self._vanilla_version_var.set(version_id)
+                if str(self._vanilla_loader_var.get() or "vanilla") != "vanilla":
+                    self._vanilla_fetch_loader_versions()
+
+    def _vanilla_current_loader(self):
+        if self._vanilla_loader_var is None:
+            return "vanilla"
+        loader_id = str(self._vanilla_loader_var.get() or "vanilla").lower()
+        return loader_id if loader_id in LOADER_LABELS else "vanilla"
+
+    def _vanilla_on_loader_change(self):
+        """Enable / disable the loader version list and refresh it."""
+        loader_id = self._vanilla_current_loader()
+        widget = self._vanilla_loader_list
+        if loader_id == "vanilla":
+            if widget is not None:
+                try:
+                    widget.configure(state="normal")
+                    widget.delete(0, tk.END)
+                    widget.insert(
+                        tk.END, "  [原版] 不安装任何模组加载器（只下原版文件）"
+                    )
+                    widget.configure(state="disabled")
+                except Exception:
+                    pass
+            self._vanilla_loader_rows = []
+            if self._vanilla_loader_hint is not None:
+                self._vanilla_loader_hint.set(
+                    "LOADER VERSION // 仅原版：不会安装任何加载器"
+                )
+            return
+        if widget is not None:
+            try:
+                widget.configure(state="normal")
+            except Exception:
+                pass
+        self._vanilla_fetch_loader_versions()
+
+    def _vanilla_fetch_loader_versions(self):
+        loader_id = self._vanilla_current_loader()
+        if loader_id == "vanilla" or self._vanilla_downloading:
+            return
+        minecraft_version = ""
+        if self._vanilla_version_var is not None:
+            minecraft_version = str(self._vanilla_version_var.get() or "").strip()
+        if not minecraft_version:
+            return
+        cache_key = (loader_id, minecraft_version)
+        cached = self._vanilla_loader_cache.get(cache_key)
+        if cached is not None:
+            self._vanilla_populate_loader_versions(
+                loader_id, minecraft_version, cached, ""
+            )
+            return
+        self._vanilla_loader_fetching = True
+        if self._vanilla_loader_hint is not None:
+            self._vanilla_loader_hint.set(
+                "LOADER VERSION // 正在获取 {0} 适配 {1} 的版本 ...".format(
+                    LOADER_LABELS.get(loader_id, loader_id), minecraft_version
+                )
+            )
+        threading.Thread(
+            target=self._vanilla_loader_versions_worker,
+            args=(loader_id, minecraft_version),
+            daemon=True,
+        ).start()
+
+    def _vanilla_loader_versions_worker(self, loader_id, minecraft_version):
+        label = LOADER_LABELS.get(loader_id, loader_id)
+        try:
+            versions = run_with_timeout(
+                lambda: loader_versions_for(loader_id, minecraft_version),
+                LOADER_META_TIMEOUT,
+                "{0} 的加载器版本".format(label),
+            )
+            error = ""
+        except Exception as exc:
+            log_debug("vanilla loader versions failed:\n" + traceback.format_exc())
+            versions = []
+            error = str(exc)
+        self.post(
+            self._vanilla_populate_loader_versions,
+            loader_id,
+            minecraft_version,
+            versions,
+            error,
+        )
+
+    def _vanilla_populate_loader_versions(
+        self, loader_id, minecraft_version, versions, error
+    ):
+        self._vanilla_loader_fetching = False
+        if self._vanilla_current_loader() != loader_id:
+            return
+        current = ""
+        if self._vanilla_version_var is not None:
+            current = str(self._vanilla_version_var.get() or "").strip()
+        if current and current != minecraft_version:
+            return
+        widget = self._vanilla_loader_list
+        if widget is None:
+            return
+        self._vanilla_loader_rows = []
+        try:
+            widget.configure(state="normal")
+            widget.delete(0, tk.END)
+        except Exception:
+            pass
+        if error or not versions:
+            if self._vanilla_loader_hint is not None:
+                self._vanilla_loader_hint.set(
+                    "LOADER VERSION // 没取到 {0} 适配 {1} 的版本 // {2}".format(
+                        LOADER_LABELS.get(loader_id, loader_id),
+                        minecraft_version,
+                        str(error or "该版本没有适配加载器")[:80],
+                    )
+                )
+            try:
+                widget.configure(state="disabled")
+            except Exception:
+                pass
+            return
+        self._vanilla_loader_cache[(loader_id, minecraft_version)] = versions
+        self._vanilla_loader_rows.append("")
+        widget.insert(
+            tk.END,
+            "[AUTO] 最新 {0} // MC {1}".format(
+                LOADER_LABELS.get(loader_id, loader_id), minecraft_version
+            ),
+        )
+        for version in versions:
+            self._vanilla_loader_rows.append(version)
+            widget.insert(tk.END, "  {0}".format(version))
+        widget.selection_clear(0, tk.END)
+        widget.selection_set(0)
+        widget.activate(0)
+        widget.see(0)
+        if self._vanilla_loader_hint is not None:
+            self._vanilla_loader_hint.set(
+                "LOADER VERSION // {0} 适配 MC {1} // {2} 个版本（默认最新）".format(
+                    LOADER_LABELS.get(loader_id, loader_id),
+                    minecraft_version,
+                    len(versions),
+                )
+            )
+
+    def _vanilla_selected_loader_version(self):
+        widget = self._vanilla_loader_list
+        if widget is None or not self._vanilla_loader_rows:
+            return ""
+        try:
+            selection = widget.curselection()
+        except Exception:
+            selection = ()
+        if not selection:
+            return ""
+        index = int(selection[0])
+        if 0 <= index < len(self._vanilla_loader_rows):
+            return str(self._vanilla_loader_rows[index] or "")
+        return ""
+
+    def _vanilla_start(self):
+        if self._vanilla_downloading:
+            return
+        if self._busy:
+            messagebox.showwarning(
+                "总线占用",
+                "模组下载任务正在运行，请稍后再开始原版安装。",
+                parent=self._vanilla_win or self.root,
+            )
+            return
+        version_id = ""
+        if self._vanilla_version_var is not None:
+            version_id = str(self._vanilla_version_var.get() or "").strip()
+        if not version_id:
+            messagebox.showwarning(
+                "缺少版本",
+                "请输入或选择要安装的原版版本号。",
+                parent=self._vanilla_win or self.root,
+            )
+            return
+        if not re.fullmatch(r"[A-Za-z0-9._\-]+", version_id):
+            messagebox.showwarning(
+                "版本号无效",
+                "版本号只能包含字母、数字、点、下划线和短横线。",
+                parent=self._vanilla_win or self.root,
+            )
+            return
+        source = "auto"
+        if self._vanilla_source_var is not None:
+            source = str(self._vanilla_source_var.get() or "auto").lower()
+        loader_id = self._vanilla_current_loader()
+        loader_version = ""
+        if loader_id != "vanilla":
+            if not self._vanilla_loader_rows:
+                messagebox.showwarning(
+                    "缺少加载器版本",
+                    "{0} 的版本列表还没准备好，请稍候再点一次，"
+                    "或切换成「仅原版」。".format(LOADER_LABELS.get(loader_id, loader_id)),
+                    parent=self._vanilla_win or self.root,
+                )
+                return
+            loader_version = self._vanilla_selected_loader_version()
+        self.config["download_source"] = source
+        self._save_config()
+        self._vanilla_downloading = True
+        self._vanilla_install_loader = loader_id
+        self._vanilla_cancel.clear()
+        self._vanilla_last_phase = ""
+        self._update_controls()
+        if self._vanilla_start_btn is not None:
+            self._vanilla_start_btn.configure(state="disabled")
+        if self._vanilla_refresh_btn is not None:
+            self._vanilla_refresh_btn.configure(state="disabled")
+        if self._vanilla_cancel_btn is not None:
+            self._vanilla_cancel_btn.configure(state="normal")
+        if self._vanilla_loader_list is not None:
+            try:
+                self._vanilla_loader_list.configure(state="disabled")
+            except Exception:
+                pass
+        if self._vanilla_status_var is not None:
+            self._vanilla_status_var.set(
+                "START // {0}{1} // {2}".format(
+                    version_id,
+                    ""
+                    if loader_id == "vanilla"
+                    else " + " + LOADER_LABELS.get(loader_id, loader_id),
+                    VANILLA_SOURCE_LABELS.get(source, source),
+                )
+            )
+        if self._vanilla_progress_var is not None:
+            self._vanilla_progress_var.set(ascii_progress_bar(0, 0))
+        self.say(
+            "安装启动: {0}{1} // {2}".format(
+                version_id,
+                ""
+                if loader_id == "vanilla"
+                else " + " + LOADER_LABELS.get(loader_id, loader_id),
+                VANILLA_SOURCE_LABELS.get(source, source),
+            )
+        )
+        DOWNLOAD_MONITOR.reset(
+            "{0}{1}".format(
+                version_id,
+                ""
+                if loader_id == "vanilla"
+                else " + " + LOADER_LABELS.get(loader_id, loader_id),
+            )
+        )
+        DOWNLOAD_MONITOR.set_notes(
+            "完整流程 // 原版文件（JSON / client.jar / 库 / 资源）"
+            + (
+                " → {0} 安装器".format(LOADER_LABELS.get(loader_id, loader_id))
+                if loader_id != "vanilla"
+                else " // 仅原版"
+            )
+            + "\n已完成或已存在的文件会自动跳过，不会重复下载"
+        )
+        threading.Thread(
+            target=self._vanilla_install_worker,
+            args=(version_id, source, loader_id, loader_version),
+            daemon=True,
+        ).start()
+        if str(self.config.get("download_detail", True)).lower() not in (
+            "0",
+            "false",
+            "no",
+        ):
+            self.on_open_download_detail()
+        self.maybe_offer_mini_game("安装 {0} 下载".format(version_id))
+
+    def _vanilla_install_worker(self, version_id, source, loader_id="vanilla", loader_version=""):
+        try:
+            result = install_vanilla_game(
+                version_id,
+                self.mc_dir,
+                source=source,
+                progress=self._vanilla_progress_from_thread,
+                say=self.say,
+                cancel=self._vanilla_cancel,
+                monitor=DOWNLOAD_MONITOR,
+            )
+            installed = version_id
+            if loader_id and loader_id != "vanilla":
+                label = LOADER_LABELS.get(loader_id, loader_id)
+                self.post(
+                    self._vanilla_progress_ui,
+                    "loader",
+                    0,
+                    0,
+                    "{0} 安装器 // 复用已下载的原版文件".format(label),
+                )
+                DOWNLOAD_MONITOR.set_phase("loader", 0, 0, label)
+                DOWNLOAD_MONITOR.set_notes(
+                    "{0} 安装器正在运行：库文件写到同一个 .minecraft/libraries，"
+                    "原版文件不会重新下载".format(label)
+                )
+                installed = self._install_loader_sync(
+                    loader_id,
+                    version_id,
+                    loader_version,
+                    cancel=self._vanilla_cancel,
+                    progress=self._vanilla_progress_from_thread,
+                    monitor=DOWNLOAD_MONITOR,
+                )
+            result["loader"] = loader_id
+            result["loader_version"] = loader_version
+            result["installed"] = installed
+            self.post(self._vanilla_success, result)
+        except OperationCancelled:
+            self.post(self._vanilla_cancelled)
+        except Exception as exc:
+            log_debug("vanilla install failed:\n" + traceback.format_exc())
+            self.post(self._vanilla_failed, str(exc))
+
+    def _vanilla_progress_from_thread(self, phase, current, total, detail):
+        self.post(self._vanilla_progress_ui, phase, current, total, detail)
+
+    def _vanilla_progress_ui(self, phase, current, total, detail):
+        phase = str(phase or "")
+        phase_label = VANILLA_PHASE_LABELS.get(phase, phase.upper())
+        if phase != self._vanilla_last_phase:
+            self._vanilla_last_phase = phase
+            self._vanilla_phase_clock = time.time()
+            self.say(
+                "原版安装 :: {0} // {1}".format(phase_label, detail)
+            )
+        rate_text = ""
+        if total and current and self._vanilla_phase_clock:
+            span = time.time() - self._vanilla_phase_clock
+            if span > 0.8:
+                if phase == "client":
+                    rate_text = "  // {0}/s".format(
+                        format_bytes(int(current / span))
+                    )
+                elif phase in ("assets", "libraries"):
+                    rate_text = "  // {0:.1f}/s".format(current / span)
+        if self._vanilla_status_var is not None:
+            if phase == "client" and total:
+                text = "{0} // {1} / {2}".format(
+                    phase_label, format_bytes(current), format_bytes(total)
+                )
+            elif total:
+                text = "{0} // {1} / {2}".format(phase_label, current, total)
+            else:
+                text = "{0} // {1}".format(phase_label, detail)
+            self._vanilla_status_var.set(text + rate_text)
+        if self._vanilla_progress_var is not None:
+            self._vanilla_progress_var.set(ascii_progress_bar(current, total))
+        if phase == "complete":
+            self._set_task_progress(active=False)
+        else:
+            self._set_task_progress(current, total)
+
+    def _vanilla_success(self, result):
+        version_id = str(result.get("version") or "")
+        loader_id = str(result.get("loader") or "vanilla")
+        loader_version = str(result.get("loader_version") or "")
+        installed = str(result.get("installed") or version_id)
+        loader_label = LOADER_LABELS.get(loader_id, loader_id)
+        self._vanilla_downloading = False
+        self._update_controls()
+        if self._vanilla_cancel_btn is not None:
+            self._vanilla_cancel_btn.configure(state="disabled")
+        if self._vanilla_loader_list is not None and loader_id == "vanilla":
+            try:
+                self._vanilla_loader_list.configure(state="normal")
+            except Exception:
+                pass
+        if self._vanilla_loader_var is not None:
+            try:
+                self._vanilla_on_loader_change()
+            except Exception:
+                pass
+        DOWNLOAD_MONITOR.set_phase("complete", 1, 1, "INSTALL COMPLETE")
+        self.config["launch_version"] = installed
+        self.config["minecraft_dir"] = self.mc_dir
+        guess = guess_mc_version(version_id)
+        if guess:
+            self.config["mc_version"] = guess
+            self.version_var.set(guess)
+            self._update_window_title()
+        if loader_id != "vanilla":
+            self.config["loader"] = loader_id
+            if loader_version:
+                self.config["loader_version"] = loader_version
+            try:
+                self.loader_var.set(loader_id)
+            except Exception:
+                pass
+        self._save_config()
+        self.refresh_versions()
+        if loader_id == "vanilla":
+            self.say("安装完成: {0}".format(installed))
+        else:
+            self.say(
+                "安装完成: {0} + {1} {2}".format(
+                    version_id, loader_label, loader_version or "(latest)"
+                )
+            )
+        messagebox.showinfo(
+            "安装完成",
+            "版本 {0} 已安装到:\n{1}\n\n"
+            "{2}"
+            "库文件 {3} 个 / 资源 {4} 个\n"
+            "下载源: {5}\n\n"
+            "已自动锁定该版本，可直接点火。".format(
+                version_id,
+                self.mc_dir,
+                (
+                    "模组加载器: {0} {1}\n启动版本: {2}\n\n".format(
+                        loader_label, loader_version or "(latest)", installed
+                    )
+                    if loader_id != "vanilla"
+                    else "安装内容: 仅原版（未装加载器）\n\n"
+                ),
+                result.get("libraries", 0),
+                result.get("assets", 0),
+                VANILLA_SOURCE_LABELS.get(
+                    str(result.get("source") or ""),
+                    str(result.get("source") or ""),
+                ),
+            ),
+            parent=self.root,
+        )
+        self._close_vanilla_dialog()
+
+    def _vanilla_cancelled(self):
+        self._vanilla_downloading = False
+        self._update_controls()
+        if self._vanilla_status_var is not None:
+            self._vanilla_status_var.set(
+                "CANCELLED // 已取消，已下载文件保留，可重新开始"
+            )
+        if self._vanilla_start_btn is not None:
+            self._vanilla_start_btn.configure(state="normal")
+        if self._vanilla_refresh_btn is not None:
+            self._vanilla_refresh_btn.configure(state="normal")
+        if self._vanilla_cancel_btn is not None:
+            self._vanilla_cancel_btn.configure(state="disabled")
+        if self._vanilla_loader_var is not None:
+            try:
+                self._vanilla_on_loader_change()
+            except Exception:
+                pass
+        DOWNLOAD_MONITOR.set_phase("cancelled", 0, 0, "CANCELLED")
+        self.say("安装已取消")
+
+    def _vanilla_failed(self, message):
+        self._vanilla_downloading = False
+        self._update_controls()
+        if self._vanilla_status_var is not None:
+            self._vanilla_status_var.set(
+                "ERROR // {0}".format(str(message)[:180])
+            )
+        if self._vanilla_start_btn is not None:
+            self._vanilla_start_btn.configure(state="normal")
+        if self._vanilla_refresh_btn is not None:
+            self._vanilla_refresh_btn.configure(state="normal")
+        if self._vanilla_cancel_btn is not None:
+            self._vanilla_cancel_btn.configure(state="disabled")
+        if self._vanilla_loader_var is not None:
+            try:
+                self._vanilla_on_loader_change()
+            except Exception:
+                pass
+        DOWNLOAD_MONITOR.set_phase("failed", 0, 0, str(message)[:60])
+        self.say("安装失败: {0}".format(message))
+        messagebox.showerror(
+            "安装失败",
+            str(message),
+            parent=self._vanilla_win or self.root,
+        )
+
+    def _vanilla_request_cancel(self):
+        """Ask the player, then stop the running vanilla download."""
+        if not self._vanilla_downloading:
+            return
+        confirmed = messagebox.askyesno(
+            "取消下载",
+            "确定要终止当前的原版下载吗？\n\n"
+            "· 正在下载的文件会立即停止\n"
+            "· 已经下载好的文件会保留\n"
+            "· 之后可以重新点 [ 开始下载 ] 继续",
+            parent=self._vanilla_win or self.root,
+        )
+        if not confirmed:
+            return
+        self._vanilla_cancel.set()
+        if self._vanilla_status_var is not None:
+            self._vanilla_status_var.set(
+                "CANCELLING // 正在停止下载，请稍候 ..."
+            )
+        if self._vanilla_cancel_btn is not None:
+            try:
+                self._vanilla_cancel_btn.configure(state="disabled")
+            except Exception:
+                pass
+        self.say("玩家确认取消 // 正在终止原版下载 ...")
+
+    def _vanilla_cancel_or_close(self):
+        if self._vanilla_downloading:
+            self._vanilla_request_cancel()
+            return
+        self._close_vanilla_dialog()
+
+    def _close_vanilla_dialog(self):
+        win = self._vanilla_win
+        self._vanilla_win = None
+        self._vanilla_version_list = None
+        self._vanilla_manifest_var = None
+        self._vanilla_status_var = None
+        self._vanilla_progress_var = None
+        self._vanilla_version_var = None
+        self._vanilla_source_var = None
+        self._vanilla_start_btn = None
+        self._vanilla_refresh_btn = None
+        self._vanilla_cancel_btn = None
+        self._vanilla_loader_var = None
+        self._vanilla_loader_list = None
+        self._vanilla_loader_hint = None
+        self._vanilla_detail_btn = None
+        self._vanilla_loader_rows = []
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+
+
+
+
+    # -- mod loader dialog --------------------------------------------------
+
+    def on_open_loader_dialog(self):
+        if self._vanilla_downloading:
+            messagebox.showinfo(
+                "安装进行中",
+                "请先完成或取消原版下载，再安装模组加载器。",
+                parent=self.root,
+            )
+            return
+        if self._loader_installing:
+            messagebox.showinfo(
+                "安装进行中",
+                "模组加载器正在安装，请稍候。",
+                parent=self.root,
+            )
+            return
+        if self._loader_win is not None:
+            try:
+                self._loader_win.deiconify()
+                self._loader_win.lift()
+                self._loader_win.focus_force()
+                return
+            except Exception:
+                self._loader_win = None
+
+        win = tk.Toplevel(self.root)
+        win.title("MOD LOADER INSTALLER // 模组加载器")
+        win.configure(bg=C_WHITE)
+        win.transient(self.root)
+        win.protocol("WM_DELETE_WINDOW", self._loader_cancel_or_close)
+        win.resizable(True, True)
+
+        wrap = tk.Frame(win, bg=C_WHITE, bd=1, relief="solid", padx=10, pady=10)
+        wrap.pack(fill="both", expand=True, padx=8, pady=8)
+
+        tk.Label(
+            wrap,
+            text=title_text("MOD LOADER INSTALLER // 模组加载器安装"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        ).pack(fill="x")
+
+        base_source = str(self.config.get("download_source") or "auto").lower()
+        tk.Label(
+            wrap,
+            text=(
+                "BASE SOURCE // {0} // 基础原版缺失时按此源安装\n"
+                "JAVA // {1} // Forge / NeoForge 处理器使用该 Java"
+            ).format(
+                VANILLA_SOURCE_LABELS.get(base_source, base_source),
+                self.config.get("java") or "PATH java / Java 21",
+            ),
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+            wraplength=720,
+        ).pack(fill="x", pady=(6, 0))
+
+        tk.Label(
+            wrap,
+            text=title_text("MOD LOADER // 加载器"),
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+        ).pack(fill="x", pady=(8, 2))
+        loader_row = tk.Frame(wrap, bg=C_WHITE)
+        loader_row.pack(fill="x")
+        default_loader = str(self.config.get("loader") or "fabric").lower()
+        if default_loader not in LOADER_LABELS:
+            default_loader = "fabric"
+        self._loader_id_var = tk.StringVar(value=default_loader)
+        for loader_id in LOADER_INSTALL_ORDER:
+            tk.Radiobutton(
+                loader_row,
+                text=LOADER_LABELS[loader_id],
+                value=loader_id,
+                variable=self._loader_id_var,
+                command=self._loader_on_loader_change,
+                bg=C_WHITE,
+                fg=C_BLACK,
+                activebackground=C_GRAY,
+                activeforeground=C_BLACK,
+                selectcolor=C_WHITE,
+                font=FONT_MAIN,
+                anchor="w",
+                highlightthickness=0,
+                bd=0,
+            ).pack(side="left", padx=(0, 14))
+
+        home_row = tk.Frame(wrap, bg=C_WHITE)
+        home_row.pack(fill="x", pady=(6, 0))
+        tk.Label(
+            home_row,
+            text=title_text("OFFICIAL DOWNLOAD // 官方下载入口 (网络受限时直接下载)"),
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            padx=6,
+            pady=3,
+            bd=1,
+            relief="solid",
+        ).pack(side="left", padx=(0, 6))
+        for loader_id in LOADER_INSTALL_ORDER:
+            self._mk_button(
+                home_row,
+                "[ {0} 官网 ]".format(LOADER_LABELS[loader_id]),
+                lambda lid=loader_id: self._open_loader_home(lid),
+            ).pack(side="left", padx=2)
+
+        lists = tk.Frame(wrap, bg=C_WHITE)
+        lists.pack(fill="both", expand=True, pady=(8, 0))
+        lists.columnconfigure(0, weight=1, uniform="loaderlists")
+        lists.columnconfigure(1, weight=1, uniform="loaderlists")
+        lists.rowconfigure(0, weight=1)
+
+        left_col = tk.Frame(lists, bg=C_WHITE)
+        left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        tk.Label(
+            left_col,
+            text=title_text("MINECRAFT VERSION // 适配游戏版本"),
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+        ).pack(fill="x")
+        left_box = tk.Frame(left_col, bg=C_WHITE, bd=1, relief="solid")
+        left_box.pack(fill="both", expand=True, pady=(2, 0))
+        left_box.columnconfigure(0, weight=1)
+        left_box.rowconfigure(0, weight=1)
+        self._loader_mc_list = tk.Listbox(
+            left_box,
+            height=10,
+            selectmode="browse",
+            font=FONT_MAIN,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            selectbackground=C_TEAL,
+            selectforeground=C_WHITE,
+            activestyle="none",
+            exportselection=False,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+        )
+        self._loader_mc_list.grid(
+            row=0, column=0, sticky="nsew", padx=(2, 0), pady=2
+        )
+        self._loader_mc_list.bind(
+            "<<ListboxSelect>>", self._loader_select_minecraft
+        )
+        mc_scroll = tk.Scrollbar(
+            left_box,
+            orient="vertical",
+            command=self._loader_mc_list.yview,
+            width=14,
+            bg=C_GRAY,
+            activebackground=C_TEAL,
+            troughcolor=C_WHITE,
+            bd=1,
+            relief="solid",
+            highlightthickness=0,
+        )
+        mc_scroll.grid(row=0, column=1, sticky="ns")
+        self._loader_mc_list.configure(yscrollcommand=mc_scroll.set)
+
+        right_col = tk.Frame(lists, bg=C_WHITE)
+        right_col.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+        tk.Label(
+            right_col,
+            text=title_text("LOADER VERSION // 适配加载器版本"),
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+        ).pack(fill="x")
+        right_box = tk.Frame(right_col, bg=C_WHITE, bd=1, relief="solid")
+        right_box.pack(fill="both", expand=True, pady=(2, 0))
+        right_box.columnconfigure(0, weight=1)
+        right_box.rowconfigure(0, weight=1)
+        self._loader_version_list = tk.Listbox(
+            right_box,
+            height=10,
+            selectmode="browse",
+            font=FONT_MAIN,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            selectbackground=C_TEAL,
+            selectforeground=C_WHITE,
+            activestyle="none",
+            exportselection=False,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+        )
+        self._loader_version_list.grid(
+            row=0, column=0, sticky="nsew", padx=(2, 0), pady=2
+        )
+        self._loader_version_list.bind(
+            "<<ListboxSelect>>", self._loader_select_loader_version
+        )
+        loader_scroll = tk.Scrollbar(
+            right_box,
+            orient="vertical",
+            command=self._loader_version_list.yview,
+            width=14,
+            bg=C_GRAY,
+            activebackground=C_TEAL,
+            troughcolor=C_WHITE,
+            bd=1,
+            relief="solid",
+            highlightthickness=0,
+        )
+        loader_scroll.grid(row=0, column=1, sticky="ns")
+        self._loader_version_list.configure(yscrollcommand=loader_scroll.set)
+
+        self._loader_status_var = tk.StringVar(
+            value="READY // 选择加载器、游戏版本与适配加载器版本"
+        )
+        tk.Label(
+            wrap,
+            textvariable=self._loader_status_var,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            wraplength=760,
+        ).pack(fill="x", pady=(6, 0))
+        self._loader_progress_var = tk.StringVar(
+            value=ascii_progress_bar(0, 0)
+        )
+        tk.Label(
+            wrap,
+            textvariable=self._loader_progress_var,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        ).pack(fill="x", pady=(4, 0))
+
+        button_row = tk.Frame(wrap, bg=C_WHITE)
+        button_row.pack(fill="x", pady=(8, 0))
+        self._loader_refresh_btn = self._mk_button(
+            button_row,
+            "[ 刷新适配列表 ]",
+            lambda: self._loader_reload_minecraft_versions(True),
+        )
+        self._loader_refresh_btn.pack(
+            side="left", expand=True, fill="x", padx=2
+        )
+        self._loader_start_btn = self._mk_button(
+            button_row, "[ 开始安装 ]", self._loader_start
+        )
+        self._loader_start_btn.pack(
+            side="left", expand=True, fill="x", padx=2
+        )
+        self._mk_button(
+            button_row, "[ 取消 / 关闭 ]", self._loader_cancel_or_close
+        ).pack(side="left", expand=True, fill="x", padx=2)
+
+        self._loader_win = win
+        win.update_idletasks()
+        pos_x = self.root.winfo_rootx() + max(
+            0, (self.root.winfo_width() - win.winfo_reqwidth()) // 2
+        )
+        pos_y = self.root.winfo_rooty() + max(
+            0, (self.root.winfo_height() - win.winfo_reqheight()) // 2
+        )
+        win.geometry("+{0}+{1}".format(pos_x, pos_y))
+        win.minsize(780, 620)
+        self._loader_reload_minecraft_versions()
+
+    def _open_loader_home(self, loader_id):
+        key = str(loader_id or "").lower()
+        url = LOADER_HOME.get(key)
+        if not url:
+            return
+        label = LOADER_LABELS.get(key, key)
+        try:
+            webbrowser.open(url)
+            self.say("已打开 {0} 官方下载页: {1}".format(label, url))
+        except Exception as exc:
+            messagebox.showerror(
+                "浏览器启动失败", "{0}\n\n{1}".format(url, exc), parent=self.root
+            )
+
+    def _loader_on_loader_change(self):
+        if self._loader_installing:
+            return
+        self._loader_selected_mc = ""
+        self._loader_selected_loader_version = ""
+        self._loader_version_rows = []
+        if self._loader_version_list is not None:
+            self._loader_version_list.delete(0, tk.END)
+        self._loader_reload_minecraft_versions()
+
+    def _loader_reload_minecraft_versions(self, force=False):
+        if self._loader_installing or self._loader_id_var is None:
+            return
+        loader_id = str(self._loader_id_var.get() or "fabric").lower()
+        self._loader_selected_mc = ""
+        self._loader_selected_loader_version = ""
+        self._loader_version_rows = []
+        if self._loader_version_list is not None:
+            self._loader_version_list.delete(0, tk.END)
+        if self._loader_refresh_btn is not None:
+            self._loader_refresh_btn.configure(state="disabled")
+        if force:
+            self._loader_mc_cache.pop(loader_id, None)
+            for cache_key in list(self._loader_versions_cache.keys()):
+                if cache_key[0] == loader_id:
+                    self._loader_versions_cache.pop(cache_key, None)
+        cached = self._loader_mc_cache.get(loader_id)
+        if cached is not None:
+            self._loader_populate_mc(loader_id, cached, "")
+            return
+        self._loader_fetching_mc = True
+        if self._loader_status_var is not None:
+            self._loader_status_var.set(
+                "LOADING // {0} 适配游戏版本 ...".format(
+                    LOADER_LABELS.get(loader_id, loader_id)
+                )
+            )
+        self.say(
+            "加载器: 获取 {0} 适配的 Minecraft 版本 ...".format(
+                LOADER_LABELS.get(loader_id, loader_id)
+            )
+        )
+        threading.Thread(
+            target=self._loader_fetch_mc_worker,
+            args=(loader_id,),
+            daemon=True,
+        ).start()
+
+    def _loader_fetch_mc_worker(self, loader_id):
+        label = LOADER_LABELS.get(loader_id, loader_id)
+        note = ""
+        versions = []
+        if loader_id == "neoforge":
+            # BMCLAPI mirrors maven.neoforged.net: fast and reachable in CN.
+            try:
+                mapping = run_with_timeout(
+                    lambda: neoforge_mirror_pairs(),
+                    LOADER_META_TIMEOUT,
+                    "NeoForge BMCLAPI 版本表",
+                )
+                versions = sort_versions_desc(list(mapping.keys()))
+                if versions:
+                    self._loader_neoforge_map = mapping
+                    note = "MIRROR // 已改用 BMCLAPI 镜像的 NeoForge 版本表（{0} 个 MC 版本）".format(
+                        len(versions)
+                    )
+            except Exception as exc:
+                log_debug("neoforge mirror mc failed:\n" + traceback.format_exc())
+                note = str(exc)
+        if not versions:
+            try:
+                def work():
+                    import minecraft_launcher_lib.mod_loader as mll_loader
+
+                    loader = mll_loader.get_mod_loader(loader_id)
+                    data = loader.get_minecraft_versions(True)
+                    if not data:
+                        data = loader.get_minecraft_versions(False)
+                    return list(data or [])
+
+                versions = sort_versions_desc(
+                    run_with_timeout(
+                        work, LOADER_META_TIMEOUT, "{0} 适配游戏版本".format(label)
+                    )
+                )
+            except Exception as exc:
+                log_debug("loader mc versions failed:\n" + traceback.format_exc())
+                note = str(exc)
+
+        if not versions:
+            fallback, fallback_note = loader_mc_fallback(loader_id)
+            if fallback:
+                versions = fallback
+                note = fallback_note
+            elif not note:
+                note = "无法获取 {0} 的适配游戏版本".format(label)
+        self.post(self._loader_populate_mc, loader_id, versions, "" if versions else note)
+        if versions and note:
+            self.post(self._set_loader_status, note, loader_id)
+
+    def _set_loader_status(self, text, loader_id=None):
+        try:
+            if self._loader_status_var is None:
+                return
+            if loader_id is not None and self._loader_id_var is not None:
+                if str(self._loader_id_var.get() or "").lower() != str(loader_id).lower():
+                    return
+            self._loader_status_var.set(str(text))
+        except Exception:
+            pass
+
+    def _loader_populate_mc(self, loader_id, versions, error):
+        self._loader_fetching_mc = False
+        if self._loader_refresh_btn is not None:
+            self._loader_refresh_btn.configure(state="normal")
+        if self._loader_id_var is None:
+            return
+        if str(self._loader_id_var.get() or "").lower() != loader_id:
+            return
+        self._loader_mc_versions = versions
+        if versions:
+            self._loader_mc_cache[loader_id] = versions
+        if self._loader_mc_list is None:
+            return
+        self._loader_mc_list.delete(0, tk.END)
+        if error or not versions:
+            if self._loader_version_list is not None:
+                self._loader_version_list.delete(0, tk.END)
+            self._loader_version_rows = []
+            if self._loader_status_var is not None:
+                self._loader_status_var.set(
+                    "ERROR // {0}".format(
+                        str(error or "没有适配的 Minecraft 版本")[:180]
+                    )
+                )
+            return
+        for version in versions:
+            installed = os.path.isfile(
+                os.path.join(
+                    self.mc_dir, "versions", version, version + ".json"
+                )
+            )
+            self._loader_mc_list.insert(
+                tk.END,
+                "{0}[MC] {1}".format("* " if installed else "  ", version),
+            )
+        target = self.mc_version
+        index = versions.index(target) if target in versions else 0
+        self._loader_mc_list.selection_clear(0, tk.END)
+        self._loader_mc_list.selection_set(index)
+        self._loader_mc_list.activate(index)
+        self._loader_mc_list.see(index)
+        if self._loader_status_var is not None:
+            self._loader_status_var.set(
+                "MC VERSIONS OK // {0} // {1} 个适配版本".format(
+                    LOADER_LABELS.get(loader_id, loader_id), len(versions)
+                )
+            )
+        self._loader_select_minecraft()
+
+    def _loader_select_minecraft(self, _event=None):
+        if (
+            self._loader_installing
+            or self._loader_mc_list is None
+            or self._loader_id_var is None
+        ):
+            return
+        selection = self._loader_mc_list.curselection()
+        if not selection:
+            return
+        index = int(selection[0])
+        if index < 0 or index >= len(self._loader_mc_versions):
+            return
+        minecraft_version = self._loader_mc_versions[index]
+        self._loader_selected_mc = minecraft_version
+        self._loader_selected_loader_version = ""
+        self._loader_version_rows = []
+        if self._loader_version_list is not None:
+            self._loader_version_list.delete(0, tk.END)
+        loader_id = str(self._loader_id_var.get() or "fabric").lower()
+        cache_key = (loader_id, minecraft_version)
+        cached = self._loader_versions_cache.get(cache_key)
+        if cached is not None:
+            self._loader_populate_versions(
+                loader_id, minecraft_version, cached, ""
+            )
+            return
+        self._loader_fetching_versions = True
+        self._loader_fetch_key = cache_key
+        if self._loader_status_var is not None:
+            self._loader_status_var.set(
+                "LOADING // {0} 的适配加载器版本 ...".format(
+                    minecraft_version
+                )
+            )
+        threading.Thread(
+            target=self._loader_fetch_versions_worker,
+            args=(loader_id, minecraft_version),
+            daemon=True,
+        ).start()
+
+    def _loader_fetch_versions_worker(self, loader_id, minecraft_version):
+        label = LOADER_LABELS.get(loader_id, loader_id)
+        note = ""
+        versions = []
+        if loader_id == "neoforge":
+            try:
+                versions = sort_versions_desc(
+                    run_with_timeout(
+                        lambda: neoforge_mirror_loader_versions(minecraft_version),
+                        LOADER_META_TIMEOUT,
+                        "NeoForge {0} 的加载器版本".format(minecraft_version),
+                    )
+                )
+                if versions:
+                    note = "MIRROR // BMCLAPI 镜像 // {0} 个 NeoForge 版本".format(
+                        len(versions)
+                    )
+            except Exception as exc:
+                log_debug("neoforge mirror versions failed:\n" + traceback.format_exc())
+                note = str(exc)
+        if not versions:
+            try:
+                def work():
+                    import minecraft_launcher_lib.mod_loader as mll_loader
+
+                    loader = mll_loader.get_mod_loader(loader_id)
+                    return list(loader.get_loader_versions(minecraft_version, False) or [])
+
+                versions = sort_versions_desc(
+                    run_with_timeout(
+                        work,
+                        LOADER_META_TIMEOUT,
+                        "{0} {1} 的加载器版本".format(label, minecraft_version),
+                    )
+                )
+            except Exception as exc:
+                log_debug("loader versions failed:\n" + traceback.format_exc())
+                note = str(exc)
+
+        if not versions:
+            fallback = loader_version_fallback(loader_id, minecraft_version)
+            if fallback:
+                versions = fallback
+                note = "MIRROR // 已改用 Forge promotions 的推荐/最新版本"
+            elif not note:
+                note = "该游戏版本没有适配的加载器版本"
+
+        self.post(
+            self._loader_populate_versions,
+            loader_id,
+            minecraft_version,
+            versions,
+            "" if versions else note,
+        )
+        if versions and note:
+            self.post(self._set_loader_status, note, loader_id)
+
+    def _loader_populate_versions(
+        self, loader_id, minecraft_version, versions, error
+    ):
+        self._loader_fetching_versions = False
+        if self._loader_id_var is None:
+            return
+        if str(self._loader_id_var.get() or "").lower() != loader_id:
+            return
+        if self._loader_selected_mc != minecraft_version:
+            return
+        if self._loader_version_list is None:
+            return
+        self._loader_version_list.delete(0, tk.END)
+        self._loader_version_rows = []
+        if error or not versions:
+            if self._loader_status_var is not None:
+                self._loader_status_var.set(
+                    "ERROR // {0}".format(
+                        str(error or "该游戏版本没有适配的加载器版本")[:180]
+                    )
+                )
+            return
+        self._loader_versions_cache[(loader_id, minecraft_version)] = versions
+        self._loader_version_rows.append("")
+        self._loader_version_list.insert(
+            tk.END,
+            "[AUTO] 最新适配版本 // {0}".format(minecraft_version),
+        )
+        installed_count = 0
+        loader = None
+        try:
+            import minecraft_launcher_lib.mod_loader as mll_loader
+
+            loader = mll_loader.get_mod_loader(loader_id)
+        except Exception:
+            loader = None
+        for version in versions:
+            installed = False
+            if loader is not None:
+                try:
+                    installed_id = loader.get_installed_version(
+                        minecraft_version, version
+                    )
+                    installed = bool(installed_id) and os.path.isdir(
+                        os.path.join(self.mc_dir, "versions", installed_id)
+                    )
+                except Exception:
+                    installed = False
+            if installed:
+                installed_count += 1
+            self._loader_version_rows.append(version)
+            self._loader_version_list.insert(
+                tk.END,
+                "{0}[LOADER] {1}".format(
+                    "* " if installed else "  ", version
+                ),
+            )
+        self._loader_version_list.selection_clear(0, tk.END)
+        self._loader_version_list.selection_set(0)
+        self._loader_version_list.activate(0)
+        self._loader_version_list.see(0)
+        if self._loader_status_var is not None:
+            self._loader_status_var.set(
+                "ADAPTED LOADERS OK // {0} // {1} 个加载器版本 // 已安装 {2}".format(
+                    minecraft_version, len(versions), installed_count
+                )
+            )
+
+    def _loader_select_loader_version(self, _event=None):
+        if self._loader_installing or self._loader_version_list is None:
+            return
+        selection = self._loader_version_list.curselection()
+        if not selection:
+            return
+        index = int(selection[0])
+        if 0 <= index < len(self._loader_version_rows):
+            self._loader_selected_loader_version = self._loader_version_rows[
+                index
+            ]
+
+    def _loader_start(self):
+        if self._loader_installing or self._loader_id_var is None:
+            return
+        if self._busy:
+            messagebox.showwarning(
+                "总线占用",
+                "模组下载任务正在运行，请稍后再开始加载器安装。",
+                parent=self._loader_win or self.root,
+            )
+            return
+        loader_id = str(self._loader_id_var.get() or "fabric").lower()
+        minecraft_version = str(self._loader_selected_mc or "").strip()
+        if not minecraft_version:
+            messagebox.showwarning(
+                "缺少游戏版本",
+                "请先在左侧选择适配的 Minecraft 版本。",
+                parent=self._loader_win or self.root,
+            )
+            return
+        if not self._loader_version_rows:
+            messagebox.showwarning(
+                "缺少加载器版本",
+                "加载器适配列表尚未完成，请稍候或点击 [刷新适配列表]。",
+                parent=self._loader_win or self.root,
+            )
+            return
+        loader_version = str(
+            self._loader_selected_loader_version or ""
+        ).strip()
+        if self._loader_version_list is not None:
+            selection = self._loader_version_list.curselection()
+            if selection:
+                index = int(selection[0])
+                if 0 <= index < len(self._loader_version_rows):
+                    loader_version = self._loader_version_rows[index]
+        self._loader_installing = True
+        self._loader_cancel.clear()
+        self._loader_last_phase = ""
+        self._update_controls()
+        if self._loader_start_btn is not None:
+            self._loader_start_btn.configure(state="disabled")
+        if self._loader_refresh_btn is not None:
+            self._loader_refresh_btn.configure(state="disabled")
+        if self._loader_status_var is not None:
+            self._loader_status_var.set(
+                "START // {0} // MC {1} // {2}".format(
+                    LOADER_LABELS.get(loader_id, loader_id),
+                    minecraft_version,
+                    loader_version or "LATEST",
+                )
+            )
+        if self._loader_progress_var is not None:
+            self._loader_progress_var.set(ascii_progress_bar(0, 0))
+        self.say(
+            "加载器安装启动: {0} {1} // MC {2}".format(
+                LOADER_LABELS.get(loader_id, loader_id),
+                loader_version or "(latest)",
+                minecraft_version,
+            )
+        )
+        threading.Thread(
+            target=self._loader_install_worker,
+            args=(loader_id, minecraft_version, loader_version),
+            daemon=True,
+        ).start()
+        if str(self.config.get("download_detail", True)).lower() not in (
+            "0",
+            "false",
+            "no",
+        ):
+            self.on_open_download_detail()
+        self.maybe_offer_mini_game(
+            "{0} 加载器安装".format(loader_id.upper())
+        )
+
+    def _loader_install_worker(self, loader_id, minecraft_version, loader_version):
+        try:
+            DOWNLOAD_MONITOR.reset(
+                "{0} {1} // MC {2}".format(
+                    LOADER_LABELS.get(loader_id, loader_id),
+                    loader_version or "(latest)",
+                    minecraft_version,
+                )
+            )
+            DOWNLOAD_MONITOR.set_notes(
+                "加载器单独安装 // 基础原版已存在时会直接复用，不会重复下载"
+            )
+            version_dir = os.path.join(
+                self.mc_dir, "versions", minecraft_version
+            )
+            vanilla_json = os.path.join(version_dir, minecraft_version + ".json")
+            vanilla_jar = os.path.join(version_dir, minecraft_version + ".jar")
+            if not (os.path.isfile(vanilla_json) and os.path.isfile(vanilla_jar)):
+                self.post(
+                    self._loader_progress_ui,
+                    "vanilla_base",
+                    0,
+                    1,
+                    "基础原版 {0}".format(minecraft_version),
+                )
+                install_vanilla_game(
+                    minecraft_version,
+                    self.mc_dir,
+                    source=str(self.config.get("download_source") or "auto"),
+                    progress=self._loader_progress_from_thread,
+                    say=self.say,
+                    cancel=self._loader_cancel,
+                    monitor=DOWNLOAD_MONITOR,
+                )
+            installed = self._install_loader_sync(
+                loader_id,
+                minecraft_version,
+                loader_version,
+                cancel=self._loader_cancel,
+                progress=self._loader_progress_from_thread,
+                monitor=DOWNLOAD_MONITOR,
+            )
+            self.post(
+                self._loader_success,
+                installed,
+                loader_id,
+                minecraft_version,
+                loader_version,
+            )
+        except OperationCancelled:
+            self.post(self._loader_cancelled)
+        except Exception as exc:
+            log_debug("loader install failed:\n" + traceback.format_exc())
+            self.post(self._loader_failed, str(exc))
+
+    def _install_loader_sync(
+        self,
+        loader_id,
+        minecraft_version,
+        loader_version,
+        cancel=None,
+        progress=None,
+        monitor=None,
+    ):
+        """Install one mod loader into self.mc_dir.
+
+        The vanilla files written by ``install_vanilla_game`` are reused as-is,
+        so a combined install never downloads the base game twice.
+        """
+        loader_id = str(loader_id or "").lower()
+        if loader_id not in LOADER_LABELS:
+            raise LauncherError("未知的加载器: {0}".format(loader_id))
+        if cancel is None:
+            cancel = self._loader_cancel
+        report = progress or self._loader_progress_from_thread
+        label = LOADER_LABELS.get(loader_id, loader_id)
+        if loader_id == "neoforge" and not str(loader_version or "").strip():
+            # "[AUTO]" -> newest NeoForge build for this MC version (mirror list).
+            try:
+                candidates = loader_versions_for("neoforge", minecraft_version)
+            except Exception:
+                candidates = []
+            if candidates:
+                loader_version = str(candidates[0])
+                report(
+                    "loader",
+                    0,
+                    0,
+                    "NeoForge AUTO // 使用最新 {0}".format(loader_version),
+                )
+        if loader_id == "neoforge":
+            return self._install_neoforge_mirror(
+                minecraft_version,
+                loader_version,
+                cancel=cancel,
+                progress=report,
+                monitor=monitor,
+            )
+        # Forge (and some Quilt builds) also refuse to run without this file.
+        ensure_launcher_profiles(self.mc_dir, minecraft_version)
+        import minecraft_launcher_lib.mod_loader as mll_loader
+
+        loader = mll_loader.get_mod_loader(loader_id)
+        java_path = str(self.config.get("java") or "").strip() or None
+        row_key = "loader:{0}".format(loader_id)
+        if monitor is not None:
+            monitor.ensure(
+                row_key, "{0} 安装器".format(label), 0, kind="loader"
+            )
+            monitor.set_phase("loader", 0, 0, "{0} 安装器".format(label))
+        try:
+            installed = loader.install(
+                minecraft_version,
+                self.mc_dir,
+                loader_version=(str(loader_version or "").strip() or None),
+                callback=self._mll_loader_callback(cancel, report, monitor, row_key),
+                java=java_path,
+            )
+        except OperationCancelled:
+            if monitor is not None:
+                monitor.finish(row_key, "cancelled")
+            raise
+        except Exception:
+            if monitor is not None:
+                monitor.finish(row_key, "failed")
+            raise
+        if monitor is not None:
+            monitor.finish(row_key, "done", 0)
+        return installed
+
+    def _mll_loader_callback(self, cancel, report, monitor, row_key):
+        """Adapt minecraft-launcher-lib's callback onto our UI + monitor."""
+        state = {"max": 0, "label": "加载器安装器"}
+
+        def set_status(text):
+            check_cancel(cancel)
+            state["label"] = str(text or state["label"])[:52]
+            if monitor is not None:
+                monitor.ensure(row_key, state["label"], state["max"], kind="loader")
+            report("loader", 0, state["max"], str(text))
+
+        def set_max(value):
+            try:
+                state["max"] = int(value)
+            except Exception:
+                state["max"] = 0
+            if monitor is not None and state["max"]:
+                monitor.ensure(row_key, state["label"], state["max"], kind="loader")
+
+        def set_progress(value):
+            check_cancel(cancel)
+            try:
+                current = int(value)
+            except Exception:
+                current = 0
+            if monitor is not None:
+                monitor.ensure(row_key, state["label"], state["max"], kind="loader")
+                monitor.update(row_key, current, state["max"])
+            report("loader", current, state["max"], "installer")
+
+        return {
+            "setStatus": set_status,
+            "setProgress": set_progress,
+            "setMax": set_max,
+        }
+
+    def _install_neoforge_mirror(
+        self, minecraft_version, loader_version, cancel=None, progress=None, monitor=None
+    ):
+        """Download the NeoForge installer from BMCLAPI and run it locally."""
+        version = str(loader_version or "").strip()
+        if not version:
+            raise LauncherError("请先在右侧选择 NeoForge 版本")
+        if cancel is None:
+            cancel = self._loader_cancel
+        report = progress or self._loader_progress_from_thread
+        row_key = "loader:neoforge"
+        required = 21 if version.startswith("21.") else 17
+        java_config = str(self.config.get("java") or "").strip()
+        java_exec = find_java_executable(self.mc_dir, java_config, required)
+        java_actual = java_major_version(java_exec) if java_exec else 0
+        if not java_exec:
+            raise LauncherError(
+                "安装 NeoForge {0} 需要 Java {1}，当前没有可用的 Java。\n"
+                "请先在 [游戏] -> [Java 运行时管理...] 下载 Java {1}。".format(
+                    version, required
+                )
+            )
+        tempdir = tempfile.mkdtemp(prefix="akm-neoforge-")
+        installer = os.path.join(tempdir, "neoforge-{0}-installer.jar".format(version))
+        # The installer aborts with "there is no minecraft launcher profile"
+        # unless the target game dir has launcher_profiles.json.
+        profiles_path = ensure_launcher_profiles(self.mc_dir, minecraft_version)
+        try:
+            report(
+                "loader",
+                0,
+                1,
+                "NeoForge {0} 安装器 下载中".format(version),
+            )
+            if monitor is not None:
+                monitor.ensure(
+                    row_key, "NeoForge {0} 安装器".format(version), 0, kind="loader"
+                )
+            download_to_dest(
+                neoforge_installer_pairs(version),
+                installer,
+                cancel=cancel,
+                timeout=120,
+                monitor=monitor,
+                label="NeoForge {0} 安装器 jar".format(version),
+                progress=lambda done, total: report(
+                    "loader", done, total, "NeoForge 安装器"
+                ),
+            )
+            report(
+                "loader",
+                0,
+                1,
+                "运行 NeoForge 安装器 (Java {0})".format(java_actual or required),
+            )
+            if monitor is not None:
+                monitor.ensure(
+                    row_key,
+                    "NeoForge 安装器 (Java {0})".format(java_actual or required),
+                    0,
+                    kind="loader",
+                )
+            # maven.neoforged.net is timeout-prone: fetch the installer's own
+            # libraries from the mirror first so the installer skips them.
+            try:
+                preseed_installer_libraries(self.mc_dir, installer, report=report)
+            except OperationCancelled:
+                raise
+            except Exception:
+                log_debug("neoforge preseed failed:\n" + traceback.format_exc())
+            check_cancel(cancel)
+            flags = 0x08000000 if os.name == "nt" else 0
+            result = subprocess.run(
+                [java_exec, "-jar", installer, "--install-client", self.mc_dir],
+                cwd=tempdir,
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=3600,
+                creationflags=flags,
+            )
+            if result.returncode != 0:
+                text = (
+                    (result.stdout or "") + "\n" + (result.stderr or "")
+                ).strip()
+                tail = text[-900:]
+                lowered = text.lower()
+                if "launcher profile" in lowered:
+                    hint = (
+                        "安装器要求目标目录里有 launcher_profiles.json。"
+                        "AKM 已在 {0} 自动补建，请直接重试；若仍报错，"
+                        "请检查该目录是否可写。".format(profiles_path or self.mc_dir)
+                    )
+                elif (
+                    "unsupportedclassversion" in lowered
+                    or "requires java" in lowered
+                    or "unsupported class file" in lowered
+                ):
+                    hint = (
+                        "安装器需要更高的 Java。请到 [游戏] -> "
+                        "[Java 运行时管理...] 装 Java 21 后再试。"
+                    )
+                elif any(
+                    word in lowered
+                    for word in (
+                        "unknownhost",
+                        "connect timed out",
+                        "connection",
+                        "socket",
+                        "timeout",
+                        "ssl",
+                    )
+                ):
+                    hint = (
+                        "安装器下载依赖失败（maven.neoforged.net 不可达）。"
+                        "可配置代理后重试，或点 [ NeoForge 官网 ] "
+                        "手动下载安装器双击运行。"
+                    )
+                else:
+                    hint = "把下面的安装器日志发我即可继续定位。"
+                log_path = self._keep_installer_log(
+                    tempdir, "neoforge-{0}".format(version)
+                )
+                raise LauncherError(
+                    "NeoForge 安装器执行失败 (exit {0})。\n{1}\n\n{2}{3}".format(
+                        result.returncode,
+                        tail,
+                        hint,
+                        ("\n日志: {0}".format(log_path)) if log_path else "",
+                    )
+                )
+            installed = "neoforge-{0}".format(version)
+            target = os.path.join(
+                self.mc_dir, "versions", installed, installed + ".json"
+            )
+            if not os.path.isfile(target):
+                versions_dir = os.path.join(self.mc_dir, "versions")
+                candidates = []
+                try:
+                    for name in os.listdir(versions_dir):
+                        if name.lower().startswith("neoforge"):
+                            candidates.append(name)
+                except OSError:
+                    candidates = []
+                if candidates:
+                    installed = sort_versions_desc(candidates)[0]
+                    target = os.path.join(
+                        self.mc_dir, "versions", installed, installed + ".json"
+                    )
+                if not os.path.isfile(target):
+                    raise LauncherError(
+                        "NeoForge 安装器没有生成版本 JSON: {0}".format(installed)
+                    )
+            if monitor is not None:
+                monitor.finish(row_key, "done", 0)
+            return installed
+        except OperationCancelled:
+            if monitor is not None:
+                monitor.finish(row_key, "cancelled")
+            raise
+        except Exception:
+            if monitor is not None:
+                monitor.finish(row_key, "failed")
+            raise
+        finally:
+            shutil.rmtree(tempdir, ignore_errors=True)
+
+    def _keep_installer_log(self, tempdir, tag):
+        """Copy the installer log out of the temp dir so failures stay debuggable."""
+        for name in ("installer.log", "install.log", "neoforge-installer.log"):
+            source = os.path.join(tempdir, name)
+            if not os.path.isfile(source):
+                continue
+            try:
+                ensure_dir(LOG_DIR)
+                stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                target = os.path.join(LOG_DIR, "{0}-{1}.log".format(tag, stamp))
+                shutil.copyfile(source, target)
+                return target
+            except OSError as exc:
+                log_debug("installer log copy failed: {0}".format(exc))
+        return ""
+
+    def _loader_progress_from_thread(self, phase, current, total, detail):
+        self.post(self._loader_progress_ui, phase, current, total, detail)
+    def _loader_progress_ui(self, phase, current, total, detail):
+        phase = str(phase or "")
+        if phase in VANILLA_PHASE_LABELS:
+            phase_label = "BASE " + VANILLA_PHASE_LABELS[phase]
+        elif phase == "vanilla_base":
+            phase_label = "BASE VANILLA"
+        else:
+            phase_label = "LOADER"
+        if phase != self._loader_last_phase:
+            self._loader_last_phase = phase
+            self.say(
+                "加载器安装 :: {0} // {1}".format(phase_label, detail)
+            )
+        if self._loader_status_var is not None:
+            if phase == "client" and total:
+                text = "{0} // {1} / {2}".format(
+                    phase_label, format_bytes(current), format_bytes(total)
+                )
+            elif total:
+                text = "{0} // {1} / {2}".format(
+                    phase_label, current, total
+                )
+            else:
+                text = "{0} // {1}".format(phase_label, detail)
+            self._loader_status_var.set(text)
+        if self._loader_progress_var is not None:
+            self._loader_progress_var.set(
+                ascii_progress_bar(current, total)
+            )
+        if phase == "complete":
+            self._set_task_progress(active=False)
+        else:
+            self._set_task_progress(current, total)
+
+    def _loader_success(
+        self, installed_version, loader_id, minecraft_version, loader_version
+    ):
+        self._loader_installing = False
+        self._update_controls()
+        self.config["launch_version"] = installed_version
+        self.config["minecraft_dir"] = self.mc_dir
+        self.config["mc_version"] = minecraft_version
+        self.config["loader"] = loader_id
+        self.config["loader_version"] = loader_version
+        self.version_var.set(minecraft_version)
+        self.loader_var.set(loader_id)
+        self._update_window_title()
+        self._save_config()
+        self.refresh_versions()
+        self.refresh_hot()
+        self.say("加载器安装完成: {0}".format(installed_version))
+        messagebox.showinfo(
+            "加载器安装完成",
+            "{0} 安装完成。\n\n"
+            "Minecraft: {1}\n"
+            "加载器版本: {2}\n"
+            "安装版本 id: {3}\n"
+            "游戏目录: {4}\n\n"
+            "已自动锁定该版本，可直接点火。".format(
+                LOADER_LABELS.get(loader_id, loader_id),
+                minecraft_version,
+                loader_version or "LATEST",
+                installed_version,
+                self.mc_dir,
+            ),
+            parent=self.root,
+        )
+        self._close_loader_dialog()
+
+    def _loader_cancelled(self):
+        self._loader_installing = False
+        self._update_controls()
+        if self._loader_status_var is not None:
+            self._loader_status_var.set(
+                "CANCELLED // 已取消，已完成文件保留"
+            )
+        if self._loader_start_btn is not None:
+            self._loader_start_btn.configure(state="normal")
+        if self._loader_refresh_btn is not None:
+            self._loader_refresh_btn.configure(state="normal")
+        self.say("加载器安装已取消")
+
+    def _loader_failed(self, message):
+        self._loader_installing = False
+        self._update_controls()
+        if self._loader_status_var is not None:
+            self._loader_status_var.set(
+                "ERROR // {0}".format(str(message)[:180])
+            )
+        if self._loader_start_btn is not None:
+            self._loader_start_btn.configure(state="normal")
+        if self._loader_refresh_btn is not None:
+            self._loader_refresh_btn.configure(state="normal")
+        self.say("加载器安装失败: {0}".format(message))
+        messagebox.showerror(
+            "加载器安装失败",
+            str(message),
+            parent=self._loader_win or self.root,
+        )
+
+    def _loader_cancel_or_close(self):
+        if self._loader_installing:
+            confirmed = messagebox.askyesno(
+                "取消加载器安装",
+                "安装仍在进行，确定取消吗？\n"
+                "已完成的步骤会保留。",
+                parent=self._loader_win or self.root,
+            )
+            if not confirmed:
+                return
+            self._loader_cancel.set()
+            if self._loader_status_var is not None:
+                self._loader_status_var.set(
+                    "CANCELLING // 等待当前步骤结束 ..."
+                )
+            self.say("正在取消加载器安装 ...")
+            return
+        self._close_loader_dialog()
+
+    def _close_loader_dialog(self):
+        win = self._loader_win
+        self._loader_win = None
+        self._loader_id_var = None
+        self._loader_mc_list = None
+        self._loader_version_list = None
+        self._loader_status_var = None
+        self._loader_progress_var = None
+        self._loader_start_btn = None
+        self._loader_refresh_btn = None
+        self._loader_selected_mc = ""
+        self._loader_selected_loader_version = ""
+        self._loader_version_rows = []
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+
+
+
+
+
+    # -- java runtime manager -------------------------------------------------
+
+    def on_open_java_dialog(self):
+        if self._java_win is not None:
+            try:
+                self._java_win.deiconify()
+                self._java_win.lift()
+                self._java_win.focus_force()
+                return
+            except Exception:
+                self._java_win = None
+
+        win = tk.Toplevel(self.root)
+        win.title("JAVA RUNTIME MANAGER // 内置 Java")
+        win.configure(bg=C_WHITE)
+        win.transient(self.root)
+        win.resizable(True, True)
+        win.protocol("WM_DELETE_WINDOW", self._java_close)
+
+        wrap = tk.Frame(win, bg=C_WHITE, bd=1, relief="solid", padx=10, pady=10)
+        wrap.pack(fill="both", expand=True, padx=8, pady=8)
+
+        tk.Label(
+            wrap,
+            text=title_text("JAVA RUNTIME MANAGER // 内置 Java 运行时"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        ).pack(fill="x")
+
+        tk.Label(
+            wrap,
+            text=(
+                "一键下载 Temurin JRE 8 / 11 / 17 / 21 / 25 到游戏目录 runtime\\ 下。\n"
+                "当前启动 Java: {0}\n"
+                "提示：保持「自动选择」最稳，启动器会按游戏版本要求挑 Java；"
+                "「固定」只在确定该版本需要这个 Java 时使用。"
+            ).format(self.config.get("java") or "自动选择（按版本要求）"),
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+            wraplength=720,
+        ).pack(fill="x", pady=(6, 0))
+
+        list_frame = tk.Frame(wrap, bg=C_WHITE, bd=1, relief="solid")
+        list_frame.pack(fill="both", expand=True, pady=(8, 0))
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+
+        self._java_list = tk.Listbox(
+            list_frame,
+            height=8,
+            selectmode="browse",
+            font=FONT_MAIN,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            selectbackground=C_TEAL,
+            selectforeground=C_WHITE,
+            activestyle="none",
+            exportselection=False,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+        )
+        self._java_list.grid(row=0, column=0, sticky="nsew", padx=(2, 0), pady=2)
+        self._java_list.bind(
+            "<<ListboxSelect>>", lambda _event: self._java_describe_selection()
+        )
+        java_scroll = tk.Scrollbar(
+            list_frame,
+            orient="vertical",
+            command=self._java_list.yview,
+            width=14,
+            bg=C_GRAY,
+            activebackground=C_TEAL,
+            troughcolor=C_WHITE,
+            bd=1,
+            relief="solid",
+            highlightthickness=0,
+        )
+        java_scroll.grid(row=0, column=1, sticky="ns")
+        self._java_list.configure(yscrollcommand=java_scroll.set)
+
+        self._java_status_var = tk.StringVar(value="READY // 选择一个 Java 版本")
+        tk.Label(
+            wrap,
+            textvariable=self._java_status_var,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            wraplength=760,
+        ).pack(fill="x", pady=(6, 0))
+
+        self._java_progress_var = tk.StringVar(value=ascii_progress_bar(0, 0))
+        tk.Label(
+            wrap,
+            textvariable=self._java_progress_var,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        ).pack(fill="x", pady=(4, 0))
+
+        self._java_buttons = []
+        row1 = tk.Frame(wrap, bg=C_WHITE)
+        row1.pack(fill="x", pady=(8, 0))
+        for text, command in (
+            ("[ 下载 / 更新选中 ]", self._java_download_selected),
+            ("[ 全部下载 ]", self._java_download_all),
+            ("[ 删除选中 ]", self._java_delete_selected),
+        ):
+            button = self._mk_button(row1, text, command)
+            button.pack(side="left", expand=True, fill="x", padx=2)
+            self._java_buttons.append(button)
+
+        row2 = tk.Frame(wrap, bg=C_WHITE)
+        row2.pack(fill="x", pady=(6, 0))
+        for text, command in (
+            ("[ 设为启动 Java ]", self._java_set_default),
+            ("[ 自动选择 ]", self._java_auto_select),
+            ("[ 打开 runtime 目录 ]", self._java_open_dir),
+            ("[ 关闭 ]", self._java_close),
+        ):
+            button = self._mk_button(row2, text, command)
+            button.pack(side="left", expand=True, fill="x", padx=2)
+            self._java_buttons.append(button)
+
+        self._java_win = win
+        win.update_idletasks()
+        pos_x = self.root.winfo_rootx() + max(
+            0, (self.root.winfo_width() - win.winfo_reqwidth()) // 2
+        )
+        pos_y = self.root.winfo_rooty() + max(
+            0, (self.root.winfo_height() - win.winfo_reqheight()) // 2
+        )
+        win.geometry("+{0}+{1}".format(pos_x, pos_y))
+        win.minsize(820, 520)
+        self._java_refresh_list()
+
+    def _java_set_status(self, text):
+        try:
+            if self._java_status_var is not None:
+                self._java_status_var.set(str(text))
+        except Exception:
+            pass
+
+    def _java_progress_ui(self, done, total):
+        try:
+            if self._java_progress_var is not None:
+                self._java_progress_var.set(ascii_progress_bar(done, total))
+        except Exception:
+            pass
+
+    def _java_progress_from_thread(self, done, total):
+        self.post(self._java_progress_ui, done, total)
+
+    def _java_refresh_list(self):
+        if self._java_list is None:
+            return
+        installed = installed_java_runtimes(self.mc_dir)
+        by_major = {row["major"]: row for row in installed}
+        current = str(self.config.get("java") or "").strip()
+        current_key = os.path.normcase(os.path.abspath(current)) if current else ""
+        self._java_rows = []
+        self._java_list.delete(0, tk.END)
+        for major in JAVA_RUNTIME_MAJORS:
+            row = by_major.get(major)
+            if row:
+                pinned = current_key and current_key == os.path.normcase(
+                    os.path.abspath(row["java"])
+                )
+                self._java_list.insert(
+                    tk.END,
+                    "{0}[已安装] Java {1} // {2} // {3}".format(
+                        "* " if pinned else "  ",
+                        major,
+                        format_bytes(row["size"]),
+                        row["dir"],
+                    ),
+                )
+            else:
+                self._java_list.insert(
+                    tk.END,
+                    "  [未安装] Java {0} // {1} // {2}".format(
+                        major,
+                        JAVA_RUNTIME_SIZES.get(major, ""),
+                        JAVA_RUNTIME_TARGETS.get(major, ""),
+                    ),
+                )
+            self._java_rows.append(
+                {"major": int(major), "installed": bool(row), "row": row}
+            )
+        if self._java_rows:
+            first = next(
+                (
+                    index
+                    for index, item in enumerate(self._java_rows)
+                    if item["installed"]
+                ),
+                0,
+            )
+            self._java_list.selection_clear(0, tk.END)
+            self._java_list.selection_set(first)
+            self._java_list.activate(first)
+        if installed:
+            self._java_set_status(
+                "READY // 已安装 {0} // 共 {1}".format(
+                    ", ".join("Java{0}".format(row["major"]) for row in installed),
+                    format_bytes(sum(row["size"] for row in installed)),
+                )
+            )
+        else:
+            self._java_set_status(
+                "READY // 还没有内置 Java；选中一行点 [ 下载 / 更新选中 ]"
+            )
+        self._java_describe_selection()
+
+    def _java_selected_row(self):
+        if self._java_list is None:
+            return None
+        selection = self._java_list.curselection()
+        if not selection:
+            return None
+        index = int(selection[0])
+        if index < 0 or index >= len(self._java_rows):
+            return None
+        return self._java_rows[index]
+
+    def _java_describe_selection(self):
+        item = self._java_selected_row()
+        if item is None or self._java_busy:
+            return
+        major = item["major"]
+        if item["installed"]:
+            row = item["row"]
+            self._java_set_status(
+                "Java {0} // {1} // {2}".format(
+                    major, format_bytes(row["size"]), row["java"]
+                )
+            )
+        else:
+            self._java_set_status(
+                "Java {0} 未安装 // {1} // {2}".format(
+                    major,
+                    JAVA_RUNTIME_TARGETS.get(major, ""),
+                    JAVA_RUNTIME_SIZES.get(major, ""),
+                )
+            )
+
+    def _java_download_selected(self):
+        item = self._java_selected_row()
+        if item is None:
+            messagebox.showinfo(
+                "未选择版本",
+                "请先在列表中选择一个 Java 版本。",
+                parent=self._java_win or self.root,
+            )
+            return
+        self._java_start([item["major"]])
+
+    def _java_download_all(self):
+        installed = {row["major"] for row in installed_java_runtimes(self.mc_dir)}
+        missing = [major for major in JAVA_RUNTIME_MAJORS if major not in installed]
+        if not missing:
+            messagebox.showinfo(
+                "已全部安装",
+                "所有内置 Java 版本都已就绪。",
+                parent=self._java_win or self.root,
+            )
+            return
+        confirmed = messagebox.askyesno(
+            "下载全部 Java",
+            "将依次下载 Java {0}\n（合计约 200 MB，源：清华 Adoptium 镜像）\n\n继续吗？".format(
+                " / ".join(str(major) for major in missing)
+            ),
+            parent=self._java_win or self.root,
+        )
+        if not confirmed:
+            return
+        self._java_start(missing)
+
+    def _java_start(self, majors):
+        majors = [int(major) for major in majors if major]
+        if not majors:
+            return
+        if self._java_busy:
+            messagebox.showinfo(
+                "下载进行中",
+                "已有 Java 下载任务在进行，请稍候。",
+                parent=self._java_win or self.root,
+            )
+            return
+        self._java_busy = True
+        self._java_cancel.clear()
+        for button in self._java_buttons[:-1]:
+            try:
+                button.configure(state="disabled")
+            except Exception:
+                pass
+        self._java_set_status(
+            "DOWNLOAD // 准备下载 Java {0} ...".format(
+                " / ".join(str(major) for major in majors)
+            )
+        )
+        threading.Thread(
+            target=self._java_download_worker, args=(majors,), daemon=True
+        ).start()
+
+    def _java_download_worker(self, majors):
+        done = []
+        failed = []
+        for major in majors:
+            try:
+                self.post(
+                    self._java_set_status,
+                    "DOWNLOAD // Java {0} 开始 ...".format(major),
+                )
+                self.post(self._java_progress_ui, 0, 0)
+                result = install_java_runtime(
+                    major,
+                    self.mc_dir,
+                    progress=self._java_progress_from_thread,
+                    cancel=self._java_cancel,
+                    say=lambda text: self.post(self._java_set_status, text),
+                )
+                done.append(major)
+                self.post(
+                    self._java_set_status,
+                    "OK // Java {0} 就绪 // {1}".format(
+                        result["detected"], result["java"]
+                    ),
+                )
+            except OperationCancelled:
+                self.post(self._java_finished, done, failed, "CANCELLED // 已取消")
+                return
+            except Exception as exc:
+                log_debug("java runtime install failed:\n" + traceback.format_exc())
+                failed.append((major, str(exc)))
+                self.post(
+                    self._java_set_status,
+                    "ERROR // Java {0}: {1}".format(major, str(exc)[:150]),
+                )
+        self.post(self._java_finished, done, failed, "")
+
+    def _java_finished(self, done, failed, note):
+        self._java_busy = False
+        for button in self._java_buttons:
+            try:
+                button.configure(state="normal")
+            except Exception:
+                pass
+        self._java_refresh_list()
+        parts = []
+        if done:
+            parts.append(
+                "已就绪: " + ", ".join("Java{0}".format(major) for major in done)
+            )
+        if failed:
+            parts.append(
+                "失败: " + ", ".join("Java{0}".format(major) for major, _ in failed)
+            )
+        if note:
+            parts.append(note)
+        if parts:
+            self._java_set_status(" // ".join(parts))
+        for major in done:
+            self.say("Java {0} 已安装到内置 runtime".format(major))
+        if failed:
+            messagebox.showerror(
+                "Java 下载失败",
+                "\n\n".join(
+                    "Java {0}: {1}".format(major, error) for major, error in failed
+                ),
+                parent=self._java_win or self.root,
+            )
+
+    def _java_set_default(self):
+        item = self._java_selected_row()
+        if item is None or not item["installed"]:
+            messagebox.showinfo(
+                "尚未安装",
+                "该 Java 版本还没有下载，请先点 [ 下载 / 更新选中 ]。",
+                parent=self._java_win or self.root,
+            )
+            return
+        java = item["row"]["java"]
+        self.config["java"] = java
+        self._save_config()
+        self._java_refresh_list()
+        self.say("启动 Java 固定为 Java {0}: {1}".format(item["major"], java))
+        self._java_set_status("PINNED // 启动 Java = {0}".format(java))
+
+    def _java_auto_select(self):
+        self.config["java"] = ""
+        self._save_config()
+        self._java_refresh_list()
+        self.say("启动 Java 已改为自动选择（按版本要求）")
+        self._java_set_status("AUTO // 启动 Java = 按版本要求自动选择")
+
+    def _java_delete_selected(self):
+        item = self._java_selected_row()
+        if item is None or not item["installed"]:
+            messagebox.showinfo(
+                "无法删除",
+                "请选择一个已安装的 Java 版本。",
+                parent=self._java_win or self.root,
+            )
+            return
+        row = item["row"]
+        confirmed = messagebox.askyesno(
+            "删除 Java 运行时",
+            "确定删除 Java {0} 吗？\n{1}".format(item["major"], row["dir"]),
+            parent=self._java_win or self.root,
+        )
+        if not confirmed:
+            return
+        shutil.rmtree(row["dir"], ignore_errors=True)
+        current = str(self.config.get("java") or "").strip()
+        if current and os.path.normcase(
+            os.path.abspath(current)
+        ) == os.path.normcase(os.path.abspath(row["java"])):
+            self.config["java"] = ""
+            self._save_config()
+            self.say("启动 Java 已回退为自动选择")
+        self._java_refresh_list()
+        self.say("已删除内置 Java {0}".format(item["major"]))
+
+    def _java_open_dir(self):
+        path = java_runtime_root(self.mc_dir)
+        try:
+            ensure_dir(path)
+            if os.name == "nt":
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as exc:
+            messagebox.showerror(
+                "无法打开目录", str(exc), parent=self._java_win or self.root
+            )
+
+    def _java_close(self):
+        if self._java_busy:
+            confirmed = messagebox.askyesno(
+                "下载进行中",
+                "Java 仍在下载，关闭窗口不会停止下载。\n确定关闭吗？",
+                parent=self._java_win or self.root,
+            )
+            if not confirmed:
+                return
+        win = self._java_win
+        self._java_win = None
+        self._java_list = None
+        self._java_status_var = None
+        self._java_progress_var = None
+        self._java_buttons = []
+        self._java_rows = []
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+    def _build_desktop_hint(self, parent):
+        """Clickable 'no wallpaper yet' label on the desktop area (left column)."""
+        hint = tk.Label(
+            parent,
+            text=(
+                "WALLPAPER // 桌面无壁纸 · 点此设置背景"
+            ),
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            padx=8,
+            pady=6,
+            bd=1,
+            relief="solid",
+            cursor="hand2",
+        )
+        hint.grid(row=1, column=0, sticky="sw", padx=(16, 6), pady=(0, 2))
+        hint.bind("<Button-1>", lambda _event: self.on_open_settings())
+        self.desktop_hint = hint
+
+    def _build_right_panel(self, parent):
+        panel = tk.Frame(parent, bg=C_WHITE, bd=1, relief="solid", padx=8, pady=8)
+        panel.grid(row=1, column=1, sticky="nsew", padx=(6, 14), pady=(10, 0))
+        panel.columnconfigure(0, weight=1)
+        panel.rowconfigure(5, weight=1)
+        self.right_panel = panel
+        self._build_glass_canvas(panel, "right")
+
+        self._mk_title(panel, "MODRINTH ARSENAL // 模组战备架").grid(
+            row=0, column=0, sticky="ew", pady=(0, 6)
+        )
+
+        search_row = tk.Frame(panel, bg=C_WHITE)
+        search_row.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+        search_row.columnconfigure(1, weight=1)
+        tk.Label(
+            search_row,
+            text="SEARCH",
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            padx=4,
+        ).grid(row=0, column=0, sticky="w")
+
+        self.search_entry = tk.Entry(
+            search_row,
+            textvariable=self.search_var,
+            font=FONT_MAIN,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            insertbackground=C_BLACK,
+            relief="solid",
+            bd=1,
+            highlightthickness=0,
+        )
+        self.search_entry.grid(row=0, column=1, sticky="ew", ipady=4, ipadx=4)
+        self.search_entry.bind("<Return>", self.on_search)
+
+        self.btn_search = self._mk_button(
+            search_row, "[ 检索 ]", self.on_search, padx=8
+        )
+        self.btn_search.grid(row=0, column=2, padx=(6, 0))
+
+        self.btn_refresh = self._mk_button(
+            search_row, "[ 热门 ]", self.refresh_hot, padx=8
+        )
+        self.btn_refresh.grid(row=0, column=3, padx=(6, 0))
+
+        filter_row = tk.Frame(panel, bg=C_GRAY, bd=1, relief="solid")
+        filter_row.grid(row=2, column=0, sticky="ew", pady=(0, 4))
+        tk.Label(
+            filter_row,
+            text="LOADER",
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            padx=4,
+        ).pack(side="left")
+        self._shelf_loader_var = tk.StringVar(
+            value=str(self.config.get("mod_filter_loader") or "auto")
+        )
+        for label, value in (
+            ("自动", "auto"),
+            ("Forge", "forge"),
+            ("NeoForge", "neoforge"),
+            ("Fabric", "fabric"),
+            ("Quilt", "quilt"),
+            ("全部", "all"),
+        ):
+            tk.Radiobutton(
+                filter_row,
+                text=label,
+                value=value,
+                variable=self._shelf_loader_var,
+                command=self.on_shelf_loader_change,
+                bg=C_WHITE,
+                fg=C_BLACK,
+                activebackground=C_TEAL,
+                activeforeground=C_WHITE,
+                selectcolor=C_TEAL,
+                font=FONT_SMALL,
+                indicatoron=False,
+                padx=5,
+                pady=1,
+                bd=1,
+                relief="solid",
+                highlightthickness=0,
+                takefocus=0,
+                cursor="hand2",
+            ).pack(side="left", padx=(4, 0))
+
+        self._shelf_filter_var = tk.StringVar(value="")
+
+        bar_head = tk.Frame(panel, bg=C_WHITE)
+        bar_head.grid(row=3, column=0, sticky="ew", pady=(0, 2))
+        self.btn_version_bar = self._mk_button(
+            bar_head,
+            "[ 版本栏 ▼ ]",
+            self.on_toggle_version_bar,
+            font=FONT_SMALL,
+            padx=6,
+            pady=1,
+        )
+        self.btn_version_bar.pack(side="left")
+        self._version_bar_summary_var = tk.StringVar(value="")
+        tk.Label(
+            bar_head,
+            textvariable=self._version_bar_summary_var,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            padx=6,
+        ).pack(side="left", fill="x", expand=True)
+
+        self.version_bar_box = tk.Frame(
+            panel, bg=C_GRAY, bd=1, relief="solid", padx=4, pady=4
+        )
+        self.version_bar_box.grid(row=4, column=0, sticky="ew", pady=(0, 4))
+        self.version_bar_box.columnconfigure(0, weight=1)
+
+        list_frame = tk.Frame(panel, bg=C_WHITE, bd=1, relief="solid")
+        list_frame.grid(row=5, column=0, sticky="nsew")
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+
+        # Icon style arsenal: thumbnail on top, mod name + downloads below.
+        self.listbox = IconGrid(
+            list_frame,
+            on_select=self.on_list_select,
+            on_activate=self.on_list_double,
+            icon_size=ICON_SIZE,
+            card_width=116,
+            multi=True,
+        )
+        self.listbox.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
+
+        bottom_row = tk.Frame(panel, bg=C_WHITE)
+        bottom_row.grid(row=6, column=0, sticky="ew", pady=(4, 0))
+        bottom_row.columnconfigure(0, weight=1)
+
+        self.count_label = tk.Label(
+            bottom_row,
+            text="ARSENAL LOADING ...",
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+        )
+        self.count_label.grid(row=0, column=0, sticky="ew")
+
+        self.btn_more = self._mk_button(
+            bottom_row, "[ 更多 → ]", self.on_search_more, font=FONT_SMALL, padx=6, pady=1
+        )
+        self.btn_more.grid(row=0, column=1, padx=(6, 0))
+        self.btn_more.configure(state="disabled")
+
+        action_row = tk.Frame(panel, bg=C_WHITE)
+        action_row.grid(row=7, column=0, sticky="ew", pady=(4, 0))
+        action_row.columnconfigure(0, weight=1, uniform="actions")
+        action_row.columnconfigure(1, weight=1, uniform="actions")
+        action_row.columnconfigure(2, weight=1, uniform="actions")
+
+        self.btn_assemble = self._mk_button(
+            action_row, "[ 装配所选 ]", self.on_assemble, pady=6
+        )
+        self.btn_assemble.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+
+        self.btn_perf = self._mk_button(
+            action_row, "[ 一键性能全家桶 ]", self.on_perf_pack, pady=6
+        )
+        self.btn_perf.grid(row=0, column=1, sticky="ew", padx=3)
+
+        # Prominent entry: audit the jars already on disk against any MC version.
+        self.btn_audit = self._mk_button(
+            action_row, "[ 模组体检 ]", self.on_open_mod_audit, pady=6
+        )
+        self.btn_audit.grid(row=0, column=2, sticky="ew", padx=(3, 0))
+        try:
+            self.btn_audit.configure(
+                bg=C_TEAL,
+                fg=C_WHITE,
+                activebackground=C_BLACK,
+                activeforeground=C_WHITE,
+            )
+            self.btn_audit.bind(
+                "<Leave>",
+                lambda _event, button=self.btn_audit: button.configure(
+                    bg=C_TEAL, fg=C_WHITE
+                )
+                if str(button.cget("state")) != "disabled"
+                else None,
+                add="+",
+            )
+        except Exception:
+            pass
+
+        # One tap Create (机械动力) bundle, right under the main action row.
+        self.btn_create_pack = self._mk_button(
+            panel,
+            "[ 一键安装机械动力全家桶 ]",
+            self.on_open_create_pack,
+            pady=6,
+        )
+        self.btn_create_pack.grid(row=8, column=0, sticky="ew", pady=(6, 0))
+        try:
+            self.btn_create_pack.configure(
+                bg=C_BLACK,
+                fg=C_WHITE,
+                activebackground=C_TEAL,
+                activeforeground=C_WHITE,
+            )
+            self.btn_create_pack.bind(
+                "<Leave>",
+                lambda _event, button=self.btn_create_pack: button.configure(
+                    bg=C_BLACK, fg=C_WHITE
+                )
+                if str(button.cget("state")) != "disabled"
+                else None,
+                add="+",
+            )
+        except Exception:
+            pass
+
+        self._refresh_shelf_label()
+        self._apply_version_bar_visibility()
+        self._refresh_version_bar()
+        if self._version_bar_open:
+            self._load_mc_tags_once()
+
+    def _list_scroll_set(self, first, last):
+        scrollbar = getattr(self, "scrollbar", None)
+        if scrollbar is None:
+            return
+        try:
+            scrollbar.set(first, last)
+        except Exception:
+            pass
+
+
+    # -- identity ------------------------------------------------------------
+
+    @property
+    def is_ms_mode(self):
+        return (
+            str(self.auth.get("mode") or "offline") == "microsoft"
+            and bool(self.auth.get("access_token"))
+        )
+
+    def _refresh_identity(self):
+        auth = self.auth
+        if self.is_ms_mode:
+            name = str(auth.get("ms_name") or auth.get("username") or "Commander")
+            expires_at = float(auth.get("expires_at") or 0)
+            expired = bool(expires_at) and time.time() >= expires_at
+            self.commander_label.configure(
+                bg=C_TEAL,
+                fg=C_WHITE,
+                text=(
+                    "MICROSOFT // {0}".format(name)
+                    if not expired
+                    else "MICROSOFT // {0} // 令牌待刷新".format(name)
+                ),
+            )
+            self.identity_label.configure(
+                text="{0} · 到期 {1} // 已存 {2} 账号".format(
+                    "正版已授权" if not expired else "正版授权已过期",
+                    ts_to_str(expires_at),
+                    len(auth.get("accounts") or []),
+                )
+            )
+            self.name_var.set(name)
+            self.name_entry.configure(state="disabled")
+            self.uuid_preview_label.configure(
+                text="UUID {0}".format(
+                    short_uuid(auth.get("ms_uuid") or auth.get("uuid") or "-")
+                )
+            )
+        else:
+            name = str(auth.get("username") or self.name_var.get() or "Steve").strip()
+            if not name:
+                name = "Steve"
+            self.commander_label.configure(
+                bg=C_GRAY,
+                fg=C_BLACK,
+                text=title_text("OFFLINE // {0} // 本地访客".format(name)),
+            )
+            self.identity_label.configure(
+                text="离线模式 · 无需授权 // 已存 {0} 账号".format(
+                    len(auth.get("accounts") or [])
+                )
+            )
+            self.name_entry.configure(state="normal")
+            if self.name_var.get() != name:
+                self.name_var.set(name)
+            self._update_uuid_preview()
+        self._refresh_avatar()
+        self._update_controls()
+
+    def _update_uuid_preview(self, _event=None):
+        if self.is_ms_mode or not hasattr(self, "uuid_preview_label"):
+            return
+        name = str(self.name_var.get() or "").strip() or "Steve"
+        try:
+            preview = offline_uuid(name)
+        except Exception:
+            preview = "-"
+        self.uuid_preview_label.configure(
+            text="UUID {0}".format(short_uuid(preview))
+        )
+
+
+    def _update_controls(self):
+        if not self._widgets_ready:
+            return
+        net_state = "disabled" if self._busy else "normal"
+        self.btn_assemble.configure(state=net_state)
+        self.btn_perf.configure(state=net_state)
+        self.btn_search.configure(state=net_state)
+        self.btn_refresh.configure(state=net_state)
+        if getattr(self, "btn_more", None) is not None:
+            more_state = net_state
+            if not self._busy:
+                state = self._search_state or {}
+                ready = bool(state.get("raw")) and int(state.get("fetched") or 0) < int(
+                    state.get("total") or 0
+                )
+                more_state = "normal" if ready else "disabled"
+            self.btn_more.configure(state=more_state)
+        install_busy = self._vanilla_downloading or self._loader_installing
+        self.btn_ignite.configure(
+            state="disabled" if (self._launching or install_busy) else "normal"
+        )
+        self.btn_login.configure(
+            state="disabled" if self._login_in_progress else "normal"
+        )
+        self.btn_sponsor.configure(state="normal")
+        installer_state = "disabled" if (install_busy or self._busy) else "normal"
+        if getattr(self, "btn_vanilla", None) is not None:
+            self.btn_vanilla.configure(state=installer_state)
+        if getattr(self, "btn_loader", None) is not None:
+            self.btn_loader.configure(state=installer_state)
+        for name in ("btn_audit", "btn_create_pack"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.configure(state=net_state)
+
+    def _save_auth(self):
+        try:
+            write_json(AUTH_PATH, self.auth)
+        except OSError as exc:
+            self.say("auth.json 写入失败: {0}".format(exc))
+
+    def _save_config(self):
+        try:
+            write_json(CONFIG_PATH, self.config)
+        except OSError as exc:
+            self.say("config.json 写入失败: {0}".format(exc))
+
+    def _current_profile(self):
+        if self.is_ms_mode:
+            name = str(self.auth.get("ms_name") or self.auth.get("username") or "")
+            if not name:
+                raise LauncherError("正版档案缺少角色名，请重新登录")
+            return {
+                "name": name,
+                "uuid": str(
+                    self.auth.get("ms_uuid")
+                    or self.auth.get("uuid")
+                    or offline_uuid(name)
+                ),
+                "token": str(self.auth.get("access_token") or ""),
+                "mode": "microsoft",
+            }
+        name = str(self.name_var.get() or self.auth.get("username") or "Steve").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,16}", name):
+            raise LauncherError("离线角色名仅允许 1-16 位字母 / 数字 / 下划线")
+        if self.auth.get("username") != name:
+            self.auth["username"] = name
+            self._save_auth()
+        return {
+            "name": name,
+            "uuid": offline_uuid(name),
+            "token": "",
+            "mode": "offline",
+        }
+
+    def on_offline_mode(self):
+        name = str(self.name_var.get() or self.auth.get("username") or "Steve").strip()
+        self._device_cancel.set()
+        self._close_device_client_dialog()
+        self._close_device_dialog()
+        self.auth["mode"] = "offline"
+        self.auth["username"] = name or "Steve"
+        self.auth["access_token"] = ""
+        self.auth["expires_at"] = 0
+        self._save_auth()
+        self._refresh_identity()
+        self.say("已切换离线模式 // IGN: {0}".format(self.auth["username"]))
+
+    def on_logout(self):
+        keep_name = str(
+            self.auth.get("username") or self.name_var.get() or "Steve"
+        ).strip() or "Steve"
+        accounts = self.auth.get("accounts") or []
+        self.auth = dict(DEFAULT_AUTH)
+        self.auth["username"] = keep_name
+        self.auth["accounts"] = accounts
+        self._save_auth()
+        self._device_cancel.set()
+        self._close_device_client_dialog()
+        self._close_device_dialog()
+        self._cancel_browser_dialog()
+        self._close_token_dialog()
+        self._close_accounts()
+        self._refresh_identity()
+        self.say("当前授权已清除 // 已记住账号保留 // 离线 GUEST 会话")
+
+    def on_copy_uuid(self):
+        try:
+            profile = self._current_profile()
+        except LauncherError as exc:
+            messagebox.showwarning("UUID 不可用", str(exc), parent=self.root)
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(profile["uuid"])
+            self.say("UUID 已复制: {0}".format(profile["uuid"]))
+        except Exception as exc:
+            messagebox.showerror("剪贴板失败", str(exc), parent=self.root)
+
+
+    # -- token login ----------------------------------------------------------
+
+    def on_token_login(self):
+        if self._login_in_progress:
+            self.say("已有登录会话在进行中 ...")
+            return
+        if self._token_win is not None:
+            try:
+                self._token_win.deiconify()
+                self._token_win.lift()
+                self._token_win.focus_force()
+                return
+            except Exception:
+                self._token_win = None
+
+        win = tk.Toplevel(self.root)
+        win.title("MICROSOFT TOKEN // 令牌式登录")
+        win.configure(bg=C_WHITE)
+        win.transient(self.root)
+        win.resizable(True, True)
+        win.protocol("WM_DELETE_WINDOW", self._close_token_dialog)
+
+        wrap = tk.Frame(win, bg=C_WHITE, bd=1, relief="solid", padx=10, pady=10)
+        wrap.pack(fill="both", expand=True, padx=8, pady=8)
+
+        tk.Label(
+            wrap,
+            text=title_text("TOKEN AUTH // MICROSOFT 令牌式登录"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        ).pack(fill="x")
+
+        tk.Label(
+            wrap,
+            text=(
+                "支持两种令牌：\n"
+                "  • Microsoft Refresh Token：推荐，登录后自动续期，可长期记住账号\n"
+                "  • Minecraft Access Token：仅令牌有效期内可用，适合临时登录"
+            ),
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            wraplength=720,
+        ).pack(fill="x", pady=(8, 6))
+
+        type_box = tk.Frame(
+            wrap, bg=C_GRAY, bd=1, relief="solid", padx=6, pady=4
+        )
+        type_box.pack(fill="x")
+        tk.Label(
+            type_box,
+            text=title_text("TOKEN TYPE // 令牌类型"),
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+        ).pack(side="left")
+        self._token_vars = {
+            "type": tk.StringVar(value="refresh"),
+            "token": tk.StringVar(value=""),
+            "source": tk.StringVar(value="live"),
+            "client": tk.StringVar(
+                value=str(self.config.get("device_client_id") or "")
+            ),
+            "remember": tk.BooleanVar(value=True),
+        }
+        tk.Radiobutton(
+            type_box,
+            text="Refresh Token（推荐）",
+            variable=self._token_vars["type"],
+            value="refresh",
+            command=self._token_update_mode,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            selectcolor=C_WHITE,
+            activebackground=C_GRAY,
+            activeforeground=C_BLACK,
+            font=FONT_MAIN,
+        ).pack(side="left", padx=(12, 0))
+        tk.Radiobutton(
+            type_box,
+            text="Access Token",
+            variable=self._token_vars["type"],
+            value="access",
+            command=self._token_update_mode,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            selectcolor=C_WHITE,
+            activebackground=C_GRAY,
+            activeforeground=C_BLACK,
+            font=FONT_MAIN,
+        ).pack(side="left", padx=(12, 0))
+
+        tk.Label(
+            wrap,
+            text=title_text("TOKEN // 令牌内容"),
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+        ).pack(fill="x", pady=(8, 2))
+        token_entry = tk.Entry(
+            wrap,
+            textvariable=self._token_vars["token"],
+            font=FONT_SMALL,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            insertbackground=C_BLACK,
+            relief="solid",
+            bd=1,
+            highlightthickness=0,
+        )
+        token_entry.pack(fill="x", ipady=4, ipadx=4)
+        token_entry.bind("<Return>", lambda _event: self._token_login_submit())
+
+        token_row = tk.Frame(wrap, bg=C_WHITE)
+        token_row.pack(fill="x", pady=(4, 0))
+        self._mk_button(token_row, "[ 粘贴 ]", self._token_paste).pack(
+            side="left", padx=(0, 6)
+        )
+        self._mk_button(token_row, "[ 清空 ]", self._token_clear).pack(
+            side="left"
+        )
+
+        source_box = tk.Frame(
+            wrap, bg=C_WHITE, bd=1, relief="solid", padx=6, pady=4
+        )
+        source_box.pack(fill="x", pady=(8, 0))
+        tk.Label(
+            source_box,
+            text=title_text("REFRESH SOURCE // 刷新令牌来源"),
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+        ).pack(fill="x")
+        self._token_source_widgets = []
+        live_radio = tk.Radiobutton(
+            source_box,
+            text="Microsoft Live / Xbox（默认）",
+            variable=self._token_vars["source"],
+            value="live",
+            command=self._token_update_mode,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            selectcolor=C_WHITE,
+            activebackground=C_WHITE,
+            activeforeground=C_BLACK,
+            font=FONT_MAIN,
+        )
+        live_radio.pack(anchor="w")
+        entra_radio = tk.Radiobutton(
+            source_box,
+            text="Entra / Azure（需要 Client ID）",
+            variable=self._token_vars["source"],
+            value="entra",
+            command=self._token_update_mode,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            selectcolor=C_WHITE,
+            activebackground=C_WHITE,
+            activeforeground=C_BLACK,
+            font=FONT_MAIN,
+        )
+        entra_radio.pack(anchor="w")
+        client_row = tk.Frame(source_box, bg=C_WHITE)
+        client_row.pack(fill="x", pady=(2, 0))
+        client_label = tk.Label(
+            client_row,
+            text="AZURE CLIENT ID",
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            width=16,
+        )
+        client_label.pack(side="left")
+        client_entry = tk.Entry(
+            client_row,
+            textvariable=self._token_vars["client"],
+            font=FONT_SMALL,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            insertbackground=C_BLACK,
+            relief="solid",
+            bd=1,
+            highlightthickness=0,
+        )
+        client_entry.pack(side="left", fill="x", expand=True, ipady=2)
+        self._token_source_widgets = [
+            live_radio,
+            entra_radio,
+            client_label,
+            client_entry,
+        ]
+
+        tk.Checkbutton(
+            wrap,
+            text="记住账号（保存 Refresh Token，下次启动自动静默刷新）",
+            variable=self._token_vars["remember"],
+            bg=C_WHITE,
+            fg=C_BLACK,
+            selectcolor=C_WHITE,
+            activebackground=C_WHITE,
+            activeforeground=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+        ).pack(fill="x", pady=(8, 0))
+
+        self._token_status_var = tk.StringVar(
+            value="READY // 令牌只保存在本机 auth.json，不会上传到第三方。"
+        )
+        tk.Label(
+            wrap,
+            textvariable=self._token_status_var,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+            wraplength=720,
+        ).pack(fill="x", pady=(6, 0))
+
+        button_row = tk.Frame(wrap, bg=C_WHITE)
+        button_row.pack(fill="x", pady=(8, 0))
+        self._token_login_btn = self._mk_button(
+            button_row, "[ 验证并登录 ]", self._token_login_submit
+        )
+        self._token_login_btn.pack(
+            side="left", expand=True, fill="x", padx=2
+        )
+        self._mk_button(
+            button_row, "[ 已记住账号 ]", self.on_open_accounts
+        ).pack(side="left", expand=True, fill="x", padx=2)
+        self._mk_button(
+            button_row, "[ 浏览器联动 ]", self._token_use_browser
+        ).pack(side="left", expand=True, fill="x", padx=2)
+        self._mk_button(
+            button_row, "[ 设备代码 ]", self._token_use_device
+        ).pack(side="left", expand=True, fill="x", padx=2)
+        self._mk_button(
+            button_row, "[ 取消 ]", self._close_token_dialog
+        ).pack(side="left", expand=True, fill="x", padx=2)
+
+        self._token_win = win
+        self._token_update_mode()
+        win.update_idletasks()
+        pos_x = self.root.winfo_rootx() + max(
+            0, (self.root.winfo_width() - win.winfo_reqwidth()) // 2
+        )
+        pos_y = self.root.winfo_rooty() + max(
+            0, (self.root.winfo_height() - win.winfo_reqheight()) // 2
+        )
+        win.geometry("+{0}+{1}".format(pos_x, pos_y))
+        win.minsize(760, 520)
+        self.say("令牌式登录已打开 // Refresh Token 可长期记住账号")
+
+    def _token_update_mode(self):
+        if not self._token_vars:
+            return
+        mode = str(self._token_vars["type"].get() or "refresh")
+        source = str(self._token_vars["source"].get() or "live")
+        state = "normal" if mode == "refresh" else "disabled"
+        for widget in self._token_source_widgets[:2]:
+            try:
+                widget.configure(state=state)
+            except Exception:
+                pass
+        client_state = "normal" if (mode == "refresh" and source == "entra") else "disabled"
+        for widget in self._token_source_widgets[2:]:
+            try:
+                widget.configure(state=client_state)
+            except Exception:
+                pass
+        if self._token_status_var is not None and not self._login_in_progress:
+            if mode == "access":
+                self._token_status_var.set(
+                    "ACCESS TOKEN // 仅验证当前令牌，有效期结束后需要重新获取。"
+                )
+            elif source == "entra":
+                self._token_status_var.set(
+                    "REFRESH TOKEN // Entra 模式，请填写签发令牌时的 Azure Client ID。"
+                )
+            else:
+                self._token_status_var.set(
+                    "REFRESH TOKEN // Microsoft Live / Xbox 模式，可长期自动续期。"
+                )
+
+    def _token_paste(self):
+        if not self._token_vars:
+            return
+        try:
+            text = str(self.root.clipboard_get() or "").strip()
+        except Exception as exc:
+            self.say("读取剪贴板失败: {0}".format(exc))
+            return
+        self._token_vars["token"].set(text)
+        if self._token_status_var is not None:
+            self._token_status_var.set(
+                "PASTED // 已粘贴 {0} 个字符，点击 [验证并登录]。".format(
+                    len(clean_token_input(text))
+                )
+            )
+
+    def _token_clear(self):
+        if self._token_vars:
+            self._token_vars["token"].set("")
+        if self._token_status_var is not None:
+            self._token_status_var.set("READY // 请粘贴令牌。")
+
+    def _close_token_dialog(self):
+        win = self._token_win
+        self._token_win = None
+        self._token_vars = {}
+        self._token_status_var = None
+        self._token_login_btn = None
+        self._token_source_widgets = []
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+    def _token_use_browser(self):
+        self._close_token_dialog()
+        self.on_ms_login("browser")
+
+    def _token_use_device(self):
+        self._close_token_dialog()
+        self.on_ms_login("device")
+
+    def _token_login_submit(self):
+        if self._login_in_progress:
+            self.say("已有登录会话在进行中 ...")
+            return
+        if not self._token_vars:
+            return
+        token = clean_token_input(self._token_vars["token"].get())
+        if not token:
+            messagebox.showwarning(
+                "缺少令牌",
+                "请粘贴 Microsoft Refresh Token 或 Minecraft Access Token。",
+                parent=self._token_win or self.root,
+            )
+            return
+        kind = str(self._token_vars["type"].get() or "refresh")
+        remember = bool(self._token_vars["remember"].get())
+        if kind == "refresh":
+            source = str(self._token_vars["source"].get() or "live")
+            if source == "entra":
+                flow = "device"
+                client_id = str(self._token_vars["client"].get() or "").strip()
+                if not client_id:
+                    messagebox.showwarning(
+                        "缺少 Client ID",
+                        "Entra / Azure 令牌需要签发它的 Azure 应用 Client ID。\n"
+                        "可在 config.json 的 device_client_id 中预先配置。",
+                        parent=self._token_win or self.root,
+                    )
+                    return
+            else:
+                flow = "browser"
+                client_id = str(
+                    self.config.get("client_id") or MS_DEFAULT_CLIENT_ID
+                )
+        else:
+            flow = "token"
+            client_id = ""
+        if self._token_login_btn is not None:
+            self._token_login_btn.configure(state="disabled")
+        if self._token_status_var is not None:
+            self._token_status_var.set(
+                "VERIFYING // 正在验证令牌并读取 Minecraft 档案 ..."
+            )
+        self._start_token_auth(kind, token, flow, client_id, remember)
+
+    def _start_token_auth(self, kind, token, flow, client_id, remember):
+        if self._login_in_progress:
+            return
+        self._login_in_progress = True
+        self._update_controls()
+        self.say(
+            "令牌验证中 // 类型 {0} // {1}".format(
+                "Refresh Token" if kind == "refresh" else "Access Token",
+                "记住账号" if remember else "仅本次会话",
+            )
+        )
+        threading.Thread(
+            target=self._token_auth_worker,
+            args=(kind, token, flow, client_id, remember),
+            daemon=True,
+        ).start()
+
+    def _auth_from_refresh_token(self, refresh_token, flow, client_id):
+        token = msa_refresh_access_token(refresh_token, client_id, flow)
+        mc = msa_xbox_to_minecraft(
+            str(token.get("access_token") or ""), azure=str(flow).lower() == "device"
+        )
+        new_refresh = str(token.get("refresh_token") or refresh_token)
+        return {
+            "mode": "microsoft",
+            "flow": flow,
+            "username": mc["name"],
+            "uuid": mc["uuid"],
+            "access_token": mc["access_token"],
+            "refresh_token": new_refresh,
+            "ms_name": mc["name"],
+            "ms_uuid": mc["uuid"],
+            "ms_refresh_token": new_refresh,
+            "expires_at": time.time()
+            + max(300, int(mc.get("expires_in") or 86400) - 60),
+            "last_login": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def _auth_from_access_token(self, access_token):
+        mc = msa_fetch_minecraft_profile(access_token)
+        expires_at = jwt_expiry(access_token)
+        if not expires_at:
+            expires_at = time.time() + 3600
+        return {
+            "mode": "microsoft",
+            "flow": "token",
+            "username": mc["name"],
+            "uuid": mc["uuid"],
+            "access_token": access_token,
+            "refresh_token": "",
+            "ms_name": mc["name"],
+            "ms_uuid": mc["uuid"],
+            "ms_refresh_token": "",
+            "expires_at": expires_at,
+            "last_login": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def _token_auth_worker(self, kind, token, flow, client_id, remember):
+        try:
+            if kind == "refresh":
+                data = self._auth_from_refresh_token(token, flow, client_id)
+            else:
+                data = self._auth_from_access_token(token)
+            self.post(
+                self._token_auth_success,
+                data,
+                remember,
+                kind,
+                flow,
+                client_id,
+            )
+        except Exception as exc:
+            log_debug("token auth failed:\n" + traceback.format_exc())
+            self.post(self._token_auth_failure, self._oauth_error_text(exc, kind))
+        finally:
+            self.post(self._finish_token_login)
+
+    def _oauth_error_text(self, exc, kind):
+        if isinstance(exc, HttpError):
+            info = exc.json()
+            error = str(info.get("error") or "")
+            description = str(info.get("error_description") or "").strip()
+            if kind == "refresh" and error in {
+                "invalid_grant",
+                "invalid_request",
+                "invalid_client",
+                "unauthorized_client",
+            }:
+                return (
+                    "Refresh Token 验证失败（{0}）。\n"
+                    "请确认令牌没有过期，并检查来源：\n"
+                    "  • Microsoft Live / Xbox：使用默认 Client ID\n"
+                    "  • Entra / Azure：填写签发令牌时的 Client ID\n\n"
+                    "{1}"
+                ).format(error, description or str(exc))
+            if error:
+                return "{0}\n{1}".format(error, description or str(exc))
+        return str(exc)
+
+    def _token_auth_success(self, data, remember, kind, flow, client_id):
+        accounts = self.auth.get("accounts") or []
+        self.auth = dict(data)
+        self.auth["accounts"] = accounts
+        if remember:
+            self._remember_account(self.auth)
+            self._save_auth()
+        if flow in {"browser", "device"}:
+            if flow == "device" and client_id:
+                self.config["device_client_id"] = client_id
+            self.config["auth_flow"] = flow
+            self._save_config()
+        self._refresh_identity()
+        if kind == "refresh":
+            if remember:
+                message = (
+                    "令牌登录成功 // COMMANDER {0} // 已记住账号，下次启动自动刷新"
+                ).format(self.auth.get("ms_name") or self.auth.get("username"))
+            else:
+                message = "令牌登录成功 // COMMANDER {0} // 仅本次会话".format(
+                    self.auth.get("ms_name") or self.auth.get("username")
+                )
+        else:
+            message = "Access Token 登录成功 // COMMANDER {0} // 仅当前令牌有效".format(
+                self.auth.get("ms_name") or self.auth.get("username")
+            )
+        self.say(message)
+        self._close_token_dialog()
+
+    def _token_auth_failure(self, message):
+        text = str(message or "令牌验证失败")
+        if self._token_status_var is not None:
+            self._token_status_var.set("FAILED // " + text.replace("\n", " ")[:180])
+        if self._token_login_btn is not None:
+            try:
+                self._token_login_btn.configure(state="normal")
+            except Exception:
+                pass
+        self.say("令牌登录失败: {0}".format(text.replace("\n", " ")[:160]))
+        messagebox.showerror(
+            "令牌登录失败", text, parent=self._token_win or self.root
+        )
+
+    def _finish_token_login(self):
+        self._login_in_progress = False
+        self._update_controls()
+        if self._token_login_btn is not None:
+            try:
+                self._token_login_btn.configure(state="normal")
+            except Exception:
+                pass
+
+    def _remember_account(self, auth):
+        refresh_token = str(auth.get("refresh_token") or "").strip()
+        if not refresh_token:
+            return
+        name = str(auth.get("ms_name") or auth.get("username") or "Commander")
+        account_uuid = str(auth.get("uuid") or "")
+        flow = str(auth.get("flow") or "browser")
+        if flow == "device":
+            client_id = str(
+                self.config.get("device_client_id") or auth.get("client_id") or ""
+            )
+        else:
+            client_id = str(
+                self.config.get("client_id") or MS_DEFAULT_CLIENT_ID
+            )
+        accounts = [
+            item
+            for item in (auth.get("accounts") or [])
+            if isinstance(item, dict)
+        ]
+        key = (account_uuid or name).lower()
+        accounts = [
+            item
+            for item in accounts
+            if str(item.get("uuid") or item.get("name") or "").lower() != key
+        ]
+        accounts.insert(
+            0,
+            {
+                "name": name,
+                "uuid": account_uuid,
+                "refresh_token": refresh_token,
+                "flow": flow,
+                "client_id": client_id,
+                "last_login": str(auth.get("last_login") or ""),
+            },
+        )
+        auth["accounts"] = accounts[:8]
+
+    def on_open_accounts(self):
+        if self._accounts_win is not None:
+            try:
+                self._accounts_win.deiconify()
+                self._accounts_win.lift()
+                self._accounts_win.focus_force()
+                return
+            except Exception:
+                self._accounts_win = None
+        accounts = [
+            item
+            for item in (self.auth.get("accounts") or [])
+            if isinstance(item, dict) and item.get("refresh_token")
+        ]
+        if not accounts:
+            messagebox.showinfo(
+                "暂无已记住账号",
+                "还没有保存的账号。\n\n"
+                "请在 [令牌式登录] 中粘贴 Microsoft Refresh Token，\n"
+                "并勾选“记住账号”。",
+                parent=self.root,
+            )
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("ACCOUNT VAULT // 已记住账号")
+        win.configure(bg=C_WHITE)
+        win.transient(self.root)
+        win.resizable(True, True)
+        win.protocol("WM_DELETE_WINDOW", self._close_accounts)
+
+        wrap = tk.Frame(win, bg=C_WHITE, bd=1, relief="solid", padx=10, pady=10)
+        wrap.pack(fill="both", expand=True, padx=8, pady=8)
+
+        tk.Label(
+            wrap,
+            text=title_text("ACCOUNT VAULT // 已记住的正版账号"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        ).pack(fill="x")
+
+        tk.Label(
+            wrap,
+            text=(
+                "账号保存在本机 auth.json；选择后会用 Refresh Token 自动登录，\n"
+                "无需再次打开浏览器。令牌不会显示在此页面。"
+            ),
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+        ).pack(fill="x", pady=(8, 6))
+
+        list_frame = tk.Frame(wrap, bg=C_WHITE, bd=1, relief="solid")
+        list_frame.pack(fill="both", expand=True)
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+        self._accounts_list = tk.Listbox(
+            list_frame,
+            height=8,
+            selectmode="browse",
+            font=FONT_MAIN,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            selectbackground=C_TEAL,
+            selectforeground=C_WHITE,
+            activestyle="none",
+            exportselection=False,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+        )
+        self._accounts_list.grid(
+            row=0, column=0, sticky="nsew", padx=(2, 0), pady=2
+        )
+        self._accounts_list.bind("<<ListboxSelect>>", self._accounts_select)
+        self._accounts_list.bind(
+            "<Double-Button-1>", self._accounts_use
+        )
+        accounts_scroll = tk.Scrollbar(
+            list_frame,
+            orient="vertical",
+            command=self._accounts_list.yview,
+            width=14,
+            bg=C_GRAY,
+            activebackground=C_TEAL,
+            troughcolor=C_WHITE,
+            bd=1,
+            relief="solid",
+            highlightthickness=0,
+        )
+        accounts_scroll.grid(row=0, column=1, sticky="ns")
+        self._accounts_list.configure(yscrollcommand=accounts_scroll.set)
+
+        self._accounts_rows = accounts
+        self._accounts_refresh_list()
+
+        self._accounts_detail_var = tk.StringVar(value="选择账号查看详情。")
+        tk.Label(
+            wrap,
+            textvariable=self._accounts_detail_var,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="nw",
+            justify="left",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+            wraplength=660,
+        ).pack(fill="x", pady=(6, 0))
+        self._accounts_select()
+
+        button_row = tk.Frame(wrap, bg=C_WHITE)
+        button_row.pack(fill="x", pady=(8, 0))
+        self._mk_button(
+            button_row, "[ 使用此账号 ]", self._accounts_use
+        ).pack(side="left", expand=True, fill="x", padx=2)
+        self._mk_button(
+            button_row, "[ 删除 ]", self._accounts_delete
+        ).pack(side="left", expand=True, fill="x", padx=2)
+        self._mk_button(
+            button_row, "[ 关闭 ]", self._close_accounts
+        ).pack(side="left", expand=True, fill="x", padx=2)
+
+        self._accounts_win = win
+        win.update_idletasks()
+        pos_x = self.root.winfo_rootx() + max(
+            0, (self.root.winfo_width() - win.winfo_reqwidth()) // 2
+        )
+        pos_y = self.root.winfo_rooty() + max(
+            0, (self.root.winfo_height() - win.winfo_reqheight()) // 2
+        )
+        win.geometry("+{0}+{1}".format(pos_x, pos_y))
+        win.minsize(700, 460)
+        self.say("已记住账号 // 共 {0} 个".format(len(accounts)))
+
+    def _accounts_refresh_list(self):
+        if self._accounts_list is None:
+            return
+        self._accounts_list.delete(0, tk.END)
+        for account in self._accounts_rows:
+            name = str(account.get("name") or "Commander")
+            uuid_text = str(account.get("uuid") or "-")
+            last_login = str(account.get("last_login") or "-")
+            self._accounts_list.insert(
+                tk.END,
+                "{0:<16} // {1} // {2}".format(name, uuid_text, last_login),
+            )
+        if self._accounts_rows:
+            self._accounts_list.selection_set(0)
+            self._accounts_list.activate(0)
+            self._accounts_select()
+
+    def _accounts_select(self, _event=None):
+        account = self._accounts_selected()
+        if account is None or self._accounts_detail_var is None:
+            return
+        self._accounts_detail_var.set(
+            "ACCOUNT   : {0}\nUUID      : {1}\nFLOW      : {2}\nLAST LOGIN: {3}\n"
+            "TOKEN     : STORED IN auth.json".format(
+                account.get("name") or "-",
+                account.get("uuid") or "-",
+                str(account.get("flow") or "browser").upper(),
+                account.get("last_login") or "-",
+            )
+        )
+
+    def _accounts_selected(self):
+        if self._accounts_list is None:
+            return None
+        selection = self._accounts_list.curselection()
+        if not selection:
+            return None
+        index = int(selection[0])
+        if index < 0 or index >= len(self._accounts_rows):
+            return None
+        return self._accounts_rows[index]
+
+    def _accounts_use(self, _event=None):
+        account = self._accounts_selected()
+        if account is None:
+            messagebox.showinfo(
+                "未选择账号", "请先选择一个已记住账号。", parent=self.root
+            )
+            return
+        if self._login_in_progress:
+            self.say("已有登录会话在进行中 ...")
+            return
+        self._close_accounts()
+        self._start_account_login(account)
+
+    def _accounts_delete(self):
+        account = self._accounts_selected()
+        if account is None:
+            return
+        key = str(account.get("uuid") or account.get("name") or "").lower()
+        if not messagebox.askyesno(
+            "删除已记住账号",
+            "从 auth.json 中删除该账号的 Refresh Token？\n"
+            "当前会话不会被强制退出。",
+            parent=self._accounts_win or self.root,
+        ):
+            return
+        accounts = [
+            item
+            for item in (self.auth.get("accounts") or [])
+            if isinstance(item, dict)
+            and str(item.get("uuid") or item.get("name") or "").lower() != key
+        ]
+        self.auth["accounts"] = accounts
+        self._save_auth()
+        self._accounts_rows = [
+            item
+            for item in accounts
+            if isinstance(item, dict) and item.get("refresh_token")
+        ]
+        if not self._accounts_rows:
+            self._close_accounts()
+            self.say("已删除记住账号 // 列表为空")
+            return
+        self._accounts_refresh_list()
+        self.say("已删除记住账号 // 剩余 {0} 个".format(len(self._accounts_rows)))
+
+    def _close_accounts(self):
+        win = self._accounts_win
+        self._accounts_win = None
+        self._accounts_list = None
+        self._accounts_rows = []
+        self._accounts_detail_var = None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+    def _start_account_login(self, account):
+        refresh_token = str(account.get("refresh_token") or "").strip()
+        if not refresh_token:
+            messagebox.showwarning(
+                "账号不可用",
+                "该账号没有保存 Refresh Token，请重新使用微软设备码登录。",
+                parent=self.root,
+            )
+            return
+        flow = str(account.get("flow") or "browser")
+        if flow == "device":
+            client_id = str(
+                account.get("client_id")
+                or self.config.get("device_client_id")
+                or ""
+            )
+        elif flow == "live":
+            client_id = MS_DEFAULT_CLIENT_ID
+        else:
+            flow = "browser"
+            client_id = str(
+                self.config.get("client_id") or MS_DEFAULT_CLIENT_ID
+            )
+        self._login_in_progress = True
+        self._update_controls()
+        self.say(
+            "正在使用已记住账号 // {0} // 刷新令牌 ...".format(
+                account.get("name") or account.get("uuid") or "?"
+            )
+        )
+        threading.Thread(
+            target=self._account_login_worker,
+            args=(refresh_token, flow, client_id),
+            daemon=True,
+        ).start()
+
+    def _account_login_worker(self, refresh_token, flow, client_id):
+        try:
+            data = self._auth_from_refresh_token(
+                refresh_token, flow, client_id
+            )
+            self.post(
+                self._token_auth_success,
+                data,
+                True,
+                "refresh",
+                flow,
+                client_id,
+            )
+        except Exception as exc:
+            log_debug("account login failed:\n" + traceback.format_exc())
+            self.post(
+                self._account_login_failure,
+                self._oauth_error_text(exc, "refresh"),
+            )
+        finally:
+            self.post(self._finish_token_login)
+
+    def _account_login_failure(self, message):
+        text = str(message or "账号登录失败")
+        self.say("账号登录失败: {0}".format(text.replace("\n", " ")[:160]))
+        messagebox.showerror(
+            "账号登录失败", text, parent=self.root
+        )
+
+    # -- Microsoft account login ---------------------------------------------
+
+    def _device_client_id(self):
+        value = str(
+            os.environ.get("AKM_MS_CLIENT_ID")
+            or self.config.get("device_client_id")
+            or ""
+        ).strip()
+        if not re.fullmatch(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+            r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            value,
+        ):
+            return ""
+        return value
+
+    def on_device_login(self):
+        if self._login_in_progress:
+            self.say("已有登录会话在进行中 ...")
+            return
+        custom_client_id = self._device_client_id()
+        if custom_client_id:
+            self._start_device_login(custom_client_id, legacy=False)
+        else:
+            self._start_device_login(MS_DEFAULT_CLIENT_ID, legacy=True)
+
+    def _open_device_client_dialog(self):
+        if self._client_win is not None:
+            try:
+                self._client_win.deiconify()
+                self._client_win.lift()
+                self._client_win.focus_force()
+                return
+            except Exception:
+                self._client_win = None
+
+        win = tk.Toplevel(self.root)
+        win.title("MICROSOFT DEVICE CODE // 配置 Client ID")
+        win.configure(bg=C_WHITE)
+        win.transient(self.root)
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", self._close_device_client_dialog)
+
+        wrap = tk.Frame(win, bg=C_WHITE, bd=1, relief="solid", padx=10, pady=10)
+        wrap.pack(fill="both", expand=True, padx=8, pady=8)
+        tk.Label(
+            wrap,
+            text=title_text("MICROSOFT DEVICE CODE // 首次配置"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        ).pack(fill="x")
+        tk.Label(
+            wrap,
+            text=(
+                "设备代码流需要一个 Azure 公共客户端应用 ID。\n"
+                "微软不再允许使用旧版 Xbox Client ID 申请设备码。\n\n"
+                "配置步骤：\n"
+                "1. 打开 Azure / Entra 应用注册，新建应用；\n"
+                "2. 在 Authentication 中启用 “Allow public client flows”；\n"
+                "3. 复制 Application (client) ID 填入下方。\n\n"
+                "Client ID 只保存在本机 config.json，不会上传。"
+            ),
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            wraplength=620,
+        ).pack(fill="x", pady=(8, 6))
+
+        self._client_var = tk.StringVar(
+            value=str(self.config.get("device_client_id") or "")
+        )
+        entry = tk.Entry(
+            wrap,
+            textvariable=self._client_var,
+            font=FONT_MAIN,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            insertbackground=C_BLACK,
+            relief="solid",
+            bd=1,
+            highlightthickness=0,
+        )
+        entry.pack(fill="x", ipady=4, ipadx=4)
+        entry.bind("<Return>", lambda _event: self._device_client_continue())
+        tk.Label(
+            wrap,
+            text="也可设置环境变量 AKM_MS_CLIENT_ID，优先级高于 config.json。",
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+        ).pack(fill="x", pady=(4, 0))
+
+        button_row = tk.Frame(wrap, bg=C_WHITE)
+        button_row.pack(fill="x", pady=(10, 0))
+        self._mk_button(
+            button_row, "[ 保存并登录 ]", self._device_client_continue
+        ).pack(side="left", expand=True, fill="x", padx=2)
+        self._mk_button(
+            button_row, "[ 打开 Azure 应用注册 ]", self._open_azure_apps
+        ).pack(side="left", expand=True, fill="x", padx=2)
+        self._mk_button(
+            button_row, "[ 改用内置 Xbox 通道 ]", self._device_client_use_builtin
+        ).pack(side="left", expand=True, fill="x", padx=2)
+        self._mk_button(
+            button_row, "[ 取消 ]", self._close_device_client_dialog
+        ).pack(side="left", expand=True, fill="x", padx=2)
+
+        self._client_win = win
+        win.update_idletasks()
+        pos_x = self.root.winfo_rootx() + max(
+            0, (self.root.winfo_width() - win.winfo_reqwidth()) // 2
+        )
+        pos_y = self.root.winfo_rooty() + max(
+            0, (self.root.winfo_height() - win.winfo_reqheight()) // 2
+        )
+        win.geometry("+{0}+{1}".format(pos_x, pos_y))
+        try:
+            entry.focus_set()
+        except Exception:
+            pass
+        self.say("设备码登录需要先配置 Azure Client ID")
+
+    def _device_client_use_builtin(self):
+        """Clear the custom Azure id and use the built-in Xbox device channel."""
+        self.config["device_client_id"] = ""
+        self.config["auth_flow"] = "live"
+        self._save_config()
+        self._close_device_client_dialog()
+        self.say("已切换回内置 Xbox 设备码通道（无需 Azure Client ID）")
+        self._start_device_login(MS_DEFAULT_CLIENT_ID, legacy=True)
+
+    def _device_client_continue(self):
+        client_id = str(
+            self._client_var.get() if self._client_var is not None else ""
+        ).strip()
+        if not re.fullmatch(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+            r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            client_id,
+        ):
+            messagebox.showwarning(
+                "Client ID 格式错误",
+                "请填写 Azure 应用的 Application (client) ID，格式为 UUID，\n"
+                "例如 00000000-0000-0000-0000-000000000000。",
+                parent=self._client_win or self.root,
+            )
+            return
+        self.config["device_client_id"] = client_id
+        self.config["auth_flow"] = "device"
+        self._save_config()
+        self._close_device_client_dialog()
+        self._start_device_login(client_id, legacy=False)
+
+    def _open_azure_apps(self):
+        self.open_external_url(
+            "https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade",
+            "Azure 应用注册",
+        )
+
+    def _close_device_client_dialog(self):
+        win = self._client_win
+        self._client_win = None
+        self._client_var = None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+    def _start_device_login(self, client_id, legacy=True):
+        if self._login_in_progress:
+            self.say("已有登录会话在进行中 ...")
+            return
+        self._device_legacy = bool(legacy)
+        if legacy:
+            self.config["auth_flow"] = "live"
+        else:
+            self.config["device_client_id"] = str(client_id or "").strip()
+            self.config["auth_flow"] = "device"
+        self._save_config()
+        self._login_flow = "device"
+        self._device_cancel.clear()
+        self._login_in_progress = True
+        self._update_controls()
+        self.say(
+            "正在向微软申请设备代码 ..."
+            if legacy
+            else "正在向 Microsoft Entra 申请设备代码 ..."
+        )
+        threading.Thread(target=self._ms_login_worker, daemon=True).start()
+
+    def on_ms_login(self, flow=None):
+        if flow is None or str(flow).lower() == "device":
+            self.on_device_login()
+            return
+        if self._login_in_progress:
+            self.say("已有登录会话在进行中 ...")
+            return
+        selected = "browser"
+        self._login_flow = selected
+        self._login_in_progress = True
+        self._update_controls()
+        self.say("正在构建微软浏览器授权链接 ...")
+        threading.Thread(target=self._ms_login_worker, daemon=True).start()
+
+    def _ms_login_worker(self):
+        flow = str(self._login_flow or "browser").lower()
+        device_login = flow == "device"
+        legacy_device = False
+        try:
+            if flow == "device":
+                legacy_device = bool(self._device_legacy)
+                client_id = (
+                    MS_DEFAULT_CLIENT_ID
+                    if legacy_device
+                    else str(self.config.get("device_client_id") or "").strip()
+                )
+                if not client_id:
+                    raise LauncherError("device_client_id 未配置")
+                self._device_cancel.clear()
+                self._device_poll_now.clear()
+                deadline = time.time() + DEVICE_LOGIN_TIMEOUT
+                token = None
+                renew_count = 0
+                last_code_at = 0.0
+                last_browser_at = 0.0
+                login_log(
+                    "device login start: flow={0} client_id={1} scope={2}".format(
+                        "live" if legacy_device else "entra",
+                        client_id,
+                        MS_LIVE_SCOPE if legacy_device else MS_SCOPE,
+                    )
+                )
+                while token is None:
+                    if self._device_cancel.is_set():
+                        raise LoginCancelled("已取消设备码登录")
+                    if time.time() >= deadline:
+                        raise LauncherError(
+                            "设备码登录等待超时（60 分钟），请重新点击正版登录。"
+                        )
+                    try:
+                        device = (
+                            msa_request_live_device_code(client_id)
+                            if legacy_device
+                            else msa_request_device_code(client_id)
+                        )
+                    except HttpError as exc:
+                        info = exc.json()
+                        error = str(info.get("error") or "")
+                        login_log(
+                            "device code request failed: http {0} error={1} detail={2}".format(
+                                exc.code,
+                                error or "?",
+                                str(info.get("error_description") or "")[:160],
+                            )
+                        )
+                        if error in {"unauthorized_client", "invalid_client"}:
+                            raise LauncherError(
+                                "Azure Client ID 无效，或应用未启用 "
+                                "“Allow public client flows”。\n"
+                                "请在 [身份] -> [微软设备代码登录] 中重新配置。"
+                            ) from None
+                        raise
+                    code = str(device.get("user_code") or "")
+                    uri = str(
+                        device.get("verification_uri")
+                        or device.get("verification_url")
+                        or "https://microsoft.com/link"
+                    )
+                    self._code_value = code
+                    self._code_uri = uri
+                    last_code_at = time.time()
+                    login_log(
+                        "device code issued: {0} expires_in={1}s uri={2}".format(
+                            code, device.get("expires_in"), uri
+                        )
+                    )
+                    self.post(self._update_device_dialog, code, uri, renew_count)
+                    # Open the verification page only once per login session;
+                    # renewals update the existing dialog instead of popping
+                    # another browser window.
+                    opened_now = not last_browser_at
+                    if opened_now:
+                        last_browser_at = time.time()
+                        try:
+                            webbrowser.open(uri)
+                        except Exception as exc:
+                            self.say("无法自动打开浏览器: {0}".format(exc))
+                    self.say(
+                        (
+                            "微软安全设备码 {0} // 已复制，浏览器授权页已打开"
+                            if opened_now
+                            else "微软安全设备码 {0} // 已复制，请在已打开的授权页输入"
+                        ).format(code)
+                    )
+                    try:
+                        token = msa_poll_device_token(
+                            device,
+                            client_id,
+                            say=self.say,
+                            cancel=self._device_cancel,
+                            poll_now=self._device_poll_now,
+                            token_url=(
+                                MS_LIVE_TOKEN_URL
+                                + "?client_id="
+                                + urllib.parse.quote(client_id, safe="")
+                                if legacy_device
+                                else MS_ENTRA_TOKEN_URL
+                            ),
+                        )
+                    except LoginNeedsPassword as exc:
+                        login_log("device login needs password: {0}".format(exc.detail[:200]))
+                        self.post(self._close_device_dialog)
+                        message = str(exc)
+                        self.post(lambda msg=message: self._show_password_help(msg))
+                        return
+                    except DeviceCodeExpired as exc:
+                        if self._device_cancel.is_set():
+                            raise LoginCancelled("已取消设备码登录") from None
+                        login_log(
+                            "device code expired after {0:.0f}s (burned={1} detail={2})".format(
+                                time.time() - last_code_at,
+                                isinstance(exc, DeviceCodeUsed),
+                                exc.detail or "-",
+                            )
+                        )
+                        expire_hint = max(60, int(device.get("expires_in") or 900))
+                        burned = isinstance(exc, DeviceCodeUsed)
+                        if burned:
+                            if renew_count >= 2:
+                                raise LauncherError(
+                                    "微软连续两次判定验证码已被消耗，登录未完成。\n"
+                                    "请重新点击 [正版登录]；如果网页里提示需要密码登录，"
+                                    "请选择「其他登录方法 -> 使用我的密码」。\n"
+                                    "诊断日志: logs\\device_login.log"
+                                ) from None
+                        elif (
+                            time.time() - last_code_at
+                            < max(30, min(300, expire_hint * 0.5))
+                            or renew_count >= 3
+                        ):
+                            raise LauncherError(
+                                "微软返回授权已失效：{0}\n"
+                                "请重新点击 [正版登录] 获取新的验证码。\n"
+                                "诊断日志: logs\\device_login.log".format(
+                                    (exc.detail or "invalid_grant / expired_token")[:200]
+                                )
+                            ) from None
+                        renew_count += 1
+                        self.post(
+                            self._set_device_dialog_note,
+                            "验证码已失效，正在自动获取新的验证码 ...",
+                        )
+                        self.say(
+                            "验证码已失效，正在自动刷新新的验证码 "
+                            "（本次登录会话最长 60 分钟）..."
+                        )
+                        continue
+                self.post(self._close_device_dialog)
+                if legacy_device:
+                    flow = "live"
+            else:
+                client_id = str(self.config.get("client_id") or MS_DEFAULT_CLIENT_ID)
+                login_url = msa_build_login_url(client_id)
+                self._browser_code_value = ""
+                self._browser_code_event.clear()
+                self.post(self._browser_dialog, login_url)
+                self.say("浏览器联动：完成登录后把回调 URL 粘贴回 AKM")
+                try:
+                    webbrowser.open(login_url)
+                except Exception as exc:
+                    self.say("无法自动打开浏览器: {0}".format(exc))
+                if not self._browser_code_event.wait(timeout=600):
+                    raise LauncherError("浏览器登录等待超时（10 分钟）")
+                self.post(self._close_browser_dialog)
+                raw = str(self._browser_code_value or "").strip()
+                if not raw:
+                    raise LoginCancelled("已取消浏览器登录")
+                code = msa_extract_code(raw)
+                if not code:
+                    raise LauncherError("未能从回调地址中解析 code")
+                self.say("正在用授权码交换微软令牌 ...")
+                token = msa_exchange_authorization_code(
+                    client_id, MS_REDIRECT_URI, code
+                )
+
+            self.say("微软授权完成，正在交换 Xbox / Minecraft 令牌 ...")
+            mc = msa_xbox_to_minecraft(
+                str(token.get("access_token") or ""),
+                azure=bool(device_login and not legacy_device),
+            )
+            self.post(self._close_device_dialog)
+            self.post(self._close_browser_dialog)
+
+            accounts = self.auth.get("accounts") or []
+            refresh_token = str(
+                token.get("refresh_token")
+                or self.auth.get("refresh_token")
+                or self.auth.get("ms_refresh_token")
+                or ""
+            )
+            self.auth = {
+                "mode": "microsoft",
+                "flow": flow,
+                "username": mc["name"],
+                "uuid": mc["uuid"],
+                "access_token": mc["access_token"],
+                "refresh_token": refresh_token,
+                "ms_name": mc["name"],
+                "ms_uuid": mc["uuid"],
+                "ms_refresh_token": refresh_token,
+                "expires_at": time.time() + max(300, int(mc["expires_in"]) - 60),
+                "last_login": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "accounts": accounts,
+            }
+            self._remember_account(self.auth)
+            if device_login:
+                if not legacy_device:
+                    self.config["device_client_id"] = str(
+                        self.config.get("device_client_id") or ""
+                    )
+                self.config["auth_flow"] = "live" if legacy_device else "device"
+                self._save_config()
+            self._save_auth()
+            self._device_poll_now.clear()
+            self.post(self._refresh_identity)
+            login_log(
+                "login success: mode=microsoft flow={0} name={1} uuid={2} refresh_token={3}".format(
+                    flow, mc["name"], mc["uuid"], "yes" if refresh_token else "no"
+                )
+            )
+            self.say(
+                "微软设备码登录成功 // [AUTH: 微软正版] COMMANDER {0}".format(
+                    mc["name"]
+                )
+                if device_login
+                else "正版登录成功 // COMMANDER {0}".format(mc["name"])
+            )
+            done_message = (
+                "已登录到正版 Minecraft。\n\n"
+                "玩家：{0}\nUUID：{1}\n\n{2}"
+            ).format(
+                mc["name"],
+                mc["uuid"],
+                (
+                    "凭证已保存到 auth.json，下次启动会自动刷新，无需再次输入验证码。"
+                    if refresh_token
+                    else "本次微软没有返回 Refresh Token，重启启动器后需要重新登录。"
+                ),
+            )
+            self.post(
+                lambda msg=done_message: messagebox.showinfo(
+                    "正版登录成功", msg, parent=self.root
+                )
+            )
+        except LoginCancelled as exc:
+            self.post(self._close_device_dialog)
+            self.post(self._close_browser_dialog)
+            self.say(str(exc))
+        except Exception as exc:
+            login_log("login failed: {0}: {1}".format(type(exc).__name__, exc))
+            log_debug("login failed:\n" + traceback.format_exc())
+            self.post(self._close_device_dialog)
+            self.post(self._close_browser_dialog)
+            self.say("正版登录失败: {0}".format(exc))
+            message = str(exc)
+            self.post(
+                lambda msg=message: messagebox.showerror(
+                    "微软登录失败", msg, parent=self.root
+                )
+            )
+        finally:
+            self._device_poll_now.clear()
+            self._login_in_progress = False
+            self.post(self._update_controls)
+
+    def _device_dialog(self, code, uri):
+        self._close_device_dialog()
+        win = tk.Toplevel(self.root)
+        win.title("MICROSOFT OAUTH // 设备代码")
+        win.configure(bg=C_WHITE)
+        win.resizable(False, False)
+        win.transient(self.root)
+        try:
+            win.attributes("-topmost", True)
+        except Exception:
+            pass
+        win.protocol("WM_DELETE_WINDOW", self._cancel_device_login)
+
+        wrap = tk.Frame(win, bg=C_WHITE, bd=1, relief="solid", padx=10, pady=10)
+        wrap.pack(fill="both", expand=True, padx=8, pady=8)
+        tk.Label(
+            wrap,
+            text=title_text("MICROSOFT DEVICE CODE // 设备码登录"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        ).pack(fill="x")
+        tk.Label(
+            wrap,
+            text=(
+                "1. 验证码已自动写入剪贴板，浏览器授权页已自动打开\n"
+                "2. 请在打开的网页中粘贴此代码，登录并点击“继续/允许”\n"
+                "3. 完成后程序会自动同步，不需要再操作本窗口"
+            ),
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+            justify="left",
+        ).pack(fill="x", pady=8)
+        self._code_var = tk.StringVar(
+            value="微软安全设备码: [ {0} ] (已自动复制)".format(code)
+        )
+        tk.Label(
+            wrap,
+            textvariable=self._code_var,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_CODE,
+            bd=1,
+            relief="solid",
+            pady=10,
+        ).pack(fill="x")
+        tk.Label(
+            wrap,
+            text="请在打开的网页中粘贴此代码并完成账号授权，完成后程序将自动同步。",
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            wraplength=560,
+        ).pack(fill="x", pady=(6, 0))
+        self._code_uri_var = tk.StringVar(value=uri)
+        tk.Label(
+            wrap,
+            textvariable=self._code_uri_var,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+        ).pack(fill="x", pady=4)
+        tk.Label(
+            wrap,
+            text=(
+                "提示：如果网页提示无法用当前方式登录，请在登录页选择"
+                "“其他登录方法 -> 使用我的密码”。"
+            ),
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            wraplength=560,
+        ).pack(fill="x")
+        self._code_note_var = tk.StringVar(
+            value="状态: 等待你在网页中完成授权 ..."
+        )
+        tk.Label(
+            wrap,
+            textvariable=self._code_note_var,
+            bg=C_WHITE,
+            fg=C_TEAL,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            wraplength=560,
+        ).pack(fill="x", pady=(4, 0))
+
+        row = tk.Frame(wrap, bg=C_WHITE)
+        row.pack(fill="x", pady=(8, 0))
+        self._mk_button(row, "[ 打开授权页 ]", self._device_dialog_open_url).pack(
+            side="left", expand=True, fill="x", padx=2
+        )
+        self._mk_button(row, "[ 复制验证码 ]", self._device_dialog_copy).pack(
+            side="left", expand=True, fill="x", padx=2
+        )
+        self._mk_button(
+            row, "[ 我已授权，立即检查 ]", self._device_dialog_check_now
+        ).pack(side="left", expand=True, fill="x", padx=2)
+        self._mk_button(row, "[ 取消登录 ]", self._cancel_device_login).pack(
+            side="left", expand=True, fill="x", padx=2
+        )
+
+        win.update_idletasks()
+        pos_x = self.root.winfo_rootx() + max(
+            0, (self.root.winfo_width() - win.winfo_width()) // 2
+        )
+        pos_y = self.root.winfo_rooty() + max(
+            0, (self.root.winfo_height() - win.winfo_height()) // 2
+        )
+        win.geometry("+{0}+{1}".format(pos_x, pos_y))
+        self._code_win = win
+        self._device_dialog_copy()
+
+    def _update_device_dialog(self, code, uri, renew_count=0):
+        """Refresh the open device dialog in place; never duplicate the window."""
+        win = self._code_win
+        if win is None:
+            self._device_dialog(code, uri)
+            return
+        try:
+            if self._code_var is not None:
+                self._code_var.set(
+                    "微软安全设备码: [ {0} ] (已自动复制)".format(code)
+                )
+            if self._code_uri_var is not None:
+                self._code_uri_var.set(uri)
+            if self._code_note_var is not None:
+                self._code_note_var.set(
+                    "状态: 上一个验证码已过期，这是第 {0} 个验证码，"
+                    "请在网页输入最新验证码".format(renew_count + 1)
+                    if renew_count
+                    else "状态: 等待你在网页中完成授权 ..."
+                )
+            win.deiconify()
+            win.lift()
+            try:
+                win.attributes("-topmost", True)
+            except Exception:
+                pass
+        except Exception:
+            self._close_device_dialog()
+            self._device_dialog(code, uri)
+            return
+        self._device_dialog_copy()
+
+    def _set_device_dialog_note(self, text):
+        try:
+            if self._code_note_var is not None:
+                self._code_note_var.set("状态: " + str(text))
+        except Exception:
+            pass
+
+    def _device_dialog_check_now(self):
+        self._device_poll_now.set()
+        self._set_device_dialog_note("正在检查授权结果 ...")
+        self.say("正在立即检查微软授权结果 ...")
+
+    def _show_password_help(self, message):
+        """Explain the 'account must sign in again' Microsoft rejection."""
+        self.say("微软要求该账号重新登录（建议改用密码方式）")
+        try:
+            choice = messagebox.askyesno(
+                "微软登录：需要密码登录",
+                str(message) + "\n\n是否现在打开微软密码设置页面？",
+                parent=self.root,
+            )
+        except Exception:
+            choice = False
+        if choice:
+            self.open_external_url(
+                "https://account.live.com/password/Change", "微软账户密码设置"
+            )
+
+    def _device_dialog_open_url(self):
+        if self._code_uri:
+            try:
+                webbrowser.open(self._code_uri)
+            except Exception as exc:
+                self.say("无法打开浏览器: {0}".format(exc))
+
+    def _device_dialog_copy(self):
+        if not self._code_value:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self._code_value)
+            self.say("微软安全设备码已复制: {0}".format(self._code_value))
+        except Exception as exc:
+            self.say("剪贴板失败: {0}".format(exc))
+
+    def _cancel_device_login(self):
+        self._device_cancel.set()
+        self._close_device_dialog()
+        self.say("已取消设备码登录")
+
+    def _close_device_dialog(self):
+        win = self._code_win
+        self._code_win = None
+        self._code_var = None
+        self._code_uri_var = None
+        self._code_note_var = None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+    def _browser_dialog(self, login_url):
+        self._close_browser_dialog()
+        self._browser_url = login_url
+        self._browser_code_value = ""
+        win = tk.Toplevel(self.root)
+        win.title("MICROSOFT OAUTH // 浏览器联动")
+        win.configure(bg=C_WHITE)
+        win.resizable(False, False)
+        win.transient(self.root)
+        try:
+            win.attributes("-topmost", True)
+        except Exception:
+            pass
+        win.protocol("WM_DELETE_WINDOW", self._cancel_browser_dialog)
+
+        wrap = tk.Frame(win, bg=C_WHITE, bd=1, relief="solid", padx=10, pady=10)
+        wrap.pack(fill="both", expand=True, padx=8, pady=8)
+        tk.Label(
+            wrap,
+            text=title_text("MICROSOFT ACCOUNT // 浏览器授权联动"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        ).pack(fill="x")
+        tk.Label(
+            wrap,
+            text=(
+                "1. 浏览器已自动打开微软登录页，完成账号授权\n"
+                "2. 页面会跳转到 login.live.com/oauth20_desktop.srf\n"
+                "3. 复制浏览器地址栏的完整 URL（含 code=...）粘贴到下方\n"
+                "4. 点击 [ 完成登录 ] 自动换取正版令牌"
+            ),
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+            justify="left",
+            wraplength=560,
+        ).pack(fill="x", pady=8)
+        tk.Label(
+            wrap,
+            text=login_url,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            bd=1,
+            relief="solid",
+            padx=4,
+            pady=4,
+            wraplength=560,
+        ).pack(fill="x")
+
+        self._browser_input_var = tk.StringVar(value="")
+        entry = tk.Entry(
+            wrap,
+            textvariable=self._browser_input_var,
+            font=FONT_MAIN,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            insertbackground=C_BLACK,
+            relief="solid",
+            bd=1,
+            highlightthickness=0,
+        )
+        entry.pack(fill="x", pady=(8, 0), ipady=4, ipadx=4)
+        entry.bind("<Return>", lambda _event: self._browser_dialog_submit())
+        self._browser_entry = entry
+
+        row = tk.Frame(wrap, bg=C_WHITE)
+        row.pack(fill="x", pady=(8, 0))
+        self._mk_button(row, "[ 完成登录 ]", self._browser_dialog_submit).pack(
+            side="left", expand=True, fill="x", padx=2
+        )
+        self._mk_button(row, "[ 重新打开授权页 ]", self._browser_dialog_open_url).pack(
+            side="left", expand=True, fill="x", padx=2
+        )
+        self._mk_button(row, "[ 复制登录链接 ]", self._browser_dialog_copy_url).pack(
+            side="left", expand=True, fill="x", padx=2
+        )
+        self._mk_button(row, "[ 取消 ]", self._cancel_browser_dialog).pack(
+            side="left", expand=True, fill="x", padx=2
+        )
+
+        win.update_idletasks()
+        pos_x = self.root.winfo_rootx() + max(
+            0, (self.root.winfo_width() - win.winfo_width()) // 2
+        )
+        pos_y = self.root.winfo_rooty() + max(
+            0, (self.root.winfo_height() - win.winfo_height()) // 2
+        )
+        win.geometry("+{0}+{1}".format(pos_x, pos_y))
+        self._browser_win = win
+        try:
+            entry.focus_set()
+        except Exception:
+            pass
+
+    def _browser_dialog_submit(self):
+        raw = ""
+        if self._browser_input_var is not None:
+            raw = str(self._browser_input_var.get() or "").strip()
+        if not raw:
+            messagebox.showwarning(
+                "缺少回调地址",
+                "请粘贴浏览器地址栏中的完整回调 URL，或仅粘贴 code 参数。",
+                parent=self._browser_win or self.root,
+            )
+            return
+        self._browser_code_value = raw
+        self._browser_code_event.set()
+        self._close_browser_dialog()
+
+    def _browser_dialog_open_url(self):
+        url = str(getattr(self, "_browser_url", "") or "")
+        if not url:
+            return
+        try:
+            webbrowser.open(url)
+        except Exception as exc:
+            self.say("无法打开浏览器: {0}".format(exc))
+
+    def _browser_dialog_copy_url(self):
+        url = str(getattr(self, "_browser_url", "") or "")
+        if not url:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(url)
+            self.say("登录链接已复制")
+        except Exception as exc:
+            self.say("剪贴板失败: {0}".format(exc))
+
+    def _cancel_browser_dialog(self):
+        self._browser_code_value = ""
+        self._browser_code_event.set()
+        self._close_browser_dialog()
+
+    def _close_browser_dialog(self):
+        win = self._browser_win
+        self._browser_win = None
+        self._browser_entry = None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+
+    # -- token refresh -------------------------------------------------------
+
+    def on_refresh_token(self):
+        if not (
+            self.auth.get("refresh_token")
+            or self.auth.get("ms_refresh_token")
+        ):
+            messagebox.showinfo(
+                "无令牌",
+                "本地没有 Refresh Token，请先使用微软设备代码登录。",
+                parent=self.root,
+            )
+            return
+        self.say("正在刷新微软令牌 ...")
+        threading.Thread(
+            target=self._refresh_token_worker, args=(False,), daemon=True
+        ).start()
+
+    def _silent_refresh(self):
+        if str(self.auth.get("mode") or "") != "microsoft":
+            return
+        if not (
+            self.auth.get("refresh_token")
+            or self.auth.get("ms_refresh_token")
+        ):
+            return
+        threading.Thread(
+            target=self._refresh_token_worker, args=(True,), daemon=True
+        ).start()
+
+    def _refresh_core(self):
+        flow = str(self.auth.get("flow") or self.config.get("auth_flow") or "browser").lower()
+        if flow == "device":
+            client_id = str(self.config.get("device_client_id") or "").strip()
+        elif flow == "live":
+            client_id = MS_DEFAULT_CLIENT_ID
+        else:
+            flow = "browser"
+            client_id = str(self.config.get("client_id") or MS_DEFAULT_CLIENT_ID)
+        if not client_id:
+            raise LauncherError("当前登录方式缺少 Client ID，请检查 config.json")
+        refresh_token = str(
+            self.auth.get("refresh_token")
+            or self.auth.get("ms_refresh_token")
+            or ""
+        )
+        if not refresh_token:
+            raise LauncherError("本地没有 Refresh Token，请重新正版登录")
+        token = msa_refresh_access_token(refresh_token, client_id, flow)
+        mc = msa_xbox_to_minecraft(
+            str(token.get("access_token") or ""), azure=str(flow).lower() == "device"
+        )
+        new_refresh = str(token.get("refresh_token") or refresh_token)
+        self.auth["mode"] = "microsoft"
+        self.auth["flow"] = flow
+        self.auth["username"] = mc["name"]
+        self.auth["uuid"] = mc["uuid"]
+        self.auth["ms_name"] = mc["name"]
+        self.auth["ms_uuid"] = mc["uuid"]
+        self.auth["access_token"] = mc["access_token"]
+        self.auth["refresh_token"] = new_refresh
+        self.auth["ms_refresh_token"] = new_refresh
+        self.auth["expires_at"] = time.time() + max(300, int(mc["expires_in"]) - 60)
+        self.auth["last_login"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._remember_account(self.auth)
+        self._save_auth()
+        return mc
+
+    def _refresh_token_worker(self, silent):
+        try:
+            mc = self._refresh_core()
+            self.post(self._refresh_identity)
+            self.say("令牌刷新成功 // COMMANDER {0}".format(mc["name"]))
+        except Exception as exc:
+            log_debug("refresh failed:\n" + traceback.format_exc())
+            self.say("令牌刷新失败: {0}".format(exc))
+            if not silent:
+                message = str(exc)
+                self.post(
+                    lambda msg=message: messagebox.showwarning(
+                        "令牌刷新失败", msg, parent=self.root
+                    )
+                )
+
+    def _ensure_fresh_token(self):
+        expires_at = float(self.auth.get("expires_at") or 0)
+        if expires_at and time.time() < expires_at - 120:
+            return
+        if not (
+            str(self.auth.get("refresh_token") or "").strip()
+            or str(self.auth.get("ms_refresh_token") or "").strip()
+        ):
+            if expires_at and time.time() >= expires_at:
+                raise LauncherError(
+                    "Minecraft Access Token 已过期，请重新使用令牌式登录。"
+                )
+            return
+        self.say("正版令牌临近过期，点火前自动刷新 ...")
+        self._refresh_core()
+
+
+    # -- Modrinth arsenal ----------------------------------------------------
+
+    def on_toggle_version_bar(self):
+        self._version_bar_open = not self._version_bar_open
+        self.config["mod_version_bar_open"] = self._version_bar_open
+        self._save_config()
+        self._apply_version_bar_visibility()
+        if self._version_bar_open:
+            self._refresh_version_bar()
+            self._load_mc_tags_once()
+        self.say(
+            "战备架版本栏 {0}".format("已展开" if self._version_bar_open else "已收起")
+        )
+
+    def _apply_version_bar_visibility(self):
+        if self.version_bar_box is None or self.btn_version_bar is None:
+            return
+        try:
+            if self._version_bar_open:
+                self.version_bar_box.grid()
+                self.btn_version_bar.configure(text="[ 版本栏 ▲ ]")
+            else:
+                self.version_bar_box.grid_remove()
+                self.btn_version_bar.configure(text="[ 版本栏 ▼ ]")
+        except Exception:
+            pass
+
+    def _load_mc_tags_once(self):
+        if self._mc_tags or self._mc_tags_loading:
+            return
+        self._mc_tags_loading = True
+
+        def worker():
+            versions = []
+            try:
+                versions = modrinth_game_versions()
+            except Exception:
+                log_debug("mc tag fetch failed:\n" + traceback.format_exc())
+            self.post(self._mc_tags_ready, versions)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _mc_tags_ready(self, versions):
+        self._mc_tags_loading = False
+        self._mc_tags = list(versions or [])
+        if self._version_bar_open:
+            self._refresh_version_bar()
+
+    def _refresh_version_bar(self):
+        box = self.version_bar_box
+        if box is None:
+            return
+        for child in list(box.winfo_children()):
+            try:
+                child.destroy()
+            except Exception:
+                pass
+        installed = list(getattr(self, "local_versions", []) or [])
+        current_launch = str(self.config.get("launch_version") or "")
+        current_mc = self.shelf_mc_version()
+        loader_label = (self.shelf_loader() or "全部").upper()
+
+        def section(title):
+            tk.Label(
+                box,
+                text=title,
+                bg=C_GRAY,
+                fg=C_BLACK,
+                font=FONT_SMALL,
+                anchor="w",
+                pady=1,
+            ).pack(fill="x", pady=(2, 1))
+
+        def add_buttons(entries, picker):
+            grid = tk.Frame(box, bg=C_GRAY)
+            grid.pack(fill="x")
+            for index, (label, value, active) in enumerate(entries):
+                button = self._mk_button(
+                    grid,
+                    label,
+                    lambda chosen=value: picker(chosen),
+                    font=FONT_SMALL,
+                    padx=4,
+                    pady=1,
+                )
+                button.grid(
+                    row=index // 5, column=index % 5, sticky="ew", padx=1, pady=1
+                )
+                if active:
+                    button.configure(bg=C_TEAL, fg=C_WHITE)
+            for column in range(5):
+                grid.columnconfigure(column, weight=1)
+
+        if installed:
+            section("已安装 // INSTALLED（点击同时锁定点火版本）")
+            entries = []
+            for version_id in installed[:15]:
+                parsed = parse_version_id(version_id, self.mc_dir)
+                loader_tag = (parsed.get("loader") or "vanilla").upper()[:7]
+                mc_label = parsed.get("mc") or version_id
+                entries.append(
+                    (
+                        "[{0}] {1}".format(loader_tag, mc_label),
+                        version_id,
+                        version_id == current_launch,
+                    )
+                )
+            add_buttons(entries, self._shelf_pick_installed)
+        else:
+            section("已安装 // INSTALLED（暂无，先用 [下载 / 安装] 装一个版本）")
+
+        section("常用版本 // COMMON MC（未安装的会提示先安装）")
+        pool = list(self._mc_tags) if self._mc_tags else list(MC_VERSION_CHOICES)
+        if current_mc and current_mc not in pool:
+            pool.insert(0, current_mc)
+        seen = set()
+        entries = []
+        for mc_version in pool:
+            if mc_version in seen:
+                continue
+            seen.add(mc_version)
+            entries.append(
+                (
+                    mc_version,
+                    mc_version,
+                    mc_version == current_mc and not current_launch,
+                )
+            )
+            if len(entries) >= 15:
+                break
+        add_buttons(entries, self._shelf_pick_mc)
+
+        if self._version_bar_summary_var is not None:
+            self._version_bar_summary_var.set(
+                "当前 // MC {0} // {1} // 已安装 {2} 个版本".format(
+                    current_mc, loader_label, len(installed)
+                )
+            )
+
+    def _shelf_pick_installed(self, version_id):
+        version_id = str(version_id or "")
+        if not version_id:
+            return
+        if self._vanilla_downloading or self._loader_installing:
+            self.say("安装进行中，暂不能切换版本")
+            return
+        if version_id in self.version_rows:
+            index = self.version_rows.index(version_id)
+            try:
+                self.version_listbox.selection_clear(0, tk.END)
+                self.version_listbox.selection_set(index)
+                self.version_listbox.activate(index)
+                self.version_listbox.see(index)
+            except Exception:
+                pass
+            self._set_version_info(index, persist=True)
+            self.say("战备架版本 -> {0} // 已锁定点火版本".format(version_id))
+        self._refresh_version_bar()
+
+    def _shelf_pick_mc(self, mc_version):
+        mc_version = str(mc_version or "").strip()
+        if not mc_version:
+            return
+        if self._vanilla_downloading or self._loader_installing:
+            self.say("安装进行中，暂不能切换版本")
+            return
+        for version_id in list(getattr(self, "local_versions", []) or []):
+            parsed = parse_version_id(version_id, self.mc_dir)
+            if str(parsed.get("mc") or "") == mc_version:
+                self._shelf_pick_installed(version_id)
+                return
+        self.config["mc_version"] = mc_version
+        self.config["launch_version"] = ""
+        self.config["loader_version"] = ""
+        self.version_var.set(mc_version)
+        self._save_config()
+        self._update_window_title()
+        self._refresh_shelf_label()
+        self.refresh_versions()
+        self._refresh_version_bar()
+        self.refresh_hot()
+        self.say(
+            "战备架版本 -> MC {0} // 尚未安装，请先用 [下载 / 安装] 装好这个版本".format(
+                mc_version
+            )
+        )
+
+    def shelf_mc_version(self):
+        return self.mc_version
+
+    # -- modpack import ------------------------------------------------------
+
+    def on_import_modpack(self):
+        if self._pack_busy:
+            self._pack_lift()
+            return
+        if self._busy or self._vanilla_downloading or self._loader_installing:
+            messagebox.showwarning(
+                "有任务进行中",
+                "请等待当前下载 / 安装任务结束后再导入整合包。",
+                parent=self.root,
+            )
+            return
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="选择整合包（Modrinth .mrpack 推荐；.zip 仅导入 mods/config）",
+            filetypes=[
+                ("整合包", "*.mrpack *.zip"),
+                ("Modrinth 整合包", "*.mrpack"),
+                ("压缩包", "*.zip"),
+                ("全部文件", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        self._pack_open_window()
+        self._pack_busy = True
+        self._pack_cancel.clear()
+        if self._pack_close_btn is not None:
+            self._pack_close_btn.configure(state="disabled")
+        self._pack_set_status("准备导入 // {0}".format(os.path.basename(path)))
+        self._pack_ui_progress(0, 0)
+        threading.Thread(
+            target=self._pack_worker, args=(path,), daemon=True
+        ).start()
+
+    def _pack_open_window(self):
+        if self._pack_win is not None:
+            self._pack_lift()
+            return
+        win = tk.Toplevel(self.root)
+        win.title("MODPACK IMPORT // 整合包导入")
+        win.configure(bg=C_WHITE)
+        win.transient(self.root)
+        win.resizable(True, True)
+        win.protocol("WM_DELETE_WINDOW", self._pack_close)
+
+        wrap = tk.Frame(win, bg=C_WHITE, bd=1, relief="solid", padx=10, pady=10)
+        wrap.pack(fill="both", expand=True, padx=8, pady=8)
+
+        tk.Label(
+            wrap,
+            text=title_text("MODPACK IMPORT // 整合包导入"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        ).pack(fill="x")
+
+        tk.Label(
+            wrap,
+            text=(
+                "支持 Modrinth .mrpack：自动安装对应原版 + 加载器，并下载包内模组。\n"
+                ".zip 仅会把 mods / config / resourcepacks 等目录导入为新实例。\n"
+                "导入的整合包会作为独立版本出现在左侧版本档案，使用独立游戏目录。"
+            ),
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+            wraplength=640,
+        ).pack(fill="x", pady=(6, 0))
+
+        self._pack_status_var = tk.StringVar(value="READY // 选择整合包文件 ...")
+        tk.Label(
+            wrap,
+            textvariable=self._pack_status_var,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            wraplength=680,
+        ).pack(fill="x", pady=(8, 0))
+
+        self._pack_progress_var = tk.StringVar(value=ascii_progress_bar(0, 0))
+        tk.Label(
+            wrap,
+            textvariable=self._pack_progress_var,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        ).pack(fill="x", pady=(4, 0))
+
+        self._pack_close_btn = self._mk_button(
+            wrap, "[ 取消 / 关闭 ]", self._pack_close
+        )
+        self._pack_close_btn.pack(fill="x", pady=(8, 0))
+
+        self._pack_win = win
+        win.update_idletasks()
+        pos_x = self.root.winfo_rootx() + max(
+            0, (self.root.winfo_width() - win.winfo_reqwidth()) // 2
+        )
+        pos_y = self.root.winfo_rooty() + max(
+            0, (self.root.winfo_height() - win.winfo_reqheight()) // 2
+        )
+        win.geometry("+{0}+{1}".format(pos_x, pos_y))
+        win.minsize(680, 300)
+
+    def _pack_lift(self):
+        if self._pack_win is None:
+            return
+        try:
+            self._pack_win.deiconify()
+            self._pack_win.lift()
+            self._pack_win.focus_force()
+        except Exception:
+            pass
+
+    def _pack_set_status(self, text):
+        try:
+            if self._pack_status_var is not None:
+                self._pack_status_var.set(str(text))
+        except Exception:
+            pass
+
+    def _pack_ui_progress(self, current, total):
+        try:
+            if self._pack_progress_var is not None:
+                self._pack_progress_var.set(ascii_progress_bar(current, total))
+        except Exception:
+            pass
+
+    def _pack_progress_from_thread(self, current, total):
+        self.post(self._pack_ui_progress, current, total)
+
+    def _pack_close(self):
+        if self._pack_busy:
+            confirmed = messagebox.askyesno(
+                "导入进行中",
+                "确定取消导入吗？已下载的文件会保留。",
+                parent=self._pack_win or self.root,
+            )
+            if not confirmed:
+                return
+            self._pack_cancel.set()
+            self._pack_set_status("CANCELLING // 等待当前步骤结束 ...")
+            return
+        win = self._pack_win
+        self._pack_win = None
+        self._pack_status_var = None
+        self._pack_progress_var = None
+        self._pack_close_btn = None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+    def _pack_worker(self, path):
+        try:
+            if str(path).lower().endswith(".mrpack"):
+                result = self._import_mrpack(path)
+            else:
+                result = self._import_zip_pack(path)
+            self.post(self._pack_finished, result, "")
+        except OperationCancelled:
+            self.post(self._pack_finished, None, "CANCELLED")
+        except Exception as exc:
+            log_debug("modpack import failed:\n" + traceback.format_exc())
+            self.post(self._pack_finished, None, str(exc))
+
+    def _pack_mll_callback(self):
+        state = {"max": 0, "last": 0.0}
+
+        def set_status(text):
+            check_cancel(self._pack_cancel)
+            now = time.time()
+            if now - state["last"] > 0.5:
+                state["last"] = now
+                self.post(self._pack_set_status, "加载器 :: {0}".format(text))
+
+        def set_max(value):
+            try:
+                state["max"] = int(value)
+            except Exception:
+                state["max"] = 0
+
+        def set_progress(value):
+            check_cancel(self._pack_cancel)
+            try:
+                current = int(value)
+            except Exception:
+                return
+            self._pack_progress_from_thread(current, state["max"])
+
+        return {
+            "setStatus": set_status,
+            "setProgress": set_progress,
+            "setMax": set_max,
+        }
+
+    def _pack_vanilla_progress(self, phase, current, total, detail):
+        if total:
+            self._pack_progress_from_thread(current, total)
+        label = VANILLA_PHASE_LABELS.get(str(phase or ""), str(phase or ""))
+        self.post(
+            self._pack_set_status,
+            "原版 {0} :: {1}".format(label, detail or ""),
+        )
+        check_cancel(self._pack_cancel)
+
+    def _import_mrpack(self, path):
+        import minecraft_launcher_lib.mod_loader as mll_loader
+
+        index = read_mrpack_index(path)
+        name = str(index.get("name") or os.path.splitext(os.path.basename(path))[0])
+        mc_version, loader, loader_version = mrpack_dependencies(index)
+        if not mc_version:
+            raise LauncherError("整合包缺少 dependencies.minecraft，无法确定游戏版本")
+        files = mrpack_files(index)
+        pack_id = sanitize_pack_id(name, self.mc_dir)
+        instance_dir = os.path.join(self.mc_dir, "versions", pack_id)
+        ensure_dir(instance_dir)
+
+        self.post(
+            self._pack_set_status,
+            "整合包: {0} // MC {1} // {2} {3} // {4} 个文件".format(
+                name, mc_version, loader or "vanilla", loader_version, len(files)
+            ),
+        )
+
+        vanilla_json = os.path.join(
+            self.mc_dir, "versions", mc_version, mc_version + ".json"
+        )
+        if not os.path.isfile(vanilla_json):
+            self.post(
+                self._pack_set_status, "STEP 1/5 安装原版 {0} ...".format(mc_version)
+            )
+            install_vanilla_game(
+                mc_version,
+                self.mc_dir,
+                source=str(self.config.get("download_source") or "auto"),
+                progress=self._pack_vanilla_progress,
+                say=lambda text: self.post(self._pack_set_status, str(text)),
+                cancel=self._pack_cancel,
+            )
+        else:
+            self.post(
+                self._pack_set_status,
+                "STEP 1/5 原版 {0} 已存在，跳过".format(mc_version),
+            )
+
+        check_cancel(self._pack_cancel)
+        base_id = mc_version
+        if loader:
+            self.post(
+                self._pack_set_status,
+                "STEP 2/5 安装加载器 {0} {1} ...".format(loader, loader_version),
+            )
+            loader_obj = mll_loader.get_mod_loader(loader)
+            try:
+                installed_loader_id = loader_obj.get_installed_version(
+                    mc_version, loader_version
+                )
+            except Exception:
+                installed_loader_id = ""
+            loader_json = (
+                os.path.join(
+                    self.mc_dir,
+                    "versions",
+                    installed_loader_id,
+                    installed_loader_id + ".json",
+                )
+                if installed_loader_id
+                else ""
+            )
+            if loader_json and os.path.isfile(loader_json):
+                self.post(
+                    self._pack_set_status,
+                    "STEP 2/5 加载器 {0} 已安装，跳过".format(installed_loader_id),
+                )
+            else:
+                loader_obj.install(
+                    mc_version,
+                    self.mc_dir,
+                    loader_version=loader_version or None,
+                    callback=self._pack_mll_callback(),
+                    java=str(self.config.get("java") or "").strip() or None,
+                )
+                if not installed_loader_id:
+                    installed_loader_id = loader_obj.get_installed_version(
+                        mc_version, loader_version
+                    )
+                loader_json = os.path.join(
+                    self.mc_dir,
+                    "versions",
+                    installed_loader_id,
+                    installed_loader_id + ".json",
+                )
+            if not os.path.isfile(loader_json):
+                raise LauncherError(
+                    "加载器安装完成但未找到版本 JSON: {0}".format(installed_loader_id)
+                )
+            base_id = installed_loader_id
+        check_cancel(self._pack_cancel)
+
+        self.post(
+            self._pack_set_status, "STEP 3/5 生成整合包实例 {0} ...".format(pack_id)
+        )
+        profile = read_json(
+            os.path.join(self.mc_dir, "versions", base_id, base_id + ".json"), {}
+        ) or {}
+        new_profile = dict(profile)
+        new_profile["id"] = pack_id
+        if "inheritsFrom" not in new_profile:
+            new_profile["inheritsFrom"] = mc_version
+        write_json(os.path.join(instance_dir, pack_id + ".json"), new_profile)
+
+        total = max(1, len(files))
+        done = 0
+        failed = []
+        for item in files:
+            check_cancel(self._pack_cancel)
+            dest = os.path.join(instance_dir, item["path"].replace("/", os.sep))
+            pairs = [("modrinth", url) for url in item["urls"]]
+            try:
+                download_to_dest(
+                    pairs,
+                    dest,
+                    sha1=item["sha1"],
+                    size=item["size"],
+                    cancel=self._pack_cancel,
+                    timeout=180,
+                )
+            except OperationCancelled:
+                raise
+            except Exception as exc:
+                failed.append((item["path"], str(exc)))
+            done += 1
+            self._pack_progress_from_thread(done, total)
+            self.post(
+                self._pack_set_status,
+                "STEP 4/5 下载 {0}/{1} // {2}".format(
+                    done, total, item["path"].split("/")[-1]
+                ),
+            )
+
+        self.post(self._pack_set_status, "STEP 5/5 解压 overrides ...")
+        overrides_name = str(index.get("overrides") or "overrides")
+        client_overrides = str(index.get("client_overrides") or "client-overrides")
+        with zipfile.ZipFile(path) as bundle:
+            tops = {
+                entry.filename.replace("\\", "/").split("/", 1)[0].lower()
+                for entry in bundle.infolist()
+            }
+            for prefix in (overrides_name.lower(), client_overrides.lower()):
+                if prefix in tops:
+                    safe_extract_zip(bundle, instance_dir, {prefix}, strip_top=True)
+
+        write_json(
+            os.path.join(instance_dir, "akm_pack.json"),
+            {
+                "name": name,
+                "version_id": pack_id,
+                "source": os.path.basename(path),
+                "mc_version": mc_version,
+                "loader": loader,
+                "loader_version": loader_version,
+                "files": len(files),
+                "failed_files": failed,
+                "imported_at": datetime.now().isoformat(timespec="seconds"),
+            },
+        )
+        return {
+            "kind": "mrpack",
+            "name": name,
+            "pack_id": pack_id,
+            "instance_dir": instance_dir,
+            "mc_version": mc_version,
+            "loader": loader,
+            "loader_version": loader_version,
+            "files": len(files),
+            "failed": failed,
+        }
+
+    def _import_zip_pack(self, path):
+        name = os.path.splitext(os.path.basename(path))[0]
+        pack_id = sanitize_pack_id(name, self.mc_dir)
+        instance_dir = os.path.join(self.mc_dir, "versions", pack_id)
+        ensure_dir(instance_dir)
+        self.post(
+            self._pack_set_status,
+            "压缩包整合: {0} // 解压 mods / config ...".format(name),
+        )
+        with zipfile.ZipFile(path) as bundle:
+            names = [
+                entry.filename.replace("\\", "/").lower()
+                for entry in bundle.infolist()
+            ]
+            if not any(item.startswith("mods/") for item in names):
+                raise LauncherError(
+                    "压缩包里没有 mods/ 目录，无法作为整合包导入。\n"
+                    "建议使用 Modrinth 的 .mrpack 格式。"
+                )
+            extracted = safe_extract_zip(
+                bundle,
+                instance_dir,
+                {
+                    "mods",
+                    "config",
+                    "defaultconfigs",
+                    "resourcepacks",
+                    "shaderpacks",
+                    "scripts",
+                    "kubejs",
+                },
+            )
+        self.post(
+            self._pack_set_status, "已解压 {0} 个文件，写入版本档案 ...".format(extracted)
+        )
+
+        base_id = str(self.config.get("launch_version") or "").strip()
+        mc_version = self.mc_version
+        profile = {}
+        base_json = (
+            os.path.join(self.mc_dir, "versions", base_id, base_id + ".json")
+            if base_id
+            else ""
+        )
+        if base_json and os.path.isfile(base_json):
+            profile = read_json(base_json, {}) or {}
+            parsed = parse_version_id(base_id, self.mc_dir)
+            mc_version = parsed.get("mc") or mc_version
+        new_profile = dict(profile)
+        new_profile["id"] = pack_id
+        if "inheritsFrom" not in new_profile:
+            new_profile["inheritsFrom"] = mc_version
+        write_json(os.path.join(instance_dir, pack_id + ".json"), new_profile)
+
+        write_json(
+            os.path.join(instance_dir, "akm_pack.json"),
+            {
+                "name": name,
+                "version_id": pack_id,
+                "source": os.path.basename(path),
+                "mc_version": mc_version,
+                "base_version": base_id,
+                "files": extracted,
+                "imported_at": datetime.now().isoformat(timespec="seconds"),
+            },
+        )
+        return {
+            "kind": "zip",
+            "name": name,
+            "pack_id": pack_id,
+            "instance_dir": instance_dir,
+            "mc_version": mc_version,
+            "loader": str(self.config.get("loader") or ""),
+            "loader_version": str(self.config.get("loader_version") or ""),
+            "files": extracted,
+            "failed": [],
+        }
+
+    def _pack_finished(self, result, error):
+        self._pack_busy = False
+        if self._pack_close_btn is not None:
+            try:
+                self._pack_close_btn.configure(state="normal")
+            except Exception:
+                pass
+        if error:
+            if error == "CANCELLED":
+                self._pack_set_status("CANCELLED // 导入已取消")
+                self.say("整合包导入已取消")
+            else:
+                self._pack_set_status("ERROR // {0}".format(str(error)[:160]))
+                self.say("整合包导入失败: {0}".format(error))
+                messagebox.showerror(
+                    "整合包导入失败", str(error), parent=self._pack_win or self.root
+                )
+            return
+        self._pack_set_status("DONE // {0}".format(result.get("pack_id") or ""))
+        self._apply_pack_result(result)
+        lines = [
+            "整合包: {0}".format(result.get("name")),
+            "版本 id: {0}".format(result.get("pack_id")),
+            "Minecraft: {0}".format(result.get("mc_version")),
+            "加载器: {0} {1}".format(
+                (result.get("loader") or "vanilla"), result.get("loader_version") or ""
+            ),
+            "文件数: {0}".format(result.get("files")),
+            "目录: {0}".format(result.get("instance_dir")),
+        ]
+        failed = result.get("failed") or []
+        if failed:
+            lines.append("")
+            lines.append("有 {0} 个文件下载失败（可重新导入补齐）：".format(len(failed)))
+            for path, reason in failed[:5]:
+                lines.append(" - {0} :: {1}".format(path, str(reason)[:80]))
+        lines.append("")
+        lines.append("已自动切到该整合包并开启版本隔离，可直接点火。")
+        messagebox.showinfo("整合包导入完成", "\n".join(lines), parent=self.root)
+        self.say("整合包导入完成: {0} // {1} 个文件".format(result.get("name"), result.get("files")))
+
+    def _apply_pack_result(self, result):
+        self.config["launch_version"] = str(result.get("pack_id") or "")
+        self.config["minecraft_dir"] = self.mc_dir
+        self.config["mc_version"] = str(result.get("mc_version") or self.mc_version)
+        self.config["loader"] = str(result.get("loader") or "vanilla")
+        self.config["loader_version"] = str(result.get("loader_version") or "")
+        self.config["version_isolation"] = True
+        self.version_var.set(self.config["mc_version"])
+        self.loader_var.set(self.config["loader"])
+        if self._isolation_var is not None:
+            try:
+                self._isolation_var.set(True)
+            except Exception:
+                pass
+        self._save_config()
+        self._update_window_title()
+        self._refresh_shelf_label()
+        self.refresh_versions()
+        self._refresh_version_bar()
+        self.refresh_hot()
+
+    # -- self update ---------------------------------------------------------
+
+    def _startup_update_check(self):
+        if not bool(self.config.get("update_check", True)):
+            return
+        if not str(self.config.get("update_url") or "").strip():
+            return
+        self.check_updates(manual=False)
+
+    def on_check_updates(self):
+        self.check_updates(manual=True)
+
+    def check_updates(self, manual=False):
+        url = str(self.config.get("update_url") or "").strip()
+        if not url:
+            if manual:
+                if self._ask_update_url():
+                    self.check_updates(manual=True)
+            return
+        if self._update_checking:
+            if manual:
+                self.say("正在检查更新，请稍候 ...")
+            return
+        self._update_checking = True
+        if manual:
+            self.say("检查更新 // {0}".format(url))
+
+        def worker():
+            manifest = None
+            error = ""
+            try:
+                manifest = fetch_update_manifest(url)
+            except Exception as exc:
+                log_debug("update check failed:\n" + traceback.format_exc())
+                error = str(exc)
+            self.post(self._update_checked, manifest, error, manual)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_checked(self, manifest, error, manual):
+        self._update_checking = False
+        if error:
+            if manual:
+                messagebox.showwarning(
+                    "检查更新失败", str(error), parent=self.root
+                )
+            return
+        if not manifest or not version_is_newer(
+            manifest.get("version"), APP_VERSION
+        ):
+            if manual:
+                messagebox.showinfo(
+                    "已是最新版本",
+                    "当前版本 {0}\n清单版本 {1}".format(
+                        app_version_tag(),
+                        app_version_tag(
+                            (manifest or {}).get("version") or APP_VERSION
+                        ),
+                    ),
+                    parent=self.root,
+                )
+            return
+        self._update_manifest = manifest
+        self.show_update_dialog(manifest)
+
+    def _ask_update_url(self):
+        from tkinter import simpledialog
+
+        current = str(self.config.get("update_url") or "").strip()
+        value = simpledialog.askstring(
+            "自动更新设置",
+            "请输入更新清单（JSON）地址：\n留空表示关闭自动更新。\n\n"
+            "示例：https://example.com/akm_update.json",
+            initialvalue=current,
+            parent=self.root,
+        )
+        if value is None:
+            return False
+        value = str(value).strip()
+        if value and not value.lower().startswith(("http://", "https://")):
+            messagebox.showwarning(
+                "地址无效", "更新地址必须以 http:// 或 https:// 开头。", parent=self.root
+            )
+            return False
+        self.config["update_url"] = value
+        self.config["update_check"] = bool(value)
+        self._save_config()
+        self.say("自动更新{0}".format("已开启: " + value if value else "已关闭"))
+        return bool(value)
+
+    def on_update_settings(self):
+        self._ask_update_url()
+
+    def show_update_dialog(self, manifest):
+        if self._update_win is not None:
+            try:
+                self._update_win.deiconify()
+                self._update_win.lift()
+                self._update_win.focus_force()
+                return
+            except Exception:
+                self._update_win = None
+
+        win = tk.Toplevel(self.root)
+        win.title("UPDATE // 发现新版本")
+        win.configure(bg=C_WHITE)
+        win.transient(self.root)
+        win.protocol("WM_DELETE_WINDOW", self._close_update_dialog)
+
+        wrap = tk.Frame(win, bg=C_WHITE, bd=1, relief="solid", padx=10, pady=10)
+        wrap.pack(fill="both", expand=True, padx=8, pady=8)
+
+        tk.Label(
+            wrap,
+            text=title_text("UPDATE // 发现新版本"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        ).pack(fill="x")
+
+        tk.Label(
+            wrap,
+            text="当前版本 {0}   ->   最新版本 {1}".format(
+                app_version_tag(), app_version_tag(manifest.get("version"))
+            ),
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+        ).pack(fill="x", pady=(8, 2))
+
+        notes = str(manifest.get("notes") or "").strip()
+        tk.Label(
+            wrap,
+            text=notes or "（该版本没有附带更新说明）",
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+            wraplength=560,
+        ).pack(fill="x")
+
+        self._update_status_var = tk.StringVar(value="READY // 可立即更新")
+        tk.Label(
+            wrap,
+            textvariable=self._update_status_var,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            wraplength=560,
+        ).pack(fill="x", pady=(6, 0))
+
+        self._update_progress_var = tk.StringVar(value=ascii_progress_bar(0, 0))
+        tk.Label(
+            wrap,
+            textvariable=self._update_progress_var,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+            padx=6,
+            pady=3,
+            bd=1,
+            relief="solid",
+        ).pack(fill="x", pady=(4, 0))
+
+        row = tk.Frame(wrap, bg=C_WHITE)
+        row.pack(fill="x", pady=(8, 0))
+        self._update_now_btn = self._mk_button(row, "[ 立即更新 ]", self.start_update)
+        self._update_now_btn.pack(side="left", expand=True, fill="x", padx=2)
+        page = str(manifest.get("page") or "").strip()
+        if page:
+            self._mk_button(
+                row,
+                "[ 打开下载页 ]",
+                lambda target=page: self.open_external_url(target, "更新下载页"),
+            ).pack(side="left", expand=True, fill="x", padx=2)
+        self._mk_button(row, "[ 稍后 ]", self._close_update_dialog).pack(
+            side="left", expand=True, fill="x", padx=2
+        )
+
+        self._update_win = win
+        win.update_idletasks()
+        pos_x = self.root.winfo_rootx() + max(
+            0, (self.root.winfo_width() - win.winfo_reqwidth()) // 2
+        )
+        pos_y = self.root.winfo_rooty() + max(
+            0, (self.root.winfo_height() - win.winfo_reqheight()) // 2
+        )
+        win.geometry("+{0}+{1}".format(pos_x, pos_y))
+
+    def _close_update_dialog(self):
+        win = self._update_win
+        self._update_win = None
+        self._update_status_var = None
+        self._update_progress_var = None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+    def _update_set_status(self, text):
+        try:
+            if self._update_status_var is not None:
+                self._update_status_var.set(str(text))
+        except Exception:
+            pass
+
+    def _update_progress_ui(self, current, total):
+        try:
+            if self._update_progress_var is not None:
+                self._update_progress_var.set(ascii_progress_bar(current, total))
+        except Exception:
+            pass
+
+    def _update_progress_cb(self, current, total):
+        self.post(self._update_progress_ui, current, total)
+
+    def start_update(self):
+        if self._update_downloading:
+            return
+        manifest = self._update_manifest or {}
+        url = str(manifest.get("url") or "").strip()
+        if not url:
+            return
+        if not getattr(sys, "frozen", False):
+            messagebox.showinfo(
+                "源码模式",
+                "当前是源码运行，无法自我替换。\n请直接下载新版本：\n" + url,
+                parent=self.root,
+            )
+            return
+        self._update_downloading = True
+        if getattr(self, "_update_now_btn", None) is not None:
+            try:
+                self._update_now_btn.configure(state="disabled")
+            except Exception:
+                pass
+        self._update_set_status("DOWNLOADING // 正在下载新版本 ...")
+        threading.Thread(
+            target=self._update_download_worker, args=(manifest,), daemon=True
+        ).start()
+
+    def _update_download_worker(self, manifest):
+        try:
+            target = os.path.join(BASE_DIR, "AKM_Launcher.new.exe")
+            temp = os.path.join(BASE_DIR, "_update_download.tmp")
+            for path in (target, temp):
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                except OSError:
+                    pass
+            self.post(
+                self._update_set_status,
+                "DOWNLOADING // {0}".format(manifest["url"]),
+            )
+            download_to_dest(
+                [("update", manifest["url"])],
+                temp,
+                progress=self._update_progress_cb,
+                timeout=600,
+            )
+            expect = str(manifest.get("sha256") or "").lower()
+            if expect:
+                actual = sha256_file(temp)
+                if actual != expect:
+                    raise LauncherError(
+                        "更新包校验失败（SHA256 不一致），已放弃本次更新"
+                    )
+            if zipfile.is_zipfile(temp):
+                self.post(self._update_set_status, "EXTRACT // 正在解包 ...")
+                with zipfile.ZipFile(temp) as bundle:
+                    member = ""
+                    for entry in bundle.namelist():
+                        if entry.replace("\\", "/").lower().endswith(
+                            "akm_launcher.exe"
+                        ):
+                            member = entry
+                            break
+                    if not member:
+                        raise LauncherError("更新包里没有 AKM_Launcher.exe")
+                    with bundle.open(member) as source, open(target, "wb") as out:
+                        shutil.copyfileobj(source, out)
+                try:
+                    os.remove(temp)
+                except OSError:
+                    pass
+            else:
+                os.replace(temp, target)
+            if os.path.getsize(target) < 1024 * 1024:
+                raise LauncherError("下载的更新文件不完整")
+            self.post(self._update_ready_to_swap)
+        except Exception as exc:
+            log_debug("self update failed:\n" + traceback.format_exc())
+            self.post(self._update_failed, str(exc))
+
+    def _update_failed(self, message):
+        self._update_downloading = False
+        if getattr(self, "_update_now_btn", None) is not None:
+            try:
+                self._update_now_btn.configure(state="normal")
+            except Exception:
+                pass
+        self._update_set_status("ERROR // {0}".format(str(message)[:140]))
+        self.say("自动更新失败: {0}".format(message))
+        messagebox.showerror(
+            "自动更新失败", str(message), parent=self._update_win or self.root
+        )
+
+    def _update_ready_to_swap(self):
+        self._update_downloading = False
+        self._update_set_status("READY // 即将重启并完成更新")
+        target = os.path.join(BASE_DIR, "AKM_Launcher.exe")
+        new_exe = os.path.join(BASE_DIR, "AKM_Launcher.new.exe")
+        bat = os.path.join(BASE_DIR, "_apply_update.bat")
+        script = (
+            "@echo off\r\n"
+            "timeout /t 1 /nobreak >nul\r\n"
+            ":waitloop\r\n"
+            'tasklist /FI "IMAGENAME eq AKM_Launcher.exe" | find /I "AKM_Launcher.exe" >nul\r\n'
+            "if not errorlevel 1 (\r\n"
+            "  timeout /t 1 /nobreak >nul\r\n"
+            "  goto waitloop\r\n"
+            ")\r\n"
+            'move /Y "{0}" "{1}" >nul\r\n'
+            'start "" "{1}"\r\n'
+            'del "%~f0"\r\n'
+        ).format(new_exe, target)
+        try:
+            with open(bat, "w", encoding="mbcs", errors="replace") as handle:
+                handle.write(script)
+            subprocess.Popen(
+                ["cmd", "/c", bat],
+                cwd=BASE_DIR,
+                creationflags=0x00000008 if os.name == "nt" else 0,
+            )
+        except Exception as exc:
+            self._update_failed("无法启动更新脚本: {0}".format(exc))
+            return
+        self.say("更新已就绪，正在重启启动器 ...")
+        self.root.after(300, self._quit_for_update)
+
+    def _quit_for_update(self):
+        try:
+            self._save_auth()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        os._exit(0)
+
+    # -- shader / resource pack downloads ------------------------------------
+
+    def content_target_dir(self, kind="shader"):
+        folder = CONTENT_KIND_FOLDERS.get(str(kind), "shaderpacks")
+        base = self.effective_game_dir()
+        try:
+            if self._content_global_var is not None and bool(
+                self._content_global_var.get()
+            ):
+                base = self.mc_dir
+        except Exception:
+            pass
+        path = os.path.join(base, folder)
+        ensure_dir(path)
+        return path
+
+    def _content_refresh_target(self):
+        kind = self._content_kind
+        label = CONTENT_KIND_LABELS.get(kind, kind)
+        self._content_set_status(
+            "目标目录 // {0} // {1}".format(label, self.content_target_dir(kind))
+        )
+
+    def _content_mc_choices(self):
+        values = set()
+        current = self.shelf_mc_version()
+        if current:
+            values.add(current)
+        for mc_version in MC_VERSION_CHOICES:
+            values.add(mc_version)
+        for version_id in list(getattr(self, "local_versions", []) or [])[:40]:
+            parsed = parse_version_id(version_id, self.mc_dir)
+            mc_version = str(parsed.get("mc") or "")
+            if mc_version:
+                values.add(mc_version)
+        ordered = sort_versions_desc([value for value in values if value])
+        return ["全部版本"] + ordered
+
+    def _content_kind_changed(self):
+        try:
+            self._content_kind = str(self._content_kind_var.get() or "shader")
+        except Exception:
+            self._content_kind = "shader"
+        self._content_refresh()
+
+    def _content_set_status(self, text):
+        try:
+            if self._content_status_var is not None:
+                self._content_status_var.set(str(text))
+        except Exception:
+            pass
+
+    def _content_progress_ui(self, current, total):
+        try:
+            if self._content_progress_var is not None:
+                self._content_progress_var.set(ascii_progress_bar(current, total))
+        except Exception:
+            pass
+
+    def _content_close(self):
+        if self._content_busy:
+            messagebox.showinfo(
+                "下载进行中", "请等待当前下载结束后再关闭。", parent=self._content_win or self.root
+            )
+            return
+        win = self._content_win
+        self._content_win = None
+        self._content_list = None
+        self._content_status_var = None
+        self._content_progress_var = None
+        self._content_download_btn = None
+        self._content_global_var = None
+        self._content_hits = []
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+    def _content_open_folder(self):
+        self._open_folder(self.content_target_dir(self._content_kind))
+
+    def on_open_content_dialog(self, kind="shader"):
+        self._content_kind = "resourcepack" if kind == "resourcepack" else "shader"
+        if self._content_win is not None:
+            try:
+                self._content_kind_var.set(self._content_kind)
+                self._content_win.deiconify()
+                self._content_win.lift()
+                self._content_win.focus_force()
+                self._content_refresh()
+                return
+            except Exception:
+                self._content_win = None
+
+        win = tk.Toplevel(self.root)
+        win.title("SHADER / RESOURCE // 光影与材质下载")
+        win.configure(bg=C_WHITE)
+        win.transient(self.root)
+        win.resizable(True, True)
+        win.protocol("WM_DELETE_WINDOW", self._content_close)
+
+        wrap = tk.Frame(win, bg=C_WHITE, bd=1, relief="solid", padx=10, pady=8)
+        wrap.pack(fill="both", expand=True, padx=8, pady=8)
+        wrap.columnconfigure(0, weight=1)
+        wrap.rowconfigure(4, weight=1)
+
+        tk.Label(
+            wrap,
+            text=title_text("SHADER / RESOURCEPACK // 光影与材质下载"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        ).grid(row=0, column=0, sticky="ew")
+
+        top = tk.Frame(wrap, bg=C_GRAY, bd=1, relief="solid")
+        top.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self._content_kind_var = tk.StringVar(value=self._content_kind)
+        for label, value in (("光影", "shader"), ("材质包", "resourcepack")):
+            tk.Radiobutton(
+                top,
+                text=label,
+                value=value,
+                variable=self._content_kind_var,
+                command=self._content_kind_changed,
+                bg=C_GRAY,
+                fg=C_BLACK,
+                activebackground=C_TEAL,
+                activeforeground=C_WHITE,
+                selectcolor=C_TEAL,
+                font=FONT_SMALL,
+                indicatoron=False,
+                padx=8,
+                pady=1,
+                bd=1,
+                relief="solid",
+                highlightthickness=0,
+                takefocus=0,
+                cursor="hand2",
+            ).pack(side="left", padx=(4, 0))
+
+        tk.Label(
+            top, text="MC 版本", bg=C_GRAY, fg=C_BLACK, font=FONT_SMALL, padx=6
+        ).pack(side="left", padx=(10, 0))
+        self._content_mc_var = tk.StringVar(value=self.shelf_mc_version() or "全部版本")
+        mc_menu = tk.OptionMenu(
+            top, self._content_mc_var, *self._content_mc_choices()
+        )
+        mc_menu.configure(
+            bg=C_WHITE,
+            fg=C_BLACK,
+            activebackground=C_TEAL,
+            activeforeground=C_WHITE,
+            font=FONT_SMALL,
+            relief="solid",
+            bd=1,
+            highlightthickness=0,
+            padx=4,
+        )
+        try:
+            mc_menu["menu"].configure(
+                bg=C_WHITE,
+                fg=C_BLACK,
+                activebackground=C_TEAL,
+                activeforeground=C_WHITE,
+                font=FONT_SMALL,
+            )
+        except Exception:
+            pass
+        mc_menu.pack(side="left", padx=(4, 0))
+
+        self._mk_button(
+            top, "[ 刷新榜单 ]", self._content_refresh, font=FONT_SMALL, padx=6, pady=1
+        ).pack(side="left", padx=(8, 4))
+
+        search_row = tk.Frame(wrap, bg=C_WHITE)
+        search_row.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        search_row.columnconfigure(0, weight=1)
+        self._content_query_var = tk.StringVar(value="")
+        entry = tk.Entry(
+            search_row,
+            textvariable=self._content_query_var,
+            font=FONT_MAIN,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            insertbackground=C_BLACK,
+            relief="solid",
+            bd=1,
+            highlightthickness=0,
+        )
+        entry.grid(row=0, column=0, sticky="ew", ipady=3, ipadx=4)
+        entry.bind("<Return>", lambda _event: self._content_search())
+        self._mk_button(
+            search_row, "[ 检索 ]", self._content_search, font=FONT_SMALL, padx=8
+        ).grid(row=0, column=1, padx=(6, 0))
+
+        hint_row = tk.Frame(wrap, bg=C_GRAY, bd=1, relief="solid")
+        hint_row.grid(row=3, column=0, sticky="ew", pady=(6, 4))
+        tk.Label(
+            hint_row,
+            text="[双击=下载] [单击=预览] 中文 / 英文 / slug 均可 // 光影需 Iris 或 OptiFine",
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            padx=6,
+            pady=2,
+        ).pack(side="left", fill="x", expand=True)
+        self._content_global_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            hint_row,
+            text="装入全局 .minecraft",
+            variable=self._content_global_var,
+            command=self._content_refresh_target,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            activebackground=C_GRAY,
+            activeforeground=C_BLACK,
+            selectcolor=C_WHITE,
+            font=FONT_SMALL,
+            bd=0,
+            highlightthickness=0,
+            padx=4,
+            takefocus=0,
+            cursor="hand2",
+        ).pack(side="right", padx=(0, 2))
+
+        list_frame = tk.Frame(wrap, bg=C_WHITE, bd=1, relief="solid")
+        list_frame.grid(row=4, column=0, sticky="nsew")
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+        # Icon style list: thumbnail on top, pack name below.
+        self._content_list = IconGrid(
+            list_frame,
+            on_select=self._content_preview,
+            on_activate=self._content_download_selected,
+            icon_size=ICON_SIZE,
+            card_width=116,
+        )
+        self._content_list.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
+
+        self._content_status_var = tk.StringVar(value="READY // 选择光影或材质包")
+        tk.Label(
+            wrap,
+            textvariable=self._content_status_var,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            wraplength=680,
+        ).grid(row=5, column=0, sticky="ew", pady=(4, 0))
+
+        self._content_progress_var = tk.StringVar(value=ascii_progress_bar(0, 0))
+        tk.Label(
+            wrap,
+            textvariable=self._content_progress_var,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+            padx=6,
+            pady=2,
+            bd=1,
+            relief="solid",
+        ).grid(row=6, column=0, sticky="ew", pady=(2, 0))
+
+        button_row = tk.Frame(wrap, bg=C_WHITE)
+        button_row.grid(row=7, column=0, sticky="ew", pady=(6, 0))
+        self._content_download_btn = self._mk_button(
+            button_row, "[ 下载选中 ]", self._content_download_selected
+        )
+        self._content_download_btn.pack(side="left", expand=True, fill="x", padx=2)
+        self._mk_button(
+            button_row, "[ 打开目标目录 ]", self._content_open_folder
+        ).pack(side="left", expand=True, fill="x", padx=2)
+        self._mk_button(button_row, "[ 关闭 ]", self._content_close).pack(
+            side="left", expand=True, fill="x", padx=2
+        )
+
+        self._content_win = win
+        win.update_idletasks()
+        pos_x = self.root.winfo_rootx() + max(
+            0, (self.root.winfo_width() - win.winfo_reqwidth()) // 2
+        )
+        pos_y = self.root.winfo_rooty() + max(
+            0, (self.root.winfo_height() - win.winfo_reqheight()) // 2
+        )
+        win.geometry("+{0}+{1}".format(pos_x, pos_y))
+        win.minsize(760, 560)
+        self._content_refresh()
+
+    def _content_mc_selected(self):
+        try:
+            value = str(self._content_mc_var.get() or "").strip()
+        except Exception:
+            value = ""
+        if not value or value == "全部版本":
+            return ""
+        return value
+
+    def _content_refresh(self):
+        self._content_start_search("")
+
+    def _content_search(self):
+        query = ""
+        try:
+            query = str(self._content_query_var.get() or "").strip()
+        except Exception:
+            query = ""
+        self._content_start_search(query)
+
+    def _content_start_search(self, query):
+        if self._content_busy:
+            self._content_set_status("BUSY // 正在下载，请稍候")
+            return
+        kind = self._content_kind
+        mc_version = self._content_mc_selected()
+        self._content_set_status(
+            "LOADING // {0} // {1}".format(
+                CONTENT_KIND_LABELS.get(kind, kind), mc_version or "全部版本"
+            )
+        )
+        threading.Thread(
+            target=self._content_fetch_worker,
+            args=(kind, mc_version, query),
+            daemon=True,
+        ).start()
+
+    def _content_fetch_worker(self, kind, mc_version, query):
+        label = CONTENT_KIND_LABELS.get(kind, kind)
+        merged = dict(self.alias)
+        merged.update(CONTENT_ALIAS_DEFAULT)
+        terms = translate_query_candidates(query, merged) if query else []
+        term = terms[0] if terms else query
+        note_suffix = ""
+        try:
+            hits, total = content_search_page(
+                term or "",
+                kind,
+                30,
+                "relevance" if term else "downloads",
+                mc_version,
+            )
+            if not hits and mc_version:
+                hits, total = content_search_page(
+                    term or "",
+                    kind,
+                    30,
+                    "relevance" if term else "downloads",
+                    "",
+                )
+                note_suffix = "{0} 无记录 // 显示全部版本".format(mc_version)
+        except Exception as exc:
+            log_debug("content search failed:\n" + traceback.format_exc())
+            self.post(
+                self._content_populate,
+                [],
+                "ERROR // {0}".format(str(exc)[:140]),
+            )
+            return
+        if not hits:
+            self.post(
+                self._content_populate,
+                [],
+                "NO MATCH // 0 条 // {0}".format(label),
+            )
+            return
+        note = "QUERY {0} // {1}/{2} 条 // {3} // MC {4}".format(
+            (term or "热门")[:20],
+            len(hits),
+            total or len(hits),
+            label,
+            mc_version or "全部",
+        )
+        if note_suffix:
+            note += " // " + note_suffix
+        self.post(self._content_populate, hits, note)
+
+    def _content_populate(self, hits, note):
+        self._content_hits = list(hits)
+        if self._content_list is None:
+            return
+        target = self._content_mc_selected()
+        cards = [
+            _hit_card(hit, target or self.shelf_mc_version())
+            for hit in self._content_hits
+        ]
+        self._content_list.set_items(cards)
+        self._content_set_status(note)
+        self._load_icons("content", self._content_hits, self._content_list)
+
+    def _content_preview(self, index=None):
+        if self._content_list is None:
+            return
+        if index is None:
+            selection = self._content_list.selected_indices()
+            index = selection[-1] if selection else -1
+        index = int(index)
+        if index < 0 or index >= len(self._content_hits):
+            return
+        hit = self._content_hits[index]
+        versions = hit_game_versions(hit)
+        head = ""
+        if versions:
+            head = ",".join(versions[:10])
+            if len(versions) > 10:
+                head += ",+{0}".format(len(versions) - 10)
+        self._content_set_status(
+            "[{0}] {1} // 下载 {2} // 支持: {3}".format(
+                str(hit.get("project_type") or self._content_kind).upper(),
+                hit.get("title") or hit.get("slug") or "?",
+                human_count(hit.get("downloads")),
+                head or "未知",
+            )
+        )
+
+    def _content_download_selected(self, index=None):
+        if self._content_busy:
+            return
+        if self._content_list is None:
+            return
+        if index is None:
+            selection = self._content_list.selected_indices()
+            index = selection[-1] if selection else -1
+        index = int(index)
+        if index < 0 or index >= len(self._content_hits):
+            messagebox.showinfo(
+                "未选择",
+                "请先在列表里选择一个光影 / 材质包。",
+                parent=self._content_win or self.root,
+            )
+            return
+        hit = self._content_hits[index]
+        project = str(hit.get("slug") or hit.get("project_id") or "")
+        if not project:
+            return
+        self._content_busy = True
+        if self._content_download_btn is not None:
+            try:
+                self._content_download_btn.configure(state="disabled")
+            except Exception:
+                pass
+        self._content_set_status("DOWNLOADING // {0}".format(project))
+        self._content_progress_ui(0, 0)
+        threading.Thread(
+            target=self._content_download_worker,
+            args=([project], self._content_kind, self._content_mc_selected()),
+            daemon=True,
+        ).start()
+
+    def _content_download_worker(self, projects, kind, mc_version):
+        target_dir = self.content_target_dir(kind)
+        label = CONTENT_KIND_LABELS.get(kind, kind)
+        ok = []
+        skipped = []
+        failed = []
+        total = max(1, len(projects))
+        for index, project in enumerate(projects, start=1):
+            try:
+                self.post(
+                    self._content_set_status,
+                    "{0} 下载 {1}/{2} // {3}".format(label, index, total, project),
+                )
+                result = fetch_content_file(
+                    project,
+                    mc_version,
+                    target_dir,
+                    say=lambda text: self.post(self._content_set_status, str(text)),
+                    kind=kind,
+                )
+                if result.get("status") == "ok":
+                    ok.append(result)
+                else:
+                    skipped.append(result)
+                self.post(self._content_progress_ui, index, total)
+            except Exception as exc:
+                log_debug("content download failed:\n" + traceback.format_exc())
+                failed.append((project, str(exc)))
+        self.post(self._content_finish, kind, target_dir, ok, skipped, failed)
+
+    def _content_finish(self, kind, target_dir, ok, skipped, failed):
+        self._content_busy = False
+        if self._content_download_btn is not None:
+            try:
+                self._content_download_btn.configure(state="normal")
+            except Exception:
+                pass
+        label = CONTENT_KIND_LABELS.get(kind, kind)
+        parts = []
+        if ok:
+            parts.append(
+                "完成 " + ", ".join(str(item.get("filename")) for item in ok)
+            )
+        if skipped:
+            parts.append(
+                "已存在 " + ", ".join(str(item.get("filename")) for item in skipped)
+            )
+        if failed:
+            parts.append("失败 {0} 个".format(len(failed)))
+        self._content_set_status(" // ".join(parts) if parts else "DONE // 无变化")
+        for item in ok:
+            self.say(
+                "[{0} 下载] {1} -> {2}".format(
+                    label, item.get("filename"), target_dir
+                )
+            )
+        lines = [
+            "{0} 下载结果".format(label),
+            "目录: {0}".format(target_dir),
+            "成功 {0} / 跳过 {1} / 失败 {2}".format(len(ok), len(skipped), len(failed)),
+        ]
+        if failed:
+            lines.append("")
+            for project, reason in failed[:6]:
+                lines.append(" - {0} :: {1}".format(project, str(reason)[:100]))
+            messagebox.showwarning(
+                "下载存在失败", "\n".join(lines), parent=self._content_win or self.root
+            )
+        else:
+            messagebox.showinfo(
+                "下载完成", "\n".join(lines), parent=self._content_win or self.root
+            )
+
+    # -- multiplayer guide ---------------------------------------------------
+
+    def local_ipv4_addresses(self):
+        import socket
+
+        addresses = []
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None):
+                ip = str(info[4][0])
+                if ":" in ip or ip.startswith("127."):
+                    continue
+                if ip not in addresses:
+                    addresses.append(ip)
+        except Exception:
+            pass
+        if not addresses:
+            try:
+                probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    probe.connect(("8.8.8.8", 80))
+                    ip = str(probe.getsockname()[0])
+                    if ip and not ip.startswith("127."):
+                        addresses.append(ip)
+                finally:
+                    probe.close()
+            except Exception:
+                pass
+        return addresses
+
+    def on_copy_local_ip(self):
+        addresses = self.local_ipv4_addresses()
+        if not addresses:
+            messagebox.showwarning(
+                "未获取到 IP",
+                "没有找到可用的 IPv4 地址，请检查网络连接。",
+                parent=self.root,
+            )
+            return
+        best = addresses[0]
+        for prefix in ("10.", "192.168.", "172."):
+            match = next((ip for ip in addresses if ip.startswith(prefix)), "")
+            if match:
+                best = match
+                break
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(best)
+            self.say("已复制本机 IP: {0}".format(best))
+        except Exception as exc:
+            self.say("剪贴板写入失败: {0}".format(exc))
+        messagebox.showinfo(
+            "本机 IP",
+            "已复制到剪贴板：{0}\n\n全部网卡地址：\n{1}\n\n"
+            "联机时地址写法：<IP>:<端口>\n"
+            "端口请用房主游戏里「对局域网开放」后聊天栏提示的那个。".format(
+                best, "\n".join(addresses)
+            ),
+            parent=self.root,
+        )
+
+    def on_open_online_guide(self):
+        if self._tutorial_win is not None:
+            try:
+                self._tutorial_win.deiconify()
+                self._tutorial_win.lift()
+                self._tutorial_win.focus_force()
+                return
+            except Exception:
+                self._tutorial_win = None
+
+        win = tk.Toplevel(self.root)
+        win.title("ONLINE PLAY // 联机教程")
+        win.configure(bg=C_WHITE)
+        win.transient(self.root)
+        win.resizable(True, True)
+
+        wrap = tk.Frame(win, bg=C_WHITE, bd=1, relief="solid", padx=10, pady=10)
+        wrap.pack(fill="both", expand=True, padx=8, pady=8)
+
+        tk.Label(
+            wrap,
+            text=title_text("ONLINE PLAY // 联机教程（蓝盾 / 局域网）"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        ).pack(fill="x")
+
+        body = tk.Frame(wrap, bg=C_WHITE, bd=1, relief="solid")
+        body.pack(fill="both", expand=True, pady=(8, 0))
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+
+        text = tk.Text(
+            body,
+            wrap="word",
+            font=FONT_SMALL,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            padx=8,
+            pady=8,
+        )
+        text.grid(row=0, column=0, sticky="nsew")
+        scroll = tk.Scrollbar(
+            body,
+            orient="vertical",
+            command=text.yview,
+            width=14,
+            bg=C_GRAY,
+            activebackground=C_TEAL,
+            troughcolor=C_WHITE,
+            bd=1,
+            relief="solid",
+        )
+        scroll.grid(row=0, column=1, sticky="ns")
+        text.configure(yscrollcommand=scroll.set)
+        text.insert("1.0", ONLINE_GUIDE_TEXT)
+        text.configure(state="disabled")
+
+        button_row = tk.Frame(wrap, bg=C_WHITE)
+        button_row.pack(fill="x", pady=(8, 0))
+        self._mk_button(
+            button_row, "[ 复制本机 IP ]", self.on_copy_local_ip
+        ).pack(side="left", expand=True, fill="x", padx=2)
+        self._mk_button(
+            button_row,
+            "[ 复制教程全文 ]",
+            lambda: self._copy_text(ONLINE_GUIDE_TEXT, "联机教程"),
+        ).pack(side="left", expand=True, fill="x", padx=2)
+        self._mk_button(button_row, "[ 关闭 ]", self._close_online_guide).pack(
+            side="left", expand=True, fill="x", padx=2
+        )
+
+        self._tutorial_win = win
+        win.update_idletasks()
+        pos_x = self.root.winfo_rootx() + max(
+            0, (self.root.winfo_width() - win.winfo_reqwidth()) // 2
+        )
+        pos_y = self.root.winfo_rooty() + max(
+            0, (self.root.winfo_height() - win.winfo_reqheight()) // 2
+        )
+        win.geometry("+{0}+{1}".format(pos_x, pos_y))
+        win.minsize(720, 520)
+
+    def _copy_text(self, content, label):
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(content)
+            self.say("已复制{0}到剪贴板".format(label))
+        except Exception as exc:
+            self.say("剪贴板写入失败: {0}".format(exc))
+
+    def _close_online_guide(self):
+        win = self._tutorial_win
+        self._tutorial_win = None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+    # -- version isolation ---------------------------------------------------
+
+    def isolation_enabled(self):
+        return bool(self.config.get("version_isolation"))
+
+    def isolated_version(self):
+        if not self.isolation_enabled():
+            return ""
+        return str(self.config.get("launch_version") or "").strip()
+
+    def effective_game_dir(self):
+        """Per-version game dir when isolation is on, otherwise the shared root."""
+        version = self.isolated_version()
+        if version:
+            return os.path.join(self.mc_dir, "versions", version)
+        return self.mc_dir
+
+    def effective_mods_dir(self):
+        return os.path.join(self.effective_game_dir(), "mods")
+
+    def ensure_isolation_dirs(self):
+        base = self.effective_game_dir()
+        if os.path.normcase(os.path.abspath(base)) == os.path.normcase(
+            os.path.abspath(self.mc_dir)
+        ):
+            ensure_dir(self.mods_dir)
+            return base
+        for sub in (
+            "mods",
+            "config",
+            "saves",
+            "resourcepacks",
+            "shaderpacks",
+            "screenshots",
+            "logs",
+        ):
+            ensure_dir(os.path.join(base, sub))
+        return base
+
+    def _refresh_isolation_label(self, version_id=None):
+        if self.version_info_var is None:
+            return
+        self._refresh_version_info(version_id)
+
+    def on_toggle_isolation(self):
+        enabled = False
+        try:
+            if self._isolation_var is not None:
+                enabled = bool(self._isolation_var.get())
+        except Exception:
+            enabled = False
+        self.config["version_isolation"] = enabled
+        self._save_config()
+        self._refresh_isolation_label()
+        if not enabled:
+            self.say("版本隔离已关闭 // 模组回到全局 mods")
+            return
+        if not self.isolated_version():
+            self.say("版本隔离已开启 // 需先选择一个具体版本才生效")
+            messagebox.showinfo(
+                "版本隔离已开启",
+                "当前是 AUTO 模式，隔离目录暂未生效。\n\n"
+                "请在左侧 [版本档案] 里选择一个具体版本，"
+                "之后启动与装配模组都会使用独立目录。",
+                parent=self.root,
+            )
+            return
+        base = self.ensure_isolation_dirs()
+        self.say("版本隔离已开启 // 独立目录 {0}".format(base))
+        messagebox.showinfo(
+            "版本隔离已开启",
+            "该版本将使用独立目录：\n{0}\n\n"
+            "mods / config / saves / resourcepacks / shaderpacks\n"
+            "都会写进这个目录，互不冲突。\n\n"
+            "全局 mods 目录保持不变，可随时切换回未隔离模式。".format(base),
+            parent=self.root,
+        )
+
+    def shelf_loader(self):
+        # Plain attribute (not a Tk variable): worker threads read this too.
+        key = str(self._shelf_loader_value or "auto").lower()
+        if key == "all":
+            return ""
+        if key in {"forge", "neoforge", "fabric", "quilt"}:
+            return key
+        return self.mod_loader
+
+    def _shelf_label_text(self):
+        loader = self.shelf_loader()
+        return "FILTER // MC {0} // {1}".format(
+            self.shelf_mc_version(),
+            loader.upper() if loader else "全部加载器",
+        )
+
+    def _refresh_shelf_label(self):
+        if self._shelf_filter_var is None:
+            return
+        try:
+            self._shelf_filter_var.set(self._shelf_label_text())
+        except Exception:
+            pass
+
+    def on_shelf_loader_change(self):
+        value = "auto"
+        try:
+            if self._shelf_loader_var is not None:
+                value = str(self._shelf_loader_var.get() or "auto")
+        except Exception:
+            value = "auto"
+        self._shelf_loader_value = value
+        self.config["mod_filter_loader"] = value
+        self._save_config()
+        self._refresh_shelf_label()
+        self.say(
+            "战备架加载器筛选 -> {0} // 重新装载榜单".format(self._shelf_label_text())
+        )
+        self.refresh_hot()
+
+    def refresh_hot(self):
+        if self._busy:
+            self.say("下载总线占用中，稍后再刷新榜单")
+            return
+        if time.time() - self._last_hot_refresh < 1.0:
+            return
+        self._last_hot_refresh = time.time()
+        try:
+            self.count_label.configure(text="ARSENAL LOADING ...")
+        except Exception:
+            pass
+        self.say(
+            "正在拉取 Modrinth 热门榜单 // {0} / {1}".format(
+                self.mc_version, self.mod_loader
+            )
+        )
+        threading.Thread(target=self._refresh_hot_worker, daemon=True).start()
+
+    def _refresh_hot_worker(self):
+        settings = self.config.get("modrinth") or {}
+        limit = int(settings.get("hot_limit") or 8)
+        index = str(settings.get("index") or "downloads")
+        mc = self.shelf_mc_version()
+        loader = self.shelf_loader()
+        scope = "{0}/{1}".format(mc, loader.upper() if loader else "全部加载器")
+        relaxed = ""
+        try:
+            hits, _total = modrinth_search_page("", limit, index, mc, loader)
+            if not hits:
+                hits, _total = modrinth_search_page("", limit, index, "", loader)
+                relaxed = "{0} 无记录 // 显示全部版本".format(mc)
+            if not hits and loader:
+                hits, _total = modrinth_search_page("", limit, index, mc, "")
+                relaxed = "{0} 无记录 // 显示全部加载器".format(loader.upper())
+            if not hits:
+                hits, _total = modrinth_search_page("", limit, index, "", "")
+                relaxed = "无记录 // 显示全站热门"
+        except Exception as exc:
+            log_debug("hot refresh failed:\n" + traceback.format_exc())
+            self.post(self._populate_hits, [], "OFFLINE // 榜单不可用")
+            self.say("热门榜单拉取失败: {0}".format(exc))
+            message = str(exc)
+            self.post(
+                lambda msg=message: messagebox.showwarning(
+                    "Modrinth 不可用",
+                    "{0}\n\n可稍后点击 [刷新热门] 重试。".format(msg),
+                    parent=self.root,
+                )
+            )
+            return
+        if not hits:
+            self.post(self._populate_hits, [], "EMPTY // 榜单无记录")
+            self.say("热门榜单为空 // Modrinth 未返回匹配记录")
+            return
+        note = "HOT {0} // {1}".format(len(hits), scope)
+        if relaxed:
+            note += " // " + relaxed
+        self.post(self._populate_hits, hits, note)
+        self.say(
+            "战备架已装载 {0} 条热门记录 // {1}".format(len(hits), scope)
+        )
+
+    def _search_limit(self):
+        settings = self.config.get("modrinth") or {}
+        try:
+            value = int(settings.get("search_limit") or 30)
+        except (TypeError, ValueError):
+            value = 30
+        return max(10, min(MODRINTH_MAX_LIMIT, value))
+
+    def _set_more_button(self, enabled):
+        button = getattr(self, "btn_more", None)
+        if button is None:
+            return
+        try:
+            button.configure(state="normal" if enabled else "disabled")
+        except Exception:
+            pass
+
+    def on_search(self, _event=None):
+        if self._busy:
+            self.say("下载总线占用中，稍后再检索")
+            return
+        raw = str(self.search_var.get() or "").strip()
+        self.say("检索指令: {0}".format(raw if raw else "(空查询 -> 热门榜单)"))
+        self._set_more_button(False)
+        threading.Thread(target=self._search_worker, args=(raw, 0), daemon=True).start()
+
+    def on_search_more(self):
+        if self._busy:
+            self.say("下载总线占用中，稍后再加载")
+            return
+        state = self._search_state or {}
+        if not state.get("raw"):
+            self.say("先检索一次，再点 [ 更多结果 ]")
+            return
+        self._set_more_button(False)
+        self.say(
+            "加载下一页结果 // 已显示 {0} 条".format(len(state.get("hits") or []))
+        )
+        threading.Thread(
+            target=self._search_worker, args=(state["raw"], 1), daemon=True
+        ).start()
+
+    def _search_scopes(self):
+        mc = self.shelf_mc_version()
+        loader = self.shelf_loader()
+        loader_label = loader.upper() if loader else "全部加载器"
+        scopes = [
+            (
+                "版本+加载器",
+                mc,
+                loader,
+                "{0}/{1} 精确适配".format(mc, loader_label),
+            )
+        ]
+        # A manual loader filter is a hard constraint: only widen the MC version.
+        if loader:
+            scopes.append(
+                ("仅加载器", "", loader, "全部版本 / {0}".format(loader_label))
+            )
+        else:
+            scopes.append(("全站", "", "", "全版本 / 全加载器"))
+        return scopes
+
+    def _search_first_page(self, raw, limit):
+        state = {
+            "raw": raw,
+            "term": "",
+            "terms": [],
+            "scope_label": "",
+            "scope_v": "",
+            "scope_l": "",
+            "scope_hint": "",
+            "fetched": 0,
+            "total": 0,
+            "hits": [],
+            "primary": "",
+            "raw_only": False,
+        }
+        if not raw:
+            hits, total = modrinth_search_page(
+                "", limit, "downloads", self.shelf_mc_version(), self.shelf_loader()
+            )
+            state.update(
+                {
+                    "hits": hits,
+                    "fetched": len(hits),
+                    "total": total or len(hits),
+                    "scope_label": "HOT",
+                    "scope_hint": "热门榜单 // {0}".format(self._shelf_label_text()),
+                }
+            )
+            return state
+
+        terms = translate_query_candidates(raw, self.alias)
+        candidate = terms[0] if terms else raw
+        state["terms"] = terms
+        state["term"] = candidate
+        state["raw_only"] = not terms
+
+        primary = None
+        if terms:
+            try:
+                primary = project_to_hit(
+                    modrinth_project(candidate),
+                    self.shelf_mc_version(),
+                    self.shelf_loader(),
+                )
+            except Exception:
+                primary = None
+            if primary:
+                state["primary"] = str(primary.get("slug") or "")
+            if primary and self.shelf_loader() and not primary.get(
+                "supports_loader", True
+            ):
+                # Keep the manual loader filter strict.
+                primary = None
+                state["primary"] = ""
+
+        best = None
+        chosen = None
+        for label, version, loader, hint in self._search_scopes():
+            page_hits, page_total = modrinth_search_page(
+                candidate, limit, "relevance", version, loader
+            )
+            if not page_hits:
+                continue
+            if best is None:
+                best = (page_hits, page_total, label, version, loader, hint)
+            if hits_mention(page_hits, candidate):
+                chosen = (page_hits, page_total, label, version, loader, hint)
+                break
+        if chosen is None and best is not None:
+            chosen = best
+        hits = []
+        total = 0
+        if chosen is not None:
+            hits, total, label, version, loader, hint = chosen
+            state.update(
+                {
+                    "scope_label": label,
+                    "scope_v": version,
+                    "scope_l": loader,
+                    "scope_hint": hint,
+                }
+            )
+        elif primary is not None:
+            state.update({"scope_label": "本体", "scope_hint": "仅命中本体项目"})
+
+        merged = []
+        if primary:
+            merged.append(primary)
+        seen = {str(item.get("slug") or "").lower() for item in merged}
+        for hit in hits:
+            slug = str(hit.get("slug") or "").lower()
+            if slug and slug in seen:
+                continue
+            seen.add(slug)
+            merged.append(hit)
+        state["hits"] = merged[:limit]
+        state["fetched"] = len(hits)
+        state["total"] = max(int(total or 0), len(merged))
+        return state
+
+    def _search_next_page(self, limit):
+        state = dict(self._search_state or {})
+        if not state.get("raw"):
+            return state
+        hits, total = modrinth_search_page(
+            state.get("term") or "",
+            limit,
+            "relevance" if state.get("term") else "downloads",
+            state.get("scope_v") or "",
+            state.get("scope_l") or "",
+            offset=int(state.get("fetched") or 0),
+        )
+        seen = {
+            str(item.get("slug") or "").lower() for item in state.get("hits") or []
+        }
+        merged = list(state.get("hits") or [])
+        for hit in hits:
+            slug = str(hit.get("slug") or "").lower()
+            if slug and slug in seen:
+                continue
+            seen.add(slug)
+            merged.append(hit)
+        state["hits"] = merged
+        state["fetched"] = int(state.get("fetched") or 0) + len(hits)
+        if total:
+            state["total"] = max(int(state.get("total") or 0), int(total))
+        return state
+
+    def _search_note(self, state, hits):
+        if not state.get("raw"):
+            return "HOT {0} // {1}".format(len(hits), self._shelf_label_text())
+        parts = ["QUERY {0}".format(state.get("term") or state.get("raw"))]
+        total = int(state.get("total") or 0)
+        if total > len(hits):
+            parts.append("{0}/{1} 条".format(len(hits), total))
+        else:
+            parts.append("{0} 条".format(len(hits)))
+        parts.append(state.get("scope_hint") or "")
+        primary = state.get("primary") or ""
+        if primary:
+            for hit in hits:
+                if str(hit.get("slug") or "") == primary and not hit.get(
+                    "supports_version", True
+                ):
+                    parts.append("本体无 {0} 版本".format(self.mc_version))
+                    break
+        if state.get("raw_only"):
+            parts.append("中文词库未收录，按原文检索")
+        return " // ".join([item for item in parts if item])
+
+    def _search_worker(self, raw, page=0):
+        limit = self._search_limit()
+        try:
+            if page == 0:
+                state = self._search_first_page(raw, limit)
+            else:
+                state = self._search_next_page(limit)
+        except Exception as exc:
+            log_debug("search failed:\n" + traceback.format_exc())
+            self.post(self._populate_hits, [], "ERROR // 检索失败")
+            self.post(self._search_finished, {}, [])
+            self.say("检索失败: {0}".format(exc))
+            message = str(exc)
+            self.post(
+                lambda msg=message: messagebox.showwarning(
+                    "检索失败", msg, parent=self.root
+                )
+            )
+            return
+
+        hits = list(state.get("hits") or [])
+        if not hits:
+            suggestions = alias_suggestions(raw, self.alias) if raw else []
+            note = "NO MATCH // 0 条 // {0}".format(self._shelf_label_text())
+            if self.shelf_loader():
+                note += " // 可切到 [全部] 再搜"
+            self.post(self._populate_hits, [], note)
+            self.post(self._search_finished, state, suggestions)
+            self.say("未找到匹配记录: {0}".format(raw))
+            return
+
+        note = self._search_note(state, hits)
+        self.post(self._populate_hits, hits, note)
+        self.post(self._search_finished, state, [])
+        if state.get("raw"):
+            self.say(
+                "检索完成: {0} -> {1} // {2} 条 // {3}".format(
+                    raw,
+                    state.get("term") or raw,
+                    len(hits),
+                    state.get("scope_hint") or "-",
+                )
+            )
+        else:
+            self.say("战备架已装载 {0} 条热门记录".format(len(hits)))
+
+    def _search_finished(self, state, suggestions):
+        self._search_state = state
+        fetched = int(state.get("fetched") or 0)
+        total = int(state.get("total") or 0)
+        self._set_more_button(bool(state.get("raw")) and 0 < fetched < total)
+        if suggestions:
+            self.say("可尝试的中文词: {0}".format(" / ".join(suggestions)))
+
+    def _populate_hits(self, hits, note):
+        self.current_hits = list(hits)
+        target = self.shelf_mc_version()
+        self.listbox.set_items([_hit_card(hit, target) for hit in self.current_hits])
+        self.count_label.configure(text=note)
+        self._load_icons("arsenal", self.current_hits, self.listbox)
+
+    def _load_icons(self, slot, hits, grid):
+        """Reuse memory/disk thumbnails, then fetch the rest off the UI thread."""
+        if grid is None:
+            return
+        token = int(self._icon_tokens.get(slot) or 0) + 1
+        self._icon_tokens[slot] = token
+        pending = []
+        for hit in hits:
+            slug = str(hit.get("slug") or hit.get("project_id") or "").strip()
+            if not slug:
+                continue
+            cached = self._icon_memory.get(slug)
+            if cached:
+                try:
+                    grid.set_icon(slug, cached)
+                except Exception:
+                    pass
+                continue
+            if self._icon_failed.get(slug, 0) >= 2:
+                continue
+            urls = project_icon_urls(hit.get("project_id"), hit.get("icon_url"))
+            if urls:
+                pending.append((slug, urls))
+        if not pending:
+            return
+        threading.Thread(
+            target=self._icon_worker,
+            args=(slot, token, list(pending), grid),
+            daemon=True,
+        ).start()
+
+    def _icon_worker(self, slot, token, pending, grid):
+        """Fetch thumbnails in parallel so a 30 card wall fills in a few seconds."""
+
+        def one(pair):
+            slug, urls = pair
+            if self._icon_tokens.get(slot) != token:
+                return None
+            try:
+                return slug, load_project_icon(slug, urls)
+            except Exception:
+                log_debug("icon failed {0}:\n{1}".format(slug, traceback.format_exc()))
+                return None
+
+        workers = max(1, min(6, len(pending)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(one, pair) for pair in pending]
+            for future in as_completed(futures):
+                if self._icon_tokens.get(slot) != token:
+                    return
+                try:
+                    result = future.result()
+                except Exception:
+                    continue
+                if not result:
+                    continue
+                slug, data = result
+                if not data:
+                    self._icon_failed[slug] = int(self._icon_failed.get(slug, 0)) + 1
+                    continue
+                self._icon_failed.pop(slug, None)
+                if len(self._icon_memory) > 600:
+                    self._icon_memory.clear()
+                self._icon_memory[slug] = data
+                self.post(self._icon_arrived, slot, token, grid, slug, data)
+
+    def _icon_arrived(self, slot, token, grid, slug, data):
+        if self._icon_tokens.get(slot) != token:
+            return
+        try:
+            grid.set_icon(slug, data)
+        except Exception:
+            pass
+
+    def on_list_select(self, index=None):
+        if index is None:
+            selection = self.listbox.selected_indices()
+            index = selection[-1] if selection else -1
+        index = int(index)
+        if index < 0 or index >= len(self.current_hits):
+            return
+        hit = self.current_hits[index]
+        description = str(hit.get("description") or "").strip().replace("\n", " ")
+        highest = highest_game_version(hit) or self.mc_version or "?"
+        text = "[PREVIEW] {0} // {1} // 最高适配 MC {2} // 下载 {3} // {4}".format(
+            hit.get("title") or hit.get("slug") or "?",
+            hit.get("slug") or "?",
+            highest,
+            human_count(hit.get("downloads")),
+            description[:120] or "无简介",
+        )
+        versions = hit_game_versions(hit)
+        if versions:
+            head = ",".join(versions[:10])
+            if len(versions) > 10:
+                head += ",+{0}".format(len(versions) - 10)
+            text += " // 支持版本: {0}".format(head)
+        warnings = []
+        shelf_loader = self.shelf_loader()
+        if hit.get("supports_version") is False:
+            warnings.append("无 {0} 版本".format(self.shelf_mc_version()))
+        if shelf_loader and hit.get("supports_loader") is False:
+            warnings.append("无 {0} 构建".format(shelf_loader.upper()))
+        if warnings:
+            text += " // 警告: {0}，装配会失败；请切换版本/加载器".format(
+                " / ".join(warnings)
+            )
+        self._apply_status(text)
+
+
+    def on_list_double(self, index=None):
+        if self._busy:
+            self.say("下载总线占用中，请稍候")
+            return
+        if not self.current_hits:
+            return
+        if index is None:
+            selection = self.listbox.selected_indices()
+            index = selection[-1] if selection else -1
+        index = int(index)
+        if index < 0 or index >= len(self.current_hits):
+            return
+        hit = self.current_hits[index]
+        project = str(hit.get("slug") or hit.get("project_id") or "")
+        if not project:
+            return
+        title = str(hit.get("title") or project)
+        self.say("双击直装: {0} // 拉取最新匹配 jar".format(title))
+        self._dispatch_downloads([project], "双击直装")
+
+    def _selected_hits(self):
+        hits = []
+        for raw_index in sorted(self.listbox.selected_indices()):
+            index = int(raw_index)
+            if 0 <= index < len(self.current_hits):
+                hits.append(self.current_hits[index])
+        return hits
+
+    def on_assemble(self):
+        if self._busy:
+            self.say("已有下载任务在运行 ...")
+            return
+        hits = self._selected_hits()
+        if not hits:
+            messagebox.showinfo(
+                "未选择模组",
+                "请先在战备架上用鼠标选中至少一个模组。",
+                parent=self.root,
+            )
+            return
+        projects = []
+        for hit in hits:
+            project = str(hit.get("slug") or hit.get("project_id") or "")
+            if project:
+                projects.append(project)
+        self._dispatch_downloads(projects, "装配所选")
+
+    def on_perf_pack(self):
+        if self._busy:
+            self.say("已有下载任务在运行 ...")
+            return
+        self.say("一键性能全家桶: 并发装配 {0} 款优化模组".format(len(PERF_PACK)))
+        self._dispatch_downloads(list(PERF_PACK), "性能全家桶")
+
+    def _create_pack_loader(self):
+        return (self.mod_loader or "").strip().lower()
+
+    def _close_create_pack(self, event=None):
+        win = getattr(self, "_create_pack_win", None)
+        self._create_pack_win = None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+    def on_open_create_pack(self):
+        """Create (机械动力) bundle: probe every row, tick, assemble in one go."""
+        existing = getattr(self, "_create_pack_win", None)
+        if existing is not None:
+            try:
+                existing.deiconify()
+                existing.lift()
+                existing.focus_force()
+                return
+            except Exception:
+                self._create_pack_win = None
+
+        mc_version = self.mc_version
+        loader = self._create_pack_loader()
+        has_loader = loader in ("forge", "neoforge", "fabric", "quilt")
+        target_dir = self.effective_mods_dir()
+
+        win = tk.Toplevel(self.root)
+        self._create_pack_win = win
+        win.title("CREATE PACK // 机械动力全家桶")
+        win.configure(bg=C_WHITE)
+        win.transient(self.root)
+        win.resizable(True, True)
+        win.protocol("WM_DELETE_WINDOW", self._close_create_pack)
+        try:
+            win.minsize(680, 470)
+        except Exception:
+            pass
+        win.bind("<Escape>", self._close_create_pack)
+
+        wrap = tk.Frame(win, bg=C_WHITE, bd=1, relief="solid", padx=10, pady=8)
+        wrap.pack(fill="both", expand=True, padx=8, pady=8)
+        wrap.columnconfigure(0, weight=1)
+        wrap.rowconfigure(4, weight=1)
+
+        tk.Label(
+            wrap,
+            text=title_text("CREATE PACK // 机械动力全家桶（一键装配）"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        ).grid(row=0, column=0, sticky="ew")
+
+        info_var = tk.StringVar(value="")
+        tk.Label(
+            wrap,
+            textvariable=info_var,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            bd=1,
+            relief="solid",
+            padx=5,
+            pady=3,
+        ).grid(row=1, column=0, sticky="ew", pady=(6, 0))
+
+        action_row = tk.Frame(wrap, bg=C_WHITE)
+        action_row.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        status_var = tk.StringVar(value="探测中 ...")
+        tk.Label(
+            action_row,
+            textvariable=status_var,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+        ).pack(side="left", fill="x", expand=True)
+
+        body = tk.Frame(wrap, bg=C_GRAY, bd=1, relief="solid")
+        body.grid(row=4, column=0, sticky="nsew", pady=(6, 0))
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+        canvas = tk.Canvas(body, bg=C_GRAY, highlightthickness=0, bd=0)
+        scroll = tk.Scrollbar(
+            body,
+            orient="vertical",
+            command=canvas.yview,
+            width=14,
+            bg=C_GRAY,
+            activebackground=C_TEAL,
+            troughcolor=C_WHITE,
+            bd=1,
+            relief="solid",
+        )
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        inner = tk.Frame(canvas, bg=C_GRAY)
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.columnconfigure(3, weight=1)
+
+        def relayout(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            try:
+                canvas.itemconfigure(window_id, width=canvas.winfo_width())
+            except Exception:
+                pass
+
+        inner.bind("<Configure>", relayout)
+        canvas.bind("<Configure>", relayout)
+        win.bind(
+            "<MouseWheel>",
+            lambda event: canvas.yview_scroll(
+                -1 if getattr(event, "delta", 0) > 0 else 1, "units"
+            ),
+        )
+
+        rows = []
+        for index, entry in enumerate(CREATE_PACK):
+            allowed = tuple(entry.get("loaders") or ())
+            applicable = (not allowed) or (loader in allowed)
+            var = tk.BooleanVar(value=applicable)
+            check = tk.Checkbutton(
+                inner,
+                text=entry.get("label") or "",
+                variable=var,
+                bg=C_GRAY,
+                fg=C_BLACK,
+                activebackground=C_GRAY,
+                activeforeground=C_BLACK,
+                selectcolor=C_WHITE,
+                font=FONT_SMALL,
+                anchor="w",
+                bd=0,
+                highlightthickness=0,
+                takefocus=0,
+                cursor="hand2" if applicable else "arrow",
+                state="normal" if applicable else "disabled",
+            )
+            check.grid(row=index, column=0, sticky="w", padx=(4, 6), pady=1)
+            tk.Label(
+                inner,
+                text=entry.get("group") or "",
+                bg=C_GRAY,
+                fg=C_TEAL,
+                font=FONT_SMALL,
+                width=3,
+                anchor="w",
+            ).grid(row=index, column=1, sticky="w")
+            status = tk.Label(
+                inner,
+                text="探测中 ..." if applicable else "不适用",
+                bg=C_GRAY,
+                fg="#555555",
+                font=FONT_SMALL,
+                width=16,
+                anchor="e",
+            )
+            status.grid(row=index, column=2, sticky="e", padx=(6, 8))
+            tk.Label(
+                inner,
+                text=entry.get("note") or "",
+                bg=C_GRAY,
+                fg="#555555",
+                font=FONT_SMALL,
+                anchor="w",
+            ).grid(row=index, column=3, sticky="w")
+            rows.append(
+                {
+                    "entry": entry,
+                    "var": var,
+                    "status": status,
+                    "hit": None,
+                    "applicable": applicable,
+                }
+            )
+
+        state = {"token": 0}
+        head_text = "目标 // MC {0} · {1} · 写入 {2}".format(
+            mc_version, loader.upper() or "?", target_dir
+        )
+        if not has_loader:
+            head_text += (
+                "\n注意 // 当前没有模组加载器，机械动力需要 Forge / Fabric / NeoForge"
+            )
+        info_var.set(head_text)
+        set_status = status_var.set
+
+        def apply_hits(token, hits, done):
+            if token != state["token"]:
+                return
+            if getattr(self, "_create_pack_win", None) is None:
+                return
+            available = 0
+            ticked = 0
+            waiting = 0
+            for index, row in enumerate(rows):
+                hit = hits[index] if index < len(hits) else None
+                if not row["applicable"]:
+                    row["status"].configure(text="不适用", fg="#777777")
+                    continue
+                if hit:
+                    row["hit"] = hit
+                    available += 1
+                    row["status"].configure(
+                        text="[ OK ] " + shorten_text(hit["version"], 14),
+                        fg="#0A6A2F",
+                    )
+                elif done:
+                    row["hit"] = None
+                    row["status"].configure(text="[ 无适配 ]", fg="#A11B1B")
+                    row["var"].set(False)
+                else:
+                    waiting += 1
+                if row["var"].get():
+                    ticked += 1
+            if waiting:
+                set_status(
+                    "探测中 ... // 已确认 {0} 项 // 还剩 {1} 项".format(
+                        available, waiting
+                    )
+                )
+            else:
+                set_status(
+                    "共 {0} 项 // 可装 {1} // 已勾选 {2}".format(
+                        len(rows), available, ticked
+                    )
+                )
+
+        def resolve_one(row):
+            for slug in row["entry"].get("slugs") or ():
+                try:
+                    versions = modrinth_versions(slug, mc_version, loader)
+                except Exception:
+                    versions = []
+                if versions:
+                    picked = pick_version(versions)
+                    return {
+                        "slug": slug,
+                        "version": str(picked.get("version_number") or ""),
+                        "count": len(versions),
+                    }
+            return None
+
+        def resolve():
+            token = state["token"]
+            hits = [None] * len(rows)
+            pending = [
+                (index, row)
+                for index, row in enumerate(rows)
+                if row["applicable"]
+            ]
+            if not pending:
+                self.post(apply_hits, token, hits, True)
+                return
+            workers = min(6, len(pending))
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="akm-pack"
+            ) as pool:
+                futures = {
+                    pool.submit(resolve_one, row): index for index, row in pending
+                }
+                for future in as_completed(futures):
+                    index = futures[future]
+                    try:
+                        hits[index] = future.result()
+                    except Exception:
+                        hits[index] = None
+                    if token != state["token"]:
+                        return
+                    self.post(apply_hits, token, list(hits), False)
+            self.post(apply_hits, token, hits, True)
+
+        def start_resolve():
+            state["token"] += 1
+            set_status("探测中 ... // {0} 个条目".format(len(rows)))
+            for row in rows:
+                if row["applicable"]:
+                    row["status"].configure(text="探测中 ...", fg="#555555")
+                    row["hit"] = None
+            threading.Thread(target=resolve, daemon=True).start()
+
+        def select_main():
+            for row in rows:
+                if not row["applicable"]:
+                    continue
+                row["var"].set(bool(row["entry"].get("group") in ("核心", "前置")))
+            ticked = sum(1 for row in rows if row["applicable"] and row["var"].get())
+            set_status("已勾选 {0} // 共 {1} 项（核心 + 前置）".format(ticked, len(rows)))
+
+        def select_all():
+            for row in rows:
+                if row["applicable"]:
+                    row["var"].set(True)
+            ticked = sum(1 for row in rows if row["applicable"] and row["var"].get())
+            set_status("已勾选 {0} // 共 {1} 项".format(ticked, len(rows)))
+
+        def select_none():
+            for row in rows:
+                row["var"].set(False)
+            set_status("已勾选 0 // 共 {0} 项".format(len(rows)))
+
+        def assemble():
+            slugs = []
+            for row in rows:
+                if not row["applicable"] or not row["var"].get():
+                    continue
+                if row["hit"]:
+                    slugs.append(row["hit"]["slug"])
+            if not slugs:
+                messagebox.showinfo(
+                    "没有可装配的条目",
+                    "当前勾选里没有适配 {0}/{1} 的模组。\n"
+                    "换个 MC 版本 / 加载器，或点 [ 重新探测 ]。".format(
+                        mc_version, loader.upper() or "?"
+                    ),
+                    parent=win,
+                )
+                return
+            self._close_create_pack()
+            self.say(
+                "机械动力全家桶 // {0} 个模组 -> {1}".format(len(slugs), target_dir)
+            )
+            self._dispatch_downloads(slugs, "机械动力全家桶")
+
+        button_row = tk.Frame(wrap, bg=C_WHITE)
+        button_row.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        button_row.columnconfigure(4, weight=1)
+        self._mk_button(
+            button_row, "[ 核心 + 前置 ]", select_main, font=FONT_SMALL, padx=6, pady=2
+        ).grid(row=0, column=0, sticky="w")
+        self._mk_button(
+            button_row, "[ 全选 ]", select_all, font=FONT_SMALL, padx=6, pady=2
+        ).grid(row=0, column=1, sticky="w", padx=(4, 0))
+        self._mk_button(
+            button_row, "[ 全不选 ]", select_none, font=FONT_SMALL, padx=6, pady=2
+        ).grid(row=0, column=2, sticky="w", padx=(4, 0))
+        self._mk_button(
+            button_row,
+            "[ 重新探测 ]",
+            start_resolve,
+            font=FONT_SMALL,
+            padx=6,
+            pady=2,
+        ).grid(row=0, column=3, sticky="w", padx=(4, 0))
+        self._mk_button(
+            button_row, "[ 关闭 ]", self._close_create_pack, font=FONT_SMALL, padx=8, pady=2
+        ).grid(row=0, column=5, sticky="e", padx=(6, 0))
+        self._mk_button(
+            button_row, "[ 开始装配 ]", assemble, padx=10, pady=2
+        ).grid(row=0, column=6, sticky="e", padx=(6, 0))
+
+        note = tk.Label(
+            wrap,
+            text=CREATE_PACK_NOTE,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            padx=5,
+            pady=3,
+            bd=1,
+            relief="solid",
+            wraplength=650,
+        )
+        note.grid(row=5, column=0, sticky="ew", pady=(6, 0))
+
+        try:
+            win.geometry(
+                "+{0}+{1}".format(
+                    self.root.winfo_rootx() + 80, self.root.winfo_rooty() + 50
+                )
+            )
+        except Exception:
+            pass
+        start_resolve()
+        self.say(
+            "机械动力全家桶 // 目标 {0}/{1} // 正在探测 {2} 个条目".format(
+                mc_version, loader.upper() or "?", len(CREATE_PACK)
+            )
+        )
+
+    def _dispatch_downloads(self, projects, label):
+        if self._vanilla_downloading or self._loader_installing:
+            messagebox.showwarning(
+                "安装进行中",
+                "请等待原版 / 加载器安装结束或取消后再装配模组。",
+                parent=self.root,
+            )
+            return
+        if self._busy:
+            messagebox.showwarning(
+                "总线占用", "已有下载任务在运行，请稍候。", parent=self.root
+            )
+            return
+        if not projects:
+            messagebox.showinfo("无任务", "没有可装配的模组。", parent=self.root)
+            return
+        self._busy = True
+        self._download_cancel.clear()
+        self._update_controls()
+        target_dir = self.effective_mods_dir()
+        ensure_dir(target_dir)
+        self.say(
+            "{0}: 启动 {1} 个并行装配任务 -> {2}".format(
+                label, len(projects), target_dir
+            )
+        )
+        if self.isolation_enabled() and self.isolated_version():
+            self.say("版本隔离生效 // 模组写入 versions\\{0}\\mods".format(
+                self.isolated_version()
+            ))
+        threading.Thread(
+            target=self._download_worker,
+            args=(list(projects), label, target_dir),
+            daemon=True,
+        ).start()
+        self.maybe_offer_mini_game("模组下载（{0} 个）".format(len(projects)))
+
+    def _download_worker(self, projects, label, mods_dir=""):
+        ok = []
+        skipped = []
+        failed = []
+        cancelled = False
+        target_dir = mods_dir or self.effective_mods_dir()
+        try:
+            ensure_dir(target_dir)
+            workers = min(4, max(1, len(projects)))
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="akm-mod"
+            ) as pool:
+                futures = {}
+                for project in projects:
+                    if self._download_cancel.is_set():
+                        cancelled = True
+                        break
+                    future = pool.submit(
+                        fetch_mod_jar,
+                        project,
+                        self.mc_version,
+                        self.mod_loader,
+                        target_dir,
+                        self.say,
+                    )
+                    futures[future] = project
+                for future in as_completed(futures):
+                    if self._download_cancel.is_set():
+                        cancelled = True
+                        for pending in futures:
+                            pending.cancel()
+                        self.say("模组下载已终止 // 已完成的文件保留")
+                        break
+                    project = futures[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        failed.append((project, str(exc)))
+                        self.say("[失败] {0} :: {1}".format(project, exc))
+                        log_debug(traceback.format_exc())
+                        continue
+                    if result.get("status") == "ok":
+                        ok.append(result)
+                        self.say(
+                            "[装配完成] {0} // {1}".format(
+                                result.get("filename"), result.get("version") or "-"
+                            )
+                        )
+                    else:
+                        skipped.append(result)
+                        self.say("[已存在] {0} 跳过".format(result.get("filename")))
+        except Exception as exc:
+            failed.append(("(dispatcher)", str(exc)))
+            log_debug("download dispatcher failed:\n" + traceback.format_exc())
+            self.say("装配调度异常: {0}".format(exc))
+        finally:
+            self.post(
+                self._finish_downloads, label, ok, skipped, failed, target_dir, cancelled
+            )
+
+    def _finish_downloads(self, label, ok, skipped, failed, mods_dir="", cancelled=False):
+        self._busy = False
+        self._update_controls()
+        if cancelled:
+            self.say(
+                "{0} 已终止 // 成功 {1} / 跳过 {2} / 失败 {3}（已完成文件保留）".format(
+                    label, len(ok), len(skipped), len(failed)
+                )
+            )
+            return
+        lines = [
+            "{0} 结束".format(label),
+            "成功 {0} / 跳过 {1} / 失败 {2}".format(
+                len(ok), len(skipped), len(failed)
+            ),
+            "目 录: {0}".format(mods_dir or self.mods_dir),
+        ]
+        if failed:
+            lines.append("")
+            lines.append("失败明细:")
+            for project, error in failed[:8]:
+                lines.append(" - {0} :: {1}".format(project, str(error)[:120]))
+        summary = "\n".join(lines)
+        self.say(
+            "{0}: 成功 {1} / 跳过 {2} / 失败 {3}".format(
+                label, len(ok), len(skipped), len(failed)
+            )
+        )
+        if failed:
+            messagebox.showwarning("装配存在失败", summary, parent=self.root)
+        else:
+            messagebox.showinfo("装配完成", summary, parent=self.root)
+
+    def on_clear_selection(self):
+        try:
+            self.listbox.clear_selection()
+        except Exception:
+            pass
+        self.say("列表选择已清空")
+
+
+    # -- ignite / launch -----------------------------------------------------
+
+    def on_ignite(self):
+        if self._vanilla_downloading or self._loader_installing:
+            self.say("安装进行中，请等待或取消后再点火")
+            return
+        if self.game_process is not None:
+            try:
+                if self.game_process.poll() is None:
+                    self.say("Minecraft 已在运行，请先关闭当前游戏进程")
+                    return
+            except Exception:
+                pass
+        if self._launching:
+            self.say("点火序列正在进行中 ...")
+            return
+        self._launching = True
+        self._launch_cancel.clear()
+        self._set_launch_state("LAUNCH: PREPARING", "active")
+        self._update_controls()
+        self.say("IGNITE 点火序列启动 ...")
+        self.maybe_offer_mini_game("游戏启动")
+        threading.Thread(target=self._ignite_worker, daemon=True).start()
+
+    def _launch_cancelled(self):
+        self._launching = False
+        self._launch_cancel.clear()
+        self._set_launch_state("LAUNCH: CANCELLED", "idle")
+        self._update_controls()
+        self.say("启动已终止 // 游戏进程没有创建，可随时重新点火")
+
+    def _check_launch_cancel(self):
+        if self._launch_cancel.is_set():
+            raise OperationCancelled("启动已终止")
+
+    def _ignite_worker(self):
+        try:
+            self._check_launch_cancel()
+            self.post(self._set_launch_state, "LAUNCH: AUTH", "active")
+            if self.is_ms_mode:
+                self._ensure_fresh_token()
+            profile = self._current_profile()
+            try:
+                import minecraft_launcher_lib as mll
+            except Exception:
+                self.say("点火中止: 缺少 minecraft-launcher-lib")
+                self.post(
+                    self._set_launch_state, "LAUNCH: NO LIB", "error"
+                )
+                self.post(
+                    lambda: messagebox.showerror(
+                        "缺少启动依赖",
+                        "未检测到 minecraft-launcher-lib。\n\n"
+                        "请打开 [关于] -> [安装 / 更新 minecraft-launcher-lib]，\n"
+                        "或手动执行:\n"
+                        "    pip install minecraft-launcher-lib",
+                        parent=self.root,
+                    )
+                )
+                return
+            self._check_launch_cancel()
+            version_id = self._ensure_game_files(mll)
+            self._check_launch_cancel()
+            self._start_game_process(mll, version_id, profile)
+        except OperationCancelled:
+            log_debug("ignite cancelled by user")
+            self.post(self._launch_cancelled)
+        except Exception as exc:
+            log_debug("ignite failed:\n" + traceback.format_exc())
+            self.post(self._set_launch_state, "LAUNCH: FAILED", "error")
+            self.say("点火失败: {0}".format(exc))
+            message = str(exc)
+            self.post(
+                lambda msg=message: messagebox.showerror(
+                    "点火失败", msg, parent=self.root
+                )
+            )
+        finally:
+            self._launching = False
+            self.post(self._update_controls)
+
+    def _install_callback(self, label="核心"):
+        state = {"max": 0, "last": 0.0, "pct": -1}
+
+        def set_status(text):
+            now = time.time()
+            if now - state["last"] > 0.4:
+                state["last"] = now
+                self.say("{0} :: {1}".format(label, text))
+
+        def set_max(value):
+            try:
+                state["max"] = int(value)
+            except Exception:
+                state["max"] = 0
+
+        def set_progress(value):
+            try:
+                current = int(value)
+            except Exception:
+                return
+            total = state["max"]
+            pct = int(current * 100 / total) if total else -1
+            self.post(self._set_task_progress, current, total)
+            if pct == state["pct"]:
+                return
+            state["pct"] = pct
+            now = time.time()
+            if now - state["last"] < 0.7:
+                return
+            state["last"] = now
+            if total:
+                self.say(
+                    "{0} :: {1}/{2} ({3}%)".format(
+                        label, current, total, pct
+                    )
+                )
+            else:
+                self.say("{0} :: {1}".format(label, current))
+
+        return {
+            "setStatus": set_status,
+            "setProgress": set_progress,
+            "setMax": set_max,
+        }
+
+    def _ensure_game_files(self, mll):
+        ensure_dir(self.mc_dir)
+        ensure_dir(os.path.join(self.mc_dir, "versions"))
+
+        selected = str(self.config.get("launch_version") or "").strip()
+        selected_json = (
+            os.path.join(self.mc_dir, "versions", selected, selected + ".json")
+            if selected
+            else ""
+        )
+        if selected and os.path.isfile(selected_json):
+            selected_dir = os.path.join(self.mc_dir, "versions", selected)
+            selected_jar = os.path.join(selected_dir, selected + ".jar")
+            selected_marker = os.path.join(selected_dir, ".akm_vanilla.json")
+            version_data = read_json(selected_json, None)
+            if not isinstance(version_data, dict) or not version_data.get("id"):
+                raise LauncherError(
+                    "版本 JSON 损坏或缺少 id: {0}".format(selected_json)
+                )
+            if os.path.isfile(selected_jar) and os.path.isfile(selected_marker):
+                self.say("AKM 原版档案校验通过: {0}".format(selected))
+                self.post(
+                    self._set_launch_state, "LAUNCH: LOCAL READY", "active"
+                )
+                return selected
+            inherits = str(version_data.get("inheritsFrom") or "").strip()
+            if inherits:
+                self.say(
+                    "使用已安装加载器版本: {0}（跳过重复安装）".format(
+                        selected
+                    )
+                )
+                self.post(
+                    self._set_launch_state, "LAUNCH: LOADER READY", "active"
+                )
+                return selected
+            if os.path.isfile(selected_jar):
+                self.say(
+                    "使用本地原版版本: {0}（跳过重复安装）".format(selected)
+                )
+                self.post(
+                    self._set_launch_state, "LAUNCH: LOCAL READY", "active"
+                )
+                return selected
+            self.say("本地版本缺少客户端 jar，尝试修复: {0}".format(selected))
+            self.post(self._set_launch_state, "LAUNCH: REPAIR", "active")
+            mll.install.install_minecraft_version(
+                selected, self.mc_dir, self._install_callback()
+            )
+            self.post(self.refresh_versions)
+            self.say("所选版本修复完成: {0}".format(selected))
+            return selected
+        if selected:
+            self.say("所选版本已失效，回退自动模式: {0}".format(selected))
+            self.post(
+                self._set_launch_state, "LAUNCH: AUTO FALLBACK", "active"
+            )
+            self.config["launch_version"] = ""
+            self.post(self._save_config)
+            self.post(self.refresh_versions)
+
+        self.post(self._set_launch_state, "LAUNCH: CHECK CORE", "active")
+        loader = str(self.config.get("loader") or "fabric").lower()
+        if loader == "vanilla":
+            version_id = self.mc_version
+        elif loader == "fabric":
+            loader_version = str(self.config.get("loader_version") or "").strip()
+            if not loader_version:
+                self.say("解析 Fabric 加载器稳定版本 ...")
+                loader_version = fetch_fabric_loader_version(self.mc_version)
+                self.config["loader_version"] = loader_version
+                self.post(self._save_config)
+            version_id = "fabric-loader-{0}-{1}".format(
+                loader_version, self.mc_version
+            )
+            version_json = os.path.join(
+                self.mc_dir, "versions", version_id, version_id + ".json"
+            )
+            if not os.path.exists(version_json):
+                self.say("写入 Fabric 版本清单 {0} ...".format(version_id))
+                profile = fetch_fabric_profile(self.mc_version, loader_version)
+                ensure_dir(os.path.dirname(version_json))
+                write_json(version_json, profile)
+        else:
+            raise LauncherError(
+                "自动模式仅支持 Fabric / 原版；当前模组筛选为 {0}，"
+                "请在版本档案中选择已安装的该加载器版本。".format(
+                    LOADER_LABELS.get(loader, loader)
+                )
+            )
+
+        version_json = os.path.join(
+            self.mc_dir, "versions", version_id, version_id + ".json"
+        )
+        installed = set()
+        try:
+            installed = {
+                str(item.get("id"))
+                for item in mll.utils.get_installed_versions(self.mc_dir)
+            }
+        except Exception:
+            installed = set()
+        if version_id in installed and os.path.exists(version_json):
+            self.say("核心校验通过: {0}".format(version_id))
+            self.post(
+                self._set_launch_state, "LAUNCH: CORE READY", "active"
+            )
+            return version_id
+
+        self.say(
+            "首次点火: 安装核心 {0}（库 / 资源可能耗时数分钟）".format(version_id)
+        )
+        self.post(self._set_launch_state, "LAUNCH: INSTALL CORE", "active")
+        mll.install.install_minecraft_version(
+            version_id, self.mc_dir, self._install_callback()
+        )
+        if not os.path.exists(version_json):
+            raise LauncherError(
+                "游戏核心安装不完整，缺少 {0}".format(version_json)
+            )
+        self.post(self.refresh_versions)
+        self.post(self._set_launch_state, "LAUNCH: CORE READY", "active")
+        self.say("核心安装完成: {0}".format(version_id))
+        return version_id
+
+
+    def _version_java_requirement(self, version_id):
+        current = str(version_id or "").strip()
+        seen = set()
+        while current and current not in seen:
+            seen.add(current)
+            path = os.path.join(
+                self.mc_dir, "versions", current, current + ".json"
+            )
+            data = read_json(path, None)
+            if not isinstance(data, dict):
+                break
+            info = data.get("javaVersion") or {}
+            if info:
+                try:
+                    major = int(info.get("majorVersion") or 0)
+                except (TypeError, ValueError):
+                    major = 0
+                return str(info.get("component") or ""), major
+            current = str(data.get("inheritsFrom") or "").strip()
+        return "", 0
+
+    def _missing_classpath_entry(self, command):
+        try:
+            for index, part in enumerate(command):
+                text = str(part)
+                if text in {"-cp", "-classpath"} and index + 1 < len(command):
+                    classpath = str(command[index + 1])
+                    for entry in classpath.split(os.pathsep):
+                        entry = entry.strip().strip('"')
+                        if not entry or "*" in entry:
+                            continue
+                        if not os.path.exists(entry):
+                            return entry
+        except Exception:
+            return ""
+        return ""
+
+    def _memory_jvm_arguments(self, memory=None):
+        """-Xms/-Xmx for the launch command (clamped to the real RAM)."""
+        if memory is None:
+            memory = normalize_memory_config(
+                self.config.get("memory"), total_ram_mb()
+            )
+        return [
+            "-Xms{0}M".format(memory["min_mb"]),
+            "-Xmx{0}M".format(memory["max_mb"]),
+        ] + self._extra_jvm_arguments()
+
+    def _start_game_process(self, mll, version_id, profile):
+        window = self.config.get("window") or {}
+        try:
+            width = str(int(window.get("width") or 854))
+            height = str(int(window.get("height") or 480))
+        except (TypeError, ValueError):
+            width, height = "854", "480"
+        memory = normalize_memory_config(
+            self.config.get("memory"), total_ram_mb()
+        )
+        jvm_arguments = self._memory_jvm_arguments(memory)
+        extra_args = self._extra_jvm_arguments()
+        self._running_version_id = str(version_id or "")
+        self.say(
+            "内存分配: -Xms{0}M / -Xmx{1}M{2}".format(
+                memory["min_mb"],
+                memory["max_mb"],
+                " // 自定义参数 {0} 项".format(len(extra_args)) if extra_args else "",
+            )
+        )
+
+        game_directory = self.ensure_isolation_dirs()
+        if os.path.normcase(os.path.abspath(game_directory)) != os.path.normcase(
+            os.path.abspath(self.mc_dir)
+        ):
+            self.say(
+                "版本隔离: 游戏目录 -> {0}".format(game_directory)
+            )
+        options = {
+            "username": profile["name"],
+            "uuid": profile["uuid"],
+            "token": profile["token"],
+            "launcherName": "AKM",
+            "launcherVersion": APP_VERSION,
+            "gameDirectory": game_directory,
+            "customResolution": True,
+            "resolutionWidth": width,
+            "resolutionHeight": height,
+            "jvmArguments": jvm_arguments,
+        }
+        java_component, java_required = self._version_java_requirement(version_id)
+        java_path = str(self.config.get("java") or "").strip()
+        java_executable = find_java_executable(
+            self.mc_dir, java_path, 0 if java_path else java_required
+        )
+        java_actual = (
+            java_major_version(java_executable) if java_executable else 0
+        )
+        if java_path:
+            if not java_executable:
+                raise LauncherError(
+                    "config.json 指定的 Java 不存在: {0}".format(java_path)
+                )
+            if java_required and java_actual and java_actual < java_required:
+                raise LauncherError(
+                    "该版本需要 Java {0}，但 config.json 指定的是 Java {1}。\n"
+                    "请修改 java 字段，或留空让 AKM 自动选择/安装。".format(
+                        java_required, java_actual
+                    )
+                )
+        else:
+            if (not java_executable) or (
+                java_required and java_actual and java_actual < java_required
+            ):
+                if java_component:
+                    self.say(
+                        "该版本需要 Java {0}，正在安装 Mojang 运行时 {1} ...".format(
+                            java_required or "?", java_component
+                        )
+                    )
+                    self.post(
+                        self._set_launch_state,
+                        "LAUNCH: JAVA RUNTIME",
+                        "active",
+                    )
+                    try:
+                        mll.runtime.install_jvm_runtime(
+                            java_component,
+                            self.mc_dir,
+                            self._install_callback("Java 运行时"),
+                        )
+                    except Exception as exc:
+                        raise LauncherError(
+                            "该版本需要 Java {0}，自动安装运行时 {1} 失败: {2}\n"
+                            "请手动安装 Java {0}，并在 config.json 的 java 字段指定路径。".format(
+                                java_required or "?", java_component, exc
+                            )
+                        ) from None
+                    java_executable = find_java_executable(
+                        self.mc_dir, "", java_required
+                    )
+                    java_actual = (
+                        java_major_version(java_executable)
+                        if java_executable
+                        else 0
+                    )
+                if (not java_executable) or (
+                    java_required and java_actual and java_actual < java_required
+                ):
+                    raise LauncherError(
+                        "该版本需要 Java {0}，当前找到 Java {1}。\n"
+                        "请安装 Java {0}，或在 config.json 的 java 字段填写 javaw.exe 绝对路径。".format(
+                            java_required or "?", java_actual or "未找到"
+                        )
+                    )
+        options["executablePath"] = java_executable
+        self.say(
+            "Java: {0} // major {1} // required {2}".format(
+                java_executable,
+                java_actual or "?",
+                java_required or "-",
+            )
+        )
+
+        self.post(self._set_launch_state, "LAUNCH: BUILD CMD", "active")
+        self.say("组装启动参数 // {0} // {1}".format(version_id, profile["mode"]))
+
+        def build_command():
+            return mll.command.get_minecraft_command(
+                version_id, self.mc_dir, options
+            )
+
+        try:
+            command = build_command()
+        except Exception as exc:
+            self.say("启动命令组装失败，尝试修复本地版本 ...")
+            self.post(self._set_launch_state, "LAUNCH: REPAIR", "active")
+            try:
+                mll.install.install_minecraft_version(
+                    version_id, self.mc_dir, self._install_callback()
+                )
+                command = build_command()
+            except Exception as repair_exc:
+                raise LauncherError(
+                    "组装启动命令失败: {0}\n修复尝试失败: {1}".format(
+                        exc, repair_exc
+                    )
+                ) from None
+        if not command:
+            raise LauncherError("启动命令为空，无法点火")
+
+        missing_entry = self._missing_classpath_entry(command)
+        if missing_entry:
+            self.say(
+                "启动类路径缺少文件，尝试修复: {0}".format(missing_entry)
+            )
+            self.post(self._set_launch_state, "LAUNCH: REPAIR", "active")
+            try:
+                mll.install.install_minecraft_version(
+                    version_id, self.mc_dir, self._install_callback()
+                )
+                command = build_command()
+            except Exception as repair_exc:
+                raise LauncherError(
+                    "启动类路径缺少文件: {0}\n修复失败: {1}".format(
+                        missing_entry, repair_exc
+                    )
+                ) from None
+            missing_entry = self._missing_classpath_entry(command)
+            if missing_entry:
+                raise LauncherError(
+                    "启动类路径仍缺少文件: {0}\n"
+                    "请删除该版本后重新安装，或检查游戏目录权限。".format(
+                        missing_entry
+                    )
+                )
+
+        ensure_dir(LOG_DIR)
+        log_path = os.path.join(
+            LOG_DIR,
+            "launch-{0}.log".format(datetime.now().strftime("%Y%m%d-%H%M%S")),
+        )
+        log_handle = open(log_path, "a", encoding="utf-8", errors="replace")
+        self._last_launch_log = log_path
+        log_handle.write(
+            "== AKM launch {0} ==\n".format(time.strftime("%Y-%m-%d %H:%M:%S"))
+        )
+        log_handle.write(" ".join(str(part) for part in command) + "\n\n")
+        log_handle.flush()
+
+        self.post(self._set_launch_state, "LAUNCH: STARTING", "active")
+        creation_flags = 0x08000000 if os.name == "nt" else 0
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=self.mc_dir,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                creationflags=creation_flags,
+            )
+        except FileNotFoundError:
+            try:
+                log_handle.close()
+            except Exception:
+                pass
+            raise LauncherError(
+                "未找到 Java 可执行文件: {0}\n"
+                "请在 config.json 的 java 字段填写 javaw.exe 的绝对路径。".format(
+                    java_executable
+                )
+            ) from None
+        except OSError as exc:
+            try:
+                log_handle.close()
+            except Exception:
+                pass
+            raise LauncherError("启动进程失败: {0}".format(exc)) from None
+
+        self.game_process = process
+        self.post(self._on_game_started, process.pid)
+        self.say("Minecraft 已点火 PID={0}".format(process.pid))
+        self.say("运行日志: {0}".format(log_path))
+
+        def monitor():
+            try:
+                code = process.wait()
+            except Exception:
+                code = -1
+            try:
+                log_handle.close()
+            except Exception:
+                pass
+            self.post(self._on_game_exit, code, process)
+
+        threading.Thread(target=monitor, daemon=True).start()
+
+
+    # -- toolbox -------------------------------------------------------------
+
+    # -- account avatar ------------------------------------------------------
+
+    def _avatar_key(self):
+        auth = self.auth
+        if self.is_ms_mode:
+            return str(auth.get("ms_uuid") or auth.get("uuid") or "").strip()
+        name = str(self.name_var.get() or auth.get("username") or "Steve").strip()
+        try:
+            return offline_uuid(name or "Steve")
+        except Exception:
+            return name
+
+    def _on_avatar_click(self, _event=None):
+        try:
+            self.on_open_accounts()
+        except Exception:
+            pass
+
+    def _refresh_avatar(self):
+        key = self._avatar_key()
+        seed = key or str(self.name_var.get() or "Steve")
+        token = self._avatar_token + 1
+        self._avatar_token = token
+        cached = self._avatar_cache.get(seed)
+        if cached:
+            self._apply_avatar(cached)
+        else:
+            try:
+                self._apply_avatar(fallback_avatar_png(seed))
+            except Exception:
+                pass
+        if seed in self._avatar_fetched:
+            return
+        self._avatar_fetched.add(seed)
+
+        def worker():
+            data = fetch_avatar_text(key or str(self.name_var.get() or "Steve"))
+            if data:
+                self.post(self._avatar_ready, token, seed, data)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _avatar_ready(self, token, seed, data):
+        self._avatar_cache[seed] = data
+        if token != self._avatar_token:
+            return
+        self._apply_avatar(data)
+
+    def _apply_avatar(self, data):
+        try:
+            photo = tk.PhotoImage(data=data)
+        except Exception:
+            return
+        self._avatar_photo = photo
+        try:
+            self.avatar_label.configure(image=photo, text="", width=0, height=0)
+        except Exception:
+            pass
+
+    # -- playtime ------------------------------------------------------------
+
+    def _instance_row(self, version_id):
+        instances = self.config.get("instances")
+        if not isinstance(instances, dict):
+            return {}
+        row = instances.get(str(version_id))
+        return row if isinstance(row, dict) else {}
+
+    def _instance_playtime_text(self, version_id):
+        row = self._instance_row(version_id)
+        seconds = int(row.get("play_seconds") or 0)
+        return format_playtime(seconds)
+
+    def _record_playtime(self, version_id, seconds):
+        version_id = str(version_id or "").strip()
+        try:
+            seconds = int(seconds)
+        except (TypeError, ValueError):
+            seconds = 0
+        if not version_id or seconds < 5:
+            return
+        instances = self.config.get("instances")
+        if not isinstance(instances, dict):
+            instances = {}
+        row = instances.get(version_id)
+        if not isinstance(row, dict):
+            row = {}
+        row["play_seconds"] = int(row.get("play_seconds") or 0) + seconds
+        row["last_played"] = int(time.time())
+        instances[version_id] = row
+        self.config["instances"] = instances
+        self._save_config()
+        try:
+            self.refresh_versions()
+            self._refresh_chips()
+        except Exception:
+            pass
+        self.say(
+            "游玩时长已记录 // {0} 累计 {1}".format(
+                version_id, format_playtime(row["play_seconds"])
+            )
+        )
+
+    # -- jvm arguments -------------------------------------------------------
+
+    def _extra_jvm_arguments(self):
+        raw = str(self.config.get("jvm_args") or "").strip()
+        if not raw:
+            return []
+        try:
+            parts = re.findall(r'"[^"]*"|\S+', raw)
+        except Exception:
+            return []
+        return [part for part in parts if part]
+
+    # -- diagnostics / saves -------------------------------------------------
+
+    def on_analyze_crash(self):
+        game_dir = self.effective_game_dir()
+        paths = crash_report_paths(game_dir)
+        if not paths:
+            messagebox.showinfo(
+                "崩溃报告分析",
+                "没有找到 crash-reports\\*.txt。\n\n"
+                "可以先复现一次崩溃，或到 工具 -> 打开日志目录 看 logs\\latest.log。",
+                parent=self.root,
+            )
+            return
+        report_path = paths[0]
+        try:
+            with open(report_path, "r", encoding="utf-8", errors="replace") as handle:
+                text = handle.read(400 * 1024)
+        except OSError as exc:
+            messagebox.showerror("崩溃报告分析", str(exc), parent=self.root)
+            return
+        suggestions, key_lines, mods = analyze_crash_text(text)
+        try:
+            stat = os.stat(report_path)
+            size_text = format_bytes(stat.st_size)
+            when_text = relative_time(stat.st_mtime)
+        except OSError:
+            size_text, when_text = "?", ""
+
+        win = tk.Toplevel(self.root)
+        win.title("CRASH REPORT // 崩溃分析")
+        win.configure(bg=C_WHITE)
+        win.transient(self.root)
+        wrap = tk.Frame(win, bg=C_WHITE, bd=1, relief="solid", padx=10, pady=10)
+        wrap.pack(fill="both", expand=True, padx=8, pady=8)
+        tk.Label(
+            wrap,
+            text=title_text("CRASH ANALYSER // 崩溃报告分析"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        ).pack(fill="x")
+        tk.Label(
+            wrap,
+            text="{0}  ·  {1}  ·  {2}".format(
+                os.path.basename(report_path), size_text, when_text
+            ),
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+        ).pack(fill="x", pady=(6, 4))
+
+        box = tk.Frame(wrap, bg=C_WHITE, bd=1, relief="solid")
+        box.pack(fill="both", expand=True)
+        detail = tk.Text(
+            box,
+            height=18,
+            wrap="word",
+            font=FONT_SMALL,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+        )
+        scroll = tk.Scrollbar(box, orient="vertical", command=detail.yview)
+        detail.configure(yscrollcommand=scroll.set)
+        detail.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        lines = ["【结论】"]
+        if suggestions:
+            for index, advice in enumerate(suggestions, start=1):
+                lines.append("{0}. {1}".format(index, advice))
+        else:
+            lines.append(
+                "没有命中常见崩溃特征，建议把 mods 里的模组分半排查，"
+                "或到 工具 -> 工具箱 查对应模组的已知问题。"
+            )
+        if mods:
+            lines.append("")
+            lines.append("【报告里提到的模组】")
+            lines.extend("- " + item for item in mods)
+        lines.append("")
+        lines.append("【关键行】")
+        if key_lines:
+            lines.extend("- " + item for item in key_lines)
+        else:
+            lines.append("- (报告里没有 Exception / Error 行)")
+        lines.append("")
+        lines.append(
+            "【当前内存】-Xmx{0}M".format(
+                normalize_memory_config(
+                    self.config.get("memory"), total_ram_mb()
+                )["max_mb"]
+            )
+        )
+        report_text = "\n".join(lines)
+        detail.insert("1.0", report_text)
+        detail.configure(state="disabled")
+
+        row = tk.Frame(wrap, bg=C_WHITE)
+        row.pack(fill="x", pady=(8, 0))
+        self._mk_button(
+            row,
+            "[ 打开报告 ]",
+            lambda: self._open_folder(os.path.dirname(report_path)),
+            padx=6,
+        ).pack(side="left", padx=(0, 6))
+        self._mk_button(
+            row,
+            "[ 复制分析 ]",
+            lambda: self._copy_text(report_text, "崩溃分析已复制"),
+            padx=6,
+        ).pack(side="left", padx=(0, 6))
+        self._mk_button(row, "[ 关闭 ]", win.destroy, padx=6).pack(side="right")
+        win.minsize(680, 520)
+        win.update_idletasks()
+        try:
+            win.geometry(
+                "+{0}+{1}".format(
+                    self.root.winfo_rootx() + 60, self.root.winfo_rooty() + 40
+                )
+            )
+        except Exception:
+            pass
+        self.say("崩溃分析: {0}".format(os.path.basename(report_path)))
+
+    def _copy_text(self, text, message):
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.say(message)
+        except Exception as exc:
+            self.say("复制失败 // {0}".format(exc))
+
+    # -- mini game (classic snake) --------------------------------------------
+
+    def on_open_snake(self):
+        game = self._snake_game
+        if game is not None:
+            try:
+                if game.win.winfo_exists():
+                    game.win.deiconify()
+                    game.win.lift()
+                    game.win.focus_force()
+                    return game
+            except Exception:
+                pass
+        self._snake_game = SnakeGame(
+            self.root,
+            best=int(self.config.get("snake_best") or 0),
+            on_best=self._save_snake_best,
+        )
+        self.say("小游戏 // 贪吃蛇已开启（方向键移动 / 空格暂停 / R 重开）")
+        return self._snake_game
+
+    def on_open_2048(self):
+        game = self._game2048
+        if game is not None:
+            try:
+                if game.win.winfo_exists():
+                    game.win.deiconify()
+                    game.win.lift()
+                    return game
+            except Exception:
+                pass
+        self._game2048 = Game2048Window(
+            self.root,
+            best=int(self.config.get("game_2048_best") or 0),
+            on_best=lambda score: self._save_game_best("game_2048_best", score),
+        )
+        self.say("小游戏 // 2048 已开启（方向键合并方块）")
+        return self._game2048
+
+    def on_open_minesweeper(self):
+        game = self._minesweeper
+        if game is not None:
+            try:
+                if game.win.winfo_exists():
+                    game.win.deiconify()
+                    game.win.lift()
+                    return game
+            except Exception:
+                pass
+        self._minesweeper = MinesweeperWindow(
+            self.root,
+            best=int(self.config.get("minesweeper_best") or 0),
+            on_best=lambda seconds: self._save_game_best("minesweeper_best", seconds),
+        )
+        self.say("小游戏 // 扫雷已开启（左键翻开 / 右键插旗）")
+        return self._minesweeper
+
+    def on_open_tetris(self):
+        game = self._tetris
+        if game is not None:
+            try:
+                if game.win.winfo_exists():
+                    game.win.deiconify()
+                    game.win.lift()
+                    return game
+            except Exception:
+                pass
+        self._tetris = TetrisWindow(
+            self.root,
+            best=int(self.config.get("tetris_best") or 0),
+            on_best=lambda score: self._save_game_best("tetris_best", score),
+        )
+        self.say("小游戏 // 俄罗斯方块已开启（空格硬降）")
+        return self._tetris
+
+    def _save_game_best(self, key, value):
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return
+        if int(self.config.get(key) or 0) == value:
+            return
+        self.config[key] = value
+        self._save_config()
+        label = {
+            "snake_best": "贪吃蛇",
+            "game_2048_best": "2048",
+            "minesweeper_best": "扫雷最快",
+            "tetris_best": "俄罗斯方块",
+        }.get(key, key)
+        if key == "minesweeper_best":
+            self.say("小游戏新纪录 // {0} {1}".format(label, format_clock(value)))
+        else:
+            self.say("小游戏新纪录 // {0} {1} 分".format(label, value))
+
+    def _save_snake_best(self, score):
+        self._save_game_best("snake_best", score)
+
+    def on_snake_best_info(self):
+        self.on_mini_game_info()
+
+    def on_mini_game_info(self):
+        snake = int(self.config.get("snake_best") or 0)
+        g2048 = int(self.config.get("game_2048_best") or 0)
+        mines = int(self.config.get("minesweeper_best") or 0)
+        tetris = int(self.config.get("tetris_best") or 0)
+        info = "\n".join(
+            [
+                "贪吃蛇：{0} 分".format(snake),
+                "2048：{0} 分".format(g2048),
+                "扫雷：{0}".format(
+                    format_clock(mines) if mines else "未通关（记录最快时间）"
+                ),
+                "俄罗斯方块：{0} 分".format(tetris),
+                "",
+                "玩法速查",
+                " · 贪吃蛇：方向键移动，吃圆点 +10，空格暂停",
+                " · 2048：方向键合并相同数字",
+                " · 扫雷：左键翻开，右键插旗，第一下必安全",
+                " · 俄罗斯方块：← → 移动，↑ 旋转，空格硬降",
+            ]
+        )
+        messagebox.showinfo("小游戏 // 最高分与玩法", info, parent=self.root)
+
+    def on_reset_game_bests(self):
+        if not messagebox.askyesno(
+            "小游戏", "把小游戏最高分全部清零？", parent=self.root
+        ):
+            return
+        for key in (
+            "snake_best",
+            "game_2048_best",
+            "minesweeper_best",
+            "tetris_best",
+        ):
+            self.config[key] = 0
+        self._save_config()
+        self.say("小游戏最高分已全部清零")
+
+    def _toggle_mini_game_prompt(self):
+        var = getattr(self, "_mini_game_var", None)
+        enabled = bool(var.get()) if var is not None else True
+        self.config["mini_game_prompt"] = enabled
+        self._save_config()
+        self.say(
+            "下载 / 启动时的小游戏提示 // {0}".format("已开启" if enabled else "已关闭")
+        )
+
+    def _close_snake_prompt(self):
+        win = self._snake_prompt_win
+        self._snake_prompt_win = None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+    def maybe_offer_mini_game(self, context="下载"):
+        """Non-blocking 'want a round of snake?' bubble (rate limited)."""
+        if not bool(self.config.get("mini_game_prompt", True)):
+            return None
+        existing = self._snake_prompt_win
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    return None
+            except Exception:
+                pass
+            self._snake_prompt_win = None
+        game = self._snake_game
+        if game is not None:
+            try:
+                if game.win.winfo_exists():
+                    return None
+            except Exception:
+                pass
+        now = time.time()
+        if now - float(self._snake_prompt_at or 0.0) < 300:
+            return None
+        self._snake_prompt_at = now
+
+        win = tk.Toplevel(self.root)
+        win.title("MINI GAME // 要不要来一局贪吃蛇？")
+        win.configure(bg=C_WHITE)
+        try:
+            win.transient(self.root)
+        except Exception:
+            pass
+        wrap = tk.Frame(win, bg=C_WHITE, bd=1, relief="solid", padx=10, pady=10)
+        wrap.pack(fill="both", expand=True, padx=6, pady=6)
+        tk.Label(
+            wrap,
+            text=title_text("MINI GAME // 经典贪吃蛇"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=3,
+            bd=1,
+            relief="solid",
+        ).pack(fill="x")
+        tk.Label(
+            wrap,
+            text="{0} 正在进行，等着也是等着 ——\n要不要玩一局小游戏？".format(context),
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+            justify="left",
+        ).pack(fill="x", pady=(8, 4))
+        skip_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            wrap,
+            text=" 以后不再提示",
+            variable=skip_var,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            activebackground=C_WHITE,
+            activeforeground=C_BLACK,
+            selectcolor=C_WHITE,
+            font=FONT_SMALL,
+            highlightthickness=0,
+            bd=0,
+        ).pack(anchor="w")
+
+        def remember_skip():
+            if not skip_var.get():
+                return
+            self.config["mini_game_prompt"] = False
+            self._save_config()
+            try:
+                if self._mini_game_var is not None:
+                    self._mini_game_var.set(False)
+            except Exception:
+                pass
+
+        def start_game(action):
+            remember_skip()
+            self._close_snake_prompt()
+            action()
+
+        def dismiss():
+            remember_skip()
+            self._close_snake_prompt()
+
+        row = tk.Frame(wrap, bg=C_WHITE)
+        row.pack(fill="x", pady=(8, 0))
+        for label, action in (
+            ("[ 贪吃蛇 ]", self.on_open_snake),
+            ("[ 2048 ]", self.on_open_2048),
+            ("[ 扫雷 ]", self.on_open_minesweeper),
+            ("[ 方块 ]", self.on_open_tetris),
+        ):
+            self._mk_button(
+                row,
+                label,
+                lambda act=action: start_game(act),
+                font=FONT_SMALL,
+                padx=4,
+                pady=2,
+            ).pack(side="left", expand=True, fill="x", padx=2)
+        row2 = tk.Frame(wrap, bg=C_WHITE)
+        row2.pack(fill="x", pady=(4, 0))
+        self._mk_button(
+            row2, "[ 继续等 ]", dismiss, font=FONT_SMALL, padx=6, pady=2
+        ).pack(side="right")
+
+        win.protocol("WM_DELETE_WINDOW", dismiss)
+        self._snake_prompt_win = win
+        win.update_idletasks()
+        try:
+            x = self.root.winfo_rootx() + max(
+                0, self.root.winfo_width() - win.winfo_reqwidth() - 30
+            )
+            y = self.root.winfo_rooty() + max(
+                0, self.root.winfo_height() - win.winfo_reqheight() - 60
+            )
+            win.geometry("+{0}+{1}".format(x, y))
+        except Exception:
+            pass
+        return win
+
+    def on_open_saves(self):
+        saves_dir = os.path.join(self.effective_game_dir(), "saves")
+        ensure_dir(saves_dir)
+        win = tk.Toplevel(self.root)
+        win.title("SAVES // 存档管理")
+        win.configure(bg=C_WHITE)
+        win.transient(self.root)
+        wrap = tk.Frame(win, bg=C_WHITE, bd=1, relief="solid", padx=10, pady=10)
+        wrap.pack(fill="both", expand=True, padx=8, pady=8)
+        tk.Label(
+            wrap,
+            text=title_text("SAVES // 存档管理（备份 / 打开）"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        ).pack(fill="x")
+        status_var = tk.StringVar(value=saves_dir)
+        tk.Label(
+            wrap,
+            textvariable=status_var,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+        ).pack(fill="x", pady=(6, 4))
+
+        frame = tk.Frame(wrap, bg=C_WHITE, bd=1, relief="solid")
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        listing = tk.Listbox(
+            frame,
+            font=FONT_MAIN,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            selectbackground=C_TEAL,
+            selectforeground=C_WHITE,
+            activestyle="none",
+            exportselection=False,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+        )
+        listing.grid(row=0, column=0, sticky="nsew", padx=(2, 0), pady=2)
+        scroll = tk.Scrollbar(frame, orient="vertical", command=listing.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        listing.configure(yscrollcommand=scroll.set)
+        state = {"rows": []}
+
+        def reload_saves():
+            listing.delete(0, tk.END)
+            state["rows"] = []
+            try:
+                names = sorted(os.listdir(saves_dir))
+            except OSError:
+                names = []
+            count = 0
+            for name in names:
+                folder = os.path.join(saves_dir, name)
+                if not os.path.isdir(folder):
+                    continue
+                count += 1
+                try:
+                    size_text = format_bytes(dir_size(folder))
+                    when_text = relative_time(os.path.getmtime(folder))
+                except Exception:
+                    size_text, when_text = "?", ""
+                state["rows"].append(name)
+                listing.insert(
+                    tk.END,
+                    "{0}   ·   {1}   ·   {2}".format(name, size_text, when_text),
+                )
+            if count:
+                status_var.set("{0}  ({1} 个存档)".format(saves_dir, count))
+            else:
+                status_var.set("{0}  (暂无存档)".format(saves_dir))
+
+        def selected():
+            pick = listing.curselection()
+            if not pick:
+                messagebox.showinfo("存档管理", "先在列表里选一个存档。", parent=win)
+                return ""
+            return state["rows"][int(pick[0])]
+
+        def open_selected():
+            name = selected()
+            if name:
+                self._open_folder(os.path.join(saves_dir, name))
+
+        def backup_selected():
+            name = selected()
+            if not name:
+                return
+            backup_dir = os.path.join(self.effective_game_dir(), "akm-backups")
+            ensure_dir(backup_dir)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            target = os.path.join(backup_dir, "{0}-{1}".format(name, stamp))
+            try:
+                shutil.make_archive(target, "zip", os.path.join(saves_dir, name))
+            except Exception as exc:
+                messagebox.showerror("备份失败", str(exc), parent=win)
+                return
+            zip_path = target + ".zip"
+            self.say("存档已备份 // {0}".format(zip_path))
+            messagebox.showinfo(
+                "备份完成",
+                "存档「{0}」已备份到:\n{1}".format(name, zip_path),
+                parent=win,
+            )
+
+        buttons = tk.Frame(wrap, bg=C_WHITE)
+        buttons.pack(fill="x", pady=(8, 0))
+        self._mk_button(buttons, "[ 备份所选 ]", backup_selected, padx=6).pack(
+            side="left", padx=(0, 6)
+        )
+        self._mk_button(buttons, "[ 打开所选 ]", open_selected, padx=6).pack(
+            side="left", padx=(0, 6)
+        )
+        self._mk_button(
+            buttons, "[ 打开存档目录 ]", lambda: self._open_folder(saves_dir), padx=6
+        ).pack(side="left", padx=(0, 6))
+        self._mk_button(buttons, "[ 刷新 ]", reload_saves, padx=6).pack(
+            side="left", padx=(0, 6)
+        )
+        self._mk_button(buttons, "[ 关闭 ]", win.destroy, padx=6).pack(side="right")
+
+        reload_saves()
+        win.minsize(640, 460)
+        win.update_idletasks()
+        try:
+            win.geometry(
+                "+{0}+{1}".format(
+                    self.root.winfo_rootx() + 70, self.root.winfo_rooty() + 60
+                )
+            )
+        except Exception:
+            pass
+        self.say("存档管理已打开 // {0}".format(saves_dir))
+
+    # -- instance card wall ---------------------------------------------------
+
+    def on_open_instances(self):
+        versions_dir = os.path.join(self.mc_dir, "versions")
+        ensure_dir(versions_dir)
+        win = tk.Toplevel(self.root)
+        win.title("INSTANCES // 实例管理")
+        win.configure(bg=C_WHITE)
+        win.transient(self.root)
+        wrap = tk.Frame(win, bg=C_WHITE, bd=1, relief="solid", padx=10, pady=10)
+        wrap.pack(fill="both", expand=True, padx=8, pady=8)
+        tk.Label(
+            wrap,
+            text=title_text("INSTANCES // 实例卡片墙"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        ).pack(fill="x")
+        summary_var = tk.StringVar(value="")
+        tk.Label(
+            wrap,
+            textvariable=summary_var,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+        ).pack(fill="x", pady=(6, 4))
+
+        body = tk.Frame(wrap, bg=C_GRAY, bd=1, relief="solid")
+        body.pack(fill="both", expand=True)
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+        canvas = tk.Canvas(body, bg=C_GRAY, highlightthickness=0, bd=0)
+        scroll = tk.Scrollbar(body, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        inner = tk.Frame(canvas, bg=C_GRAY)
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def on_inner_configure(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            try:
+                canvas.itemconfigure(window_id, width=canvas.winfo_width())
+            except Exception:
+                pass
+
+        inner.bind("<Configure>", on_inner_configure)
+        canvas.bind("<Configure>", on_inner_configure)
+
+        def on_wheel(event):
+            delta = -1 if getattr(event, "delta", 0) > 0 else 1
+            canvas.yview_scroll(delta, "units")
+
+        canvas.bind_all("<MouseWheel>", on_wheel)
+        state = {"photos": []}
+
+        def build_cards():
+            for child in inner.winfo_children():
+                child.destroy()
+            state["photos"] = []
+            versions = list_local_versions(self.mc_dir)
+            columns = 3
+            for column in range(columns):
+                inner.columnconfigure(column, weight=1, uniform="cards")
+            if not versions:
+                tk.Label(
+                    inner,
+                    text="还没有实例。\n先去 游戏 -> 下载 / 安装游戏（原版 + 加载器）。",
+                    bg=C_GRAY,
+                    fg=C_BLACK,
+                    font=FONT_MAIN,
+                    justify="left",
+                    anchor="nw",
+                    padx=10,
+                    pady=10,
+                ).grid(row=0, column=0, sticky="nw")
+            total_play = 0
+            for index, version_id in enumerate(versions):
+                row_info = self._instance_row(version_id)
+                seconds = int(row_info.get("play_seconds") or 0)
+                total_play += seconds
+                last = relative_time(int(row_info.get("last_played") or 0))
+                parsed = parse_version_id(version_id, self.mc_dir)
+                loader_tag = (parsed.get("loader") or "vanilla").upper()
+                mc_tag = parsed.get("mc") or "?"
+                instance_dir = os.path.join(versions_dir, version_id)
+                instance_mods = os.path.join(instance_dir, "mods")
+                mods_dir = (
+                    instance_mods
+                    if os.path.isdir(instance_mods)
+                    else os.path.join(self.mc_dir, "mods")
+                )
+                try:
+                    mod_count = len(
+                        [
+                            name
+                            for name in os.listdir(mods_dir)
+                            if name.lower().endswith(".jar")
+                        ]
+                    )
+                except OSError:
+                    mod_count = 0
+                try:
+                    size_text = format_bytes(dir_size(instance_dir))
+                except Exception:
+                    size_text = "?"
+
+                card = tk.Frame(inner, bg=C_WHITE, bd=1, relief="solid", padx=8, pady=8)
+                card.grid(
+                    row=index // columns,
+                    column=index % columns,
+                    sticky="nsew",
+                    padx=6,
+                    pady=6,
+                )
+                card.columnconfigure(1, weight=1)
+                try:
+                    photo = tk.PhotoImage(data=instance_thumb_png(version_id, 72))
+                    state["photos"].append(photo)
+                    tk.Label(card, image=photo, bd=1, relief="solid", bg=C_GRAY).grid(
+                        row=0, column=0, rowspan=3, sticky="nw", padx=(0, 8)
+                    )
+                except Exception:
+                    pass
+                tk.Label(
+                    card,
+                    text=version_id,
+                    bg=C_WHITE,
+                    fg=C_BLACK,
+                    font=FONT_MAIN,
+                    anchor="w",
+                    justify="left",
+                    wraplength=210,
+                ).grid(row=0, column=1, sticky="ew")
+                tk.Label(
+                    card,
+                    text="{0} · MC {1} · {2} 个模组 · {3}".format(
+                        loader_tag, mc_tag, mod_count, size_text
+                    ),
+                    bg=C_WHITE,
+                    fg=C_BLACK,
+                    font=FONT_SMALL,
+                    anchor="w",
+                    justify="left",
+                    wraplength=200,
+                ).grid(row=1, column=1, sticky="ew", pady=(2, 0))
+                meta = "已玩 {0}".format(format_playtime(seconds) or "--")
+                if last:
+                    meta += " · 上次 " + last
+                tk.Label(
+                    card,
+                    text=meta,
+                    bg=C_WHITE,
+                    fg=C_BLACK,
+                    font=FONT_SMALL,
+                    anchor="w",
+                    justify="left",
+                    wraplength=200,
+                ).grid(row=2, column=1, sticky="ew", pady=(1, 0))
+
+                buttons = tk.Frame(card, bg=C_WHITE)
+                buttons.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+                for column in range(3):
+                    buttons.columnconfigure(column, weight=1, uniform="cardbtn")
+                self._mk_button(
+                    buttons,
+                    "[ 启动 ]",
+                    lambda chosen=version_id: self._instance_launch(chosen),
+                    font=FONT_SMALL,
+                    padx=4,
+                    pady=2,
+                ).grid(row=0, column=0, sticky="ew", padx=(0, 3))
+                self._mk_button(
+                    buttons,
+                    "[ 打开 ]",
+                    lambda chosen=instance_dir: self._open_folder(chosen),
+                    font=FONT_SMALL,
+                    padx=4,
+                    pady=2,
+                ).grid(row=0, column=1, sticky="ew", padx=3)
+                self._mk_button(
+                    buttons,
+                    "[ 复制 ]",
+                    lambda chosen=version_id: self._copy_instance(chosen, win),
+                    font=FONT_SMALL,
+                    padx=4,
+                    pady=2,
+                ).grid(row=0, column=2, sticky="ew", padx=(3, 0))
+
+            summary_var.set(
+                "{0} 个实例  ·  总游玩 {1}  ·  {2}".format(
+                    len(versions),
+                    format_playtime(total_play) or "--",
+                    versions_dir,
+                )
+            )
+            win.update_idletasks()
+            on_inner_configure()
+
+        toolbar = tk.Frame(wrap, bg=C_WHITE)
+        toolbar.pack(fill="x", pady=(8, 0))
+        self._mk_button(toolbar, "[ 刷新 ]", build_cards, padx=6).pack(
+            side="left", padx=(0, 6)
+        )
+        self._mk_button(
+            toolbar,
+            "[ 打开 versions 目录 ]",
+            lambda: self._open_folder(versions_dir),
+            padx=6,
+        ).pack(side="left", padx=(0, 6))
+        self._mk_button(toolbar, "[ 关闭 ]", win.destroy, padx=6).pack(side="right")
+
+        def on_close():
+            try:
+                canvas.unbind_all("<MouseWheel>")
+            except Exception:
+                pass
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+        build_cards()
+        win.minsize(900, 560)
+        win.update_idletasks()
+        try:
+            win.geometry(
+                "1020x620+{0}+{1}".format(
+                    self.root.winfo_rootx() + 40, self.root.winfo_rooty() + 30
+                )
+            )
+        except Exception:
+            pass
+        self.say("实例管理已打开 // {0} 个实例".format(len(self.local_versions)))
+
+    def _instance_launch(self, version_id):
+        version_id = str(version_id or "").strip()
+        if not version_id:
+            return
+        if self.game_process is not None:
+            self.say("游戏正在运行，先退出再切换实例")
+            return
+        self.config["launch_version"] = version_id
+        parsed = parse_version_id(version_id, self.mc_dir)
+        if parsed.get("mc"):
+            self.config["mc_version"] = parsed["mc"]
+            self.version_var.set(parsed["mc"])
+        if parsed.get("loader") in {"fabric", "quilt", "forge", "neoforge"}:
+            self.config["loader"] = parsed["loader"]
+            self.loader_var.set(parsed["loader"])
+        self._save_config()
+        self.refresh_versions()
+        selected = str(self.config.get("launch_version") or "")
+        if selected in self.version_rows:
+            index = self.version_rows.index(selected)
+            self.version_listbox.selection_clear(0, tk.END)
+            self.version_listbox.selection_set(index)
+            self.version_listbox.see(index)
+        self.say("切换实例 // {0}，开始点火".format(version_id))
+        self.on_ignite()
+
+    def _copy_instance(self, version_id, parent=None):
+        version_id = str(version_id or "").strip()
+        if not version_id:
+            return
+        src = os.path.join(self.mc_dir, "versions", version_id)
+        if not os.path.isdir(src):
+            messagebox.showerror(
+                "复制实例",
+                "找不到实例目录：\n{0}".format(src),
+                parent=parent or self.root,
+            )
+            return
+        if simpledialog is None:
+            return
+        new_id = simpledialog.askstring(
+            "复制实例",
+            "新实例名称（字母 / 数字 / . _ -）：",
+            initialvalue="{0}-copy".format(version_id),
+            parent=parent or self.root,
+        )
+        if not new_id:
+            return
+        new_id = new_id.strip()
+        if not re.fullmatch(r"[A-Za-z0-9._\-]+", new_id):
+            messagebox.showwarning(
+                "复制实例",
+                "名称只能包含字母、数字、点、下划线、短横线。",
+                parent=parent or self.root,
+            )
+            return
+        dst = os.path.join(self.mc_dir, "versions", new_id)
+        if os.path.exists(dst):
+            messagebox.showwarning(
+                "复制实例", "实例 {0} 已存在。".format(new_id), parent=parent or self.root
+            )
+            return
+        try:
+            shutil.copytree(src, dst)
+        except Exception as exc:
+            messagebox.showerror("复制实例失败", str(exc), parent=parent or self.root)
+            return
+        for suffix in (".json", ".jar"):
+            old = os.path.join(dst, version_id + suffix)
+            new = os.path.join(dst, new_id + suffix)
+            if os.path.isfile(old):
+                try:
+                    os.replace(old, new)
+                except OSError:
+                    pass
+        json_path = os.path.join(dst, new_id + ".json")
+        data = read_json(json_path, None)
+        if isinstance(data, dict):
+            data["id"] = new_id
+            try:
+                write_json(json_path, data)
+            except OSError:
+                pass
+        self.refresh_versions()
+        self.say("实例已复制 // {0} -> {1}".format(version_id, new_id))
+        messagebox.showinfo(
+            "复制完成",
+            "新实例：{0}\n目录：{1}\n\n可在 游戏 -> 实例管理 里直接启动。".format(
+                new_id, dst
+            ),
+            parent=parent or self.root,
+        )
+
+    # -- mod update checker ---------------------------------------------------
+
+    def on_open_mod_updates(self):
+        mods_dir = self.effective_mods_dir()
+        ensure_dir(mods_dir)
+        win = tk.Toplevel(self.root)
+        win.title("MOD UPDATES // 模组更新检测")
+        win.configure(bg=C_WHITE)
+        win.transient(self.root)
+        wrap = tk.Frame(win, bg=C_WHITE, bd=1, relief="solid", padx=10, pady=10)
+        wrap.pack(fill="both", expand=True, padx=8, pady=8)
+        tk.Label(
+            wrap,
+            text=title_text("MOD UPDATES // 模组更新检测（Modrinth SHA1 比对）"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        ).pack(fill="x")
+        status_var = tk.StringVar(value="准备检测 // {0}".format(mods_dir))
+        tk.Label(
+            wrap,
+            textvariable=status_var,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            wraplength=760,
+        ).pack(fill="x", pady=(6, 4))
+
+        frame = tk.Frame(wrap, bg=C_WHITE, bd=1, relief="solid")
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        listing = tk.Listbox(
+            frame,
+            font=FONT_SMALL,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            selectbackground=C_TEAL,
+            selectforeground=C_WHITE,
+            selectmode="extended",
+            activestyle="none",
+            exportselection=False,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+        )
+        listing.grid(row=0, column=0, sticky="nsew", padx=(2, 0), pady=2)
+        scroll = tk.Scrollbar(frame, orient="vertical", command=listing.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        listing.configure(yscrollcommand=scroll.set)
+        state = {"rows": [], "busy": False}
+
+        def scan_done(rows, error_text):
+            state["busy"] = False
+            state["rows"] = rows
+            listing.delete(0, tk.END)
+            pending = 0
+            for row in rows:
+                version = row["version"]
+                if version:
+                    pending += 1
+                    listing.insert(
+                        tk.END,
+                        "[可更新] {0}  ->  {1}  ({2})".format(
+                            row["file"],
+                            version.get("version_number")
+                            or version.get("name")
+                            or "?",
+                            ",".join(version.get("loaders") or [])[:22],
+                        ),
+                    )
+                else:
+                    listing.insert(tk.END, "[已最新] {0}".format(row["file"]))
+            if error_text:
+                status_var.set(
+                    "检测完成，但请求失败：{0}\n可更新 {1} 个 / 共 {2} 个 mods".format(
+                        error_text[:120], pending, len(rows)
+                    )
+                )
+            else:
+                status_var.set(
+                    "检测完成 // 可更新 {0} 个 / 共 {1} 个 mods".format(
+                        pending, len(rows)
+                    )
+                )
+            self.say("模组更新检测 // 可更新 {0} / {1}".format(pending, len(rows)))
+
+        def scan():
+            if state["busy"]:
+                return
+            state["busy"] = True
+            listing.delete(0, tk.END)
+            state["rows"] = []
+            status_var.set("正在计算 SHA1 并查询 Modrinth ...")
+
+            def worker():
+                jars = {}
+                try:
+                    for name in sorted(os.listdir(mods_dir)):
+                        if not name.lower().endswith(".jar"):
+                            continue
+                        path = os.path.join(mods_dir, name)
+                        try:
+                            jars[sha1_file(path)] = (name, path)
+                        except OSError:
+                            continue
+                except OSError as exc:
+                    self.post(scan_done, [], "读取 mods 目录失败 // {0}".format(exc))
+                    return
+                updates = {}
+                error_text = ""
+                if jars:
+                    loaders = [self.mod_loader] if self.mod_loader else []
+                    try:
+                        updates = modrinth_version_files(
+                            list(jars.keys()),
+                            update=True,
+                            loaders=loaders,
+                            game_versions=[self.mc_version],
+                        )
+                    except Exception as exc:
+                        error_text = str(exc)
+                rows = []
+                for digest, (name, path) in jars.items():
+                    item = updates.get(digest) if isinstance(updates, dict) else None
+                    rows.append(
+                        {
+                            "file": name,
+                            "path": path,
+                            "sha1": digest,
+                            "version": item if isinstance(item, dict) else None,
+                        }
+                    )
+                rows.sort(key=lambda row: (row["version"] is None, row["file"].lower()))
+                self.post(scan_done, rows, error_text)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def update_done(ok, failed):
+            state["busy"] = False
+            if failed:
+                status_var.set(
+                    "更新完成 {0} 个，失败 {1} 个：{2}".format(
+                        ok,
+                        len(failed),
+                        "; ".join(
+                            "{0}: {1}".format(name, err) for name, err in failed[:3]
+                        ),
+                    )
+                )
+            else:
+                status_var.set("更新完成 // {0} 个模组已替换".format(ok))
+            self.say("模组更新完成 // 成功 {0} / 失败 {1}".format(ok, len(failed)))
+            scan()
+
+        def update_selected(only_selected=True):
+            if state["busy"]:
+                return
+            if only_selected:
+                picks = listing.curselection()
+                if not picks:
+                    messagebox.showinfo(
+                        "模组更新", "先在列表里选一个或多个模组。", parent=win
+                    )
+                    return
+                targets = [state["rows"][int(index)] for index in picks]
+            else:
+                targets = list(state["rows"])
+            updates = [row for row in targets if row["version"]]
+            if not updates:
+                messagebox.showinfo(
+                    "模组更新", "没有可更新的模组（先点 [ 检测 ]）。", parent=win
+                )
+                return
+            if not messagebox.askyesno(
+                "模组更新",
+                "将下载并替换 {0} 个模组，旧 jar 会被删除。继续？".format(len(updates)),
+                parent=win,
+            ):
+                return
+            state["busy"] = True
+            status_var.set("正在更新 {0} 个模组 ...".format(len(updates)))
+
+            def worker():
+                ok = 0
+                failed = []
+                for row in updates:
+                    version = row["version"]
+                    files = [
+                        item
+                        for item in (version.get("files") or [])
+                        if isinstance(item, dict) and item.get("url")
+                    ]
+                    primary = next(
+                        (item for item in files if item.get("primary")),
+                        files[0] if files else None,
+                    )
+                    if primary is None:
+                        failed.append((row["file"], "该版本没有可下载文件"))
+                        continue
+                    filename = sanitize_filename(
+                        str(primary.get("filename") or os.path.basename(row["file"]))
+                    )
+                    dest = os.path.join(mods_dir, filename)
+                    try:
+                        download_file(str(primary["url"]), dest, timeout=90)
+                        if os.path.abspath(dest) != os.path.abspath(row["path"]):
+                            try:
+                                os.remove(row["path"])
+                            except OSError:
+                                pass
+                        ok += 1
+                    except Exception as exc:
+                        failed.append((row["file"], str(exc)))
+                self.post(update_done, ok, failed)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        toolbar = tk.Frame(wrap, bg=C_WHITE)
+        toolbar.pack(fill="x", pady=(8, 0))
+        self._mk_button(toolbar, "[ 检测 ]", scan, padx=6).pack(
+            side="left", padx=(0, 6)
+        )
+        self._mk_button(
+            toolbar, "[ 更新所选 ]", lambda: update_selected(True), padx=6
+        ).pack(side="left", padx=(0, 6))
+        self._mk_button(
+            toolbar, "[ 全部更新 ]", lambda: update_selected(False), padx=6
+        ).pack(side="left", padx=(0, 6))
+        self._mk_button(
+            toolbar, "[ 打开 mods 目录 ]", lambda: self._open_folder(mods_dir), padx=6
+        ).pack(side="left", padx=(0, 6))
+        self._mk_button(toolbar, "[ 关闭 ]", win.destroy, padx=6).pack(side="right")
+
+        win.minsize(780, 480)
+        win.update_idletasks()
+        try:
+            win.geometry(
+                "+{0}+{1}".format(
+                    self.root.winfo_rootx() + 50, self.root.winfo_rooty() + 40
+                )
+            )
+        except Exception:
+            pass
+        scan()
+
+    # -- mod version audit ("does this jar support MC 1.21?") ------------------
+
+    def on_open_mod_audit(self):
+        """Drop jars in, type a target MC version, keep only what fits."""
+        existing = getattr(self, "_audit_win", None)
+        if existing is not None:
+            try:
+                existing.deiconify()
+                existing.lift()
+                existing.focus_force()
+                return
+            except Exception:
+                self._audit_win = None
+        win = tk.Toplevel(self.root)
+        self._audit_win = win
+        win.title("MOD AUDIT // 模组版本体检")
+        win.configure(bg=C_WHITE)
+        win.transient(self.root)
+        win.resizable(True, True)
+        try:
+            win.minsize(800, 580)
+        except Exception:
+            pass
+
+        wrap = tk.Frame(win, bg=C_WHITE, bd=1, relief="solid", padx=10, pady=8)
+        wrap.pack(fill="both", expand=True, padx=8, pady=8)
+        wrap.columnconfigure(0, weight=1)
+        wrap.rowconfigure(5, weight=1)
+
+        tk.Label(
+            wrap,
+            text=title_text("MOD AUDIT // 模组版本体检（目标版本适配筛选）"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        ).grid(row=0, column=0, sticky="ew")
+
+        target_row = tk.Frame(wrap, bg=C_GRAY, bd=1, relief="solid", padx=4, pady=4)
+        target_row.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        tk.Label(
+            target_row, text="目标 MC 版本", bg=C_GRAY, fg=C_BLACK, font=FONT_SMALL
+        ).pack(side="left", padx=(4, 6))
+        target_var = tk.StringVar(value=self.shelf_mc_version() or self.mc_version)
+        tk.Entry(
+            target_row,
+            textvariable=target_var,
+            font=FONT_MAIN,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            insertbackground=C_BLACK,
+            relief="solid",
+            bd=1,
+            highlightthickness=0,
+            width=12,
+        ).pack(side="left", ipady=2, padx=(0, 8))
+        for preset in ("1.21.1", "1.21", "1.20.1", "1.19.2"):
+            self._mk_button(
+                target_row,
+                preset,
+                lambda value=preset: target_var.set(value),
+                font=FONT_SMALL,
+                padx=4,
+                pady=0,
+            ).pack(side="left", padx=1)
+        for label, variable in (
+            ("含 x.y.z 子版本", tk.BooleanVar(value=True)),
+            ("联网核对 Modrinth", tk.BooleanVar(value=True)),
+        ):
+            tk.Checkbutton(
+                target_row,
+                text=label,
+                variable=variable,
+                bg=C_GRAY,
+                fg=C_BLACK,
+                activebackground=C_GRAY,
+                activeforeground=C_BLACK,
+                selectcolor=C_WHITE,
+                font=FONT_SMALL,
+                bd=0,
+                highlightthickness=0,
+                takefocus=0,
+                cursor="hand2",
+            ).pack(side="left", padx=(8, 2))
+            if variable is None:
+                pass
+            if label.startswith("含"):
+                patch_var = variable
+            else:
+                net_var = variable
+        action_row = tk.Frame(wrap, bg=C_WHITE)
+        action_row.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        status_var = tk.StringVar(value="等待投放 // 把 jar 拖进这个窗口")
+        self._mk_button(
+            action_row,
+            "[ 选择 jar... ]",
+            lambda: add_paths(self._audit_pick_files(win), run=True),
+            font=FONT_SMALL,
+            padx=6,
+            pady=1,
+        ).pack(side="left", padx=(0, 4))
+        self._mk_button(
+            action_row,
+            "[ 扫描当前 mods ]",
+            lambda: add_paths([self.effective_mods_dir()], run=True),
+            font=FONT_SMALL,
+            padx=6,
+            pady=1,
+        ).pack(side="left", padx=4)
+        self._mk_button(
+            action_row,
+            "[ 运行体检 ]",
+            lambda: add_paths(None, run=True),
+            font=FONT_SMALL,
+            padx=6,
+            pady=1,
+        ).pack(side="left", padx=4)
+        self._mk_button(
+            action_row, "[ 清空 ]", lambda: clear_all(), font=FONT_SMALL, padx=6, pady=1
+        ).pack(side="left", padx=4)
+        tk.Label(
+            action_row,
+            textvariable=status_var,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+        ).pack(side="left", fill="x", expand=True, padx=(8, 0))
+
+        tk.Label(
+            wrap,
+            text=(
+                "把 .jar 或整个 mods 文件夹拖进本窗口即可批量体检；结论优先看 "
+                "Modrinth 上该项目有没有发布过对应版本，未收录时回落到 jar 内 "
+                "fabric.mod.json / mods.toml / mcmod.info 的声明；勾选 "
+                "[ 联网查 CurseForge 移植 ] 还会去 CF 找该版本的移植构建（蓝色 CF 行）"
+            ),
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            wraplength=730,
+            bd=1,
+            relief="solid",
+            padx=4,
+            pady=2,
+        ).grid(row=3, column=0, sticky="ew", pady=(6, 0))
+
+        summary_var = tk.StringVar(value="")
+        tk.Label(
+            wrap,
+            textvariable=summary_var,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+        ).grid(row=4, column=0, sticky="ew", pady=(6, 2))
+
+        body = tk.Frame(wrap, bg=C_WHITE, bd=1, relief="solid")
+        body.grid(row=5, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+        listing = tk.Text(
+            body,
+            font=FONT_SMALL,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            wrap="none",
+            height=14,
+        )
+        listing.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
+        scroll = tk.Scrollbar(
+            body,
+            orient="vertical",
+            command=listing.yview,
+            width=14,
+            bg=C_GRAY,
+            activebackground=C_TEAL,
+            troughcolor=C_WHITE,
+            bd=1,
+            relief="solid",
+        )
+        scroll.grid(row=0, column=1, sticky="ns")
+        listing.configure(yscrollcommand=scroll.set)
+        listing.tag_configure("ok", foreground="#0A6A2F")
+        listing.tag_configure("port", foreground="#0B4F9C")
+        listing.tag_configure("miss", foreground="#A11B1B")
+        listing.tag_configure("unknown", foreground="#555555")
+        listing.tag_configure("note", foreground=C_TEAL)
+        listing.configure(state="disabled")
+        state = {"paths": [], "rows": [], "busy": False, "target_dir": ""}
+        only_ok = tk.BooleanVar(value=True)
+        cf_var = tk.BooleanVar(value=True)
+
+        def set_status(text):
+            try:
+                status_var.set(text)
+            except Exception:
+                pass
+
+        target_text_var = tk.StringVar(value="")
+
+        def current_target_dir():
+            return str(state.get("target_dir") or "") or self.effective_mods_dir()
+
+        def refresh_target_label():
+            path = current_target_dir()
+            default = self.effective_mods_dir()
+            same = os.path.normcase(os.path.abspath(path)) == os.path.normcase(
+                os.path.abspath(default)
+            )
+            target_text_var.set(
+                "安装到 // {0}{1}".format(path, "" if same else "   （自选目录）")
+            )
+
+        def candidate_mods_dirs():
+            """当前 mods + 每个已安装版本的 mods，供 [ 目标文件夹... ] 里挑。"""
+            rows2 = []
+            default = self.effective_mods_dir()
+            rows2.append(("当前版本 mods", default))
+            versions_dir = os.path.join(self.mc_dir, "versions")
+            try:
+                names = sorted(os.listdir(versions_dir))
+            except OSError:
+                names = []
+            for name in names:
+                base = os.path.join(versions_dir, name)
+                if not os.path.isdir(base):
+                    continue
+                mods = os.path.join(base, "mods")
+                if os.path.normcase(os.path.abspath(mods)) == os.path.normcase(
+                    os.path.abspath(default)
+                ):
+                    continue
+                rows2.append((name, mods))
+            return rows2
+
+        def choose_target_dir(on_done=None):
+            """Ask which version's mods folder the audit results go into."""
+            if state["busy"]:
+                return
+            chooser = tk.Toplevel(win)
+            chooser.title("INSTALL TARGET // 安装到哪个版本文件夹")
+            chooser.configure(bg=C_WHITE)
+            chooser.transient(win)
+            chooser.resizable(True, True)
+            try:
+                chooser.minsize(600, 430)
+            except Exception:
+                pass
+            try:
+                chooser.grab_set()
+            except Exception:
+                pass
+
+            box = tk.Frame(chooser, bg=C_WHITE, bd=1, relief="solid", padx=10, pady=8)
+            box.pack(fill="both", expand=True, padx=8, pady=8)
+            box.columnconfigure(0, weight=1)
+            box.rowconfigure(2, weight=1)
+
+            tk.Label(
+                box,
+                text=title_text("INSTALL TARGET // 装到哪个版本文件夹？"),
+                bg=C_TEAL,
+                fg=C_WHITE,
+                font=FONT_TITLE,
+                anchor="w",
+                padx=6,
+                pady=4,
+                bd=1,
+                relief="solid",
+            ).grid(row=0, column=0, sticky="ew")
+            tk.Label(
+                box,
+                text=(
+                    "体检已完成。选一个版本的 mods 文件夹，或点 [ 浏览... ] 自己挑：\n"
+                    "装到别的版本时，原来那个版本的旧 jar 不会被删除。"
+                ),
+                bg=C_GRAY,
+                fg=C_BLACK,
+                font=FONT_SMALL,
+                justify="left",
+                anchor="w",
+                padx=5,
+                pady=3,
+                bd=1,
+                relief="solid",
+            ).grid(row=1, column=0, sticky="ew", pady=(6, 0))
+
+            list_body = tk.Frame(box, bg=C_WHITE, bd=1, relief="solid")
+            list_body.grid(row=2, column=0, sticky="nsew", pady=(6, 0))
+            list_body.rowconfigure(0, weight=1)
+            list_body.columnconfigure(0, weight=1)
+            picker = tk.Listbox(
+                list_body,
+                font=FONT_SMALL,
+                bg=C_WHITE,
+                fg=C_BLACK,
+                activestyle="none",
+                relief="flat",
+                bd=0,
+                highlightthickness=0,
+                exportselection=False,
+                height=8,
+            )
+            picker.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
+            scroll2 = tk.Scrollbar(
+                list_body,
+                orient="vertical",
+                command=picker.yview,
+                width=14,
+                bg=C_GRAY,
+                activebackground=C_TEAL,
+                troughcolor=C_WHITE,
+                bd=1,
+                relief="solid",
+            )
+            scroll2.grid(row=0, column=1, sticky="ns")
+            picker.configure(yscrollcommand=scroll2.set)
+
+            current = current_target_dir()
+            entries = candidate_mods_dirs()
+            for index, (label2, path2) in enumerate(entries):
+                picker.insert(tk.END, "{0:<24} {1}".format(label2, path2))
+                if os.path.normcase(os.path.abspath(path2)) == os.path.normcase(
+                    os.path.abspath(current)
+                ):
+                    picker.selection_set(index)
+                    picker.see(index)
+
+            path_var = tk.StringVar(value=current)
+            path_row = tk.Frame(box, bg=C_WHITE)
+            path_row.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+            path_row.columnconfigure(1, weight=1)
+            tk.Label(
+                path_row, text="目标", bg=C_WHITE, fg=C_BLACK, font=FONT_SMALL
+            ).grid(row=0, column=0, sticky="w", padx=(0, 6))
+            tk.Entry(
+                path_row,
+                textvariable=path_var,
+                font=FONT_SMALL,
+                bg=C_WHITE,
+                fg=C_BLACK,
+                insertbackground=C_BLACK,
+                relief="solid",
+                bd=1,
+                highlightthickness=0,
+            ).grid(row=0, column=1, sticky="ew", ipady=3)
+
+            def pick_from_list(_event=None):
+                picked = picker.curselection()
+                if picked:
+                    path_var.set(entries[int(picked[0])][1])
+
+            def browse():
+                start = path_var.get().strip() or self.effective_mods_dir()
+                if os.path.isfile(start):
+                    start = os.path.dirname(start)
+                chosen = filedialog.askdirectory(
+                    parent=chooser,
+                    title="选择 mods 文件夹（选版本目录也行，会自动补 mods）",
+                    initialdir=start if os.path.isdir(start) else self.mc_dir,
+                    mustexist=True,
+                )
+                if not chosen:
+                    return
+                chosen = os.path.abspath(chosen)
+                if os.path.basename(chosen).lower() != "mods":
+                    chosen = os.path.join(chosen, "mods")
+                path_var.set(chosen)
+
+            def confirm():
+                path3 = str(path_var.get() or "").strip()
+                if not path3:
+                    messagebox.showinfo(
+                        "还没选目录",
+                        "请在列表里选一个，或点 [ 浏览... ]。",
+                        parent=chooser,
+                    )
+                    return
+                path3 = os.path.abspath(path3)
+                try:
+                    ensure_dir(path3)
+                except OSError as exc:
+                    messagebox.showerror(
+                        "目录不可写", "{0}\n\n{1}".format(path3, exc), parent=chooser
+                    )
+                    return
+                state["target_dir"] = path3
+                refresh_target_label()
+                set_status("安装目录 // {0}".format(path3))
+                self.say("模组体检 // 安装目录切换到 {0}".format(path3))
+                try:
+                    chooser.grab_release()
+                except Exception:
+                    pass
+                chooser.destroy()
+                if on_done is not None:
+                    on_done()
+
+            picker.bind("<<ListboxSelect>>", pick_from_list)
+            picker.bind("<Double-Button-1>", lambda _event: confirm())
+
+            action_row2 = tk.Frame(box, bg=C_WHITE)
+            action_row2.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+            self._mk_button(
+                action_row2, "[ 浏览... ]", browse, font=FONT_SMALL
+            ).pack(side="left")
+            self._mk_button(
+                action_row2, "[ 取消 ]", chooser.destroy, font=FONT_SMALL
+            ).pack(side="right")
+            self._mk_button(
+                action_row2, "[ 就装这里 ]", confirm, font=FONT_SMALL
+            ).pack(side="right", padx=(0, 6))
+            chooser.protocol("WM_DELETE_WINDOW", chooser.destroy)
+            chooser.bind("<Escape>", lambda _event: chooser.destroy())
+            chooser.bind("<Return>", lambda _event: confirm())
+            try:
+                chooser.update_idletasks()
+                chooser.geometry(
+                    "+{0}+{1}".format(win.winfo_rootx() + 60, win.winfo_rooty() + 50)
+                )
+            except Exception:
+                pass
+            chooser.focus_force()
+
+        def render():
+            rows = list(state["rows"])
+            target_text = str(target_var.get() or "").strip()
+            listing.configure(state="normal")
+            listing.delete("1.0", tk.END)
+            hits = [row for row in rows if row.get("ok") is True]
+            misses = [row for row in rows if row.get("ok") is False]
+            unknown = [row for row in rows if row.get("ok") is None]
+            ports = [row for row in rows if row.get("cf")]
+            if only_ok.get():
+                shown = [row for row in rows if row.get("ok") is True or row.get("cf")]
+            else:
+                shown = rows
+            shown = sorted(
+                shown,
+                key=lambda row: (
+                    0 if row.get("ok") is True else (1 if row.get("cf") else 2),
+                    str(row.get("title") or "").lower(),
+                ),
+            )
+            if not rows:
+                listing.insert(
+                    "end",
+                    "（还没有投递 jar：拖进来，或点 [ 扫描当前 mods ]）\n",
+                    "unknown",
+                )
+            for row in shown:
+                verdict = row.get("ok")
+                port = row.get("cf") or {}
+                if verdict is True:
+                    tag, mark = "ok", "[ OK ]"
+                elif port:
+                    tag, mark = "port", "[ CF ]"
+                elif verdict is False:
+                    tag, mark = "miss", "[MISS]"
+                else:
+                    tag, mark = "unknown", "[ ?? ]"
+                title = shorten_text(row.get("title") or row.get("file"), 26)
+                local = shorten_text(
+                    row.get("installed_version") or row.get("version") or "-", 18
+                )
+                loader = (row.get("loader") or "?").upper()[:10]
+                source = row.get("source") or ""
+                if verdict is True:
+                    if source == "modrinth":
+                        detail = "有 {0} 构建 // 最新 {1}".format(
+                            target_text, row.get("best") or "?"
+                        )
+                        if row.get("best") and local and row["best"] != local:
+                            detail += "  (可升级)"
+                    elif source == "local":
+                        detail = "本地声明支持：{0}".format(
+                            row.get("predicate") or "?"
+                        )
+                    else:
+                        detail = "文件名推断支持 {0}".format(target_text)
+                elif port:
+                    detail = "CurseForge 移植版：{0}  ({1})".format(
+                        shorten_text(port.get("filename"), 34),
+                        port.get("type") or "release",
+                    )
+                elif verdict is False:
+                    if source == "modrinth":
+                        detail = "无 {0} 构建 // 最高只到 {1}".format(
+                            target_text, row.get("max_mc") or "?"
+                        )
+                    else:
+                        detail = "本地声明不支持：{0}".format(
+                            row.get("predicate") or row.get("mc_hint") or "?"
+                        )
+                    if row.get("cf_project"):
+                        detail += " // CF 无该版本"
+                else:
+                    detail = "未收录 Modrinth 且 jar 内无版本信息"
+                listing.insert(
+                    "end",
+                    "{0} {1:<28} {2:<18} {3:<10} {4}\n".format(
+                        mark, title, local, loader, detail
+                    ),
+                    tag,
+                )
+            listing.configure(state="disabled")
+            listing.see("1.0")
+            summary_var.set(
+                "目标 MC {0} // 命中 {1} / 共 {2} // 排除 {3} // 未知 {4}{5}".format(
+                    target_text or "?",
+                    len(hits),
+                    len(rows),
+                    len(misses),
+                    len(unknown),
+                    "  // CF 移植 {0}".format(len(ports)) if ports else "",
+                )
+            )
+            refresh_action_labels()
+
+        def add_paths(items, run=False):
+            if state["busy"]:
+                set_status("正在体检，请稍候 ...")
+                return
+            fresh = []
+            for item in items or []:
+                text = str(item or "").strip().strip('"')
+                if not text:
+                    continue
+                if os.path.isdir(text):
+                    try:
+                        names = sorted(os.listdir(text))
+                    except OSError:
+                        continue
+                    fresh.extend(
+                        os.path.join(text, name)
+                        for name in names
+                        if name.lower().endswith(".jar")
+                    )
+                elif text.lower().endswith(".jar") and os.path.isfile(text):
+                    fresh.append(text)
+            known = set(
+                os.path.normcase(os.path.abspath(path)) for path in state["paths"]
+            )
+            added = 0
+            for path in fresh:
+                key = os.path.normcase(os.path.abspath(path))
+                if key in known:
+                    continue
+                known.add(key)
+                state["paths"].append(path)
+                added += 1
+            if added:
+                self.say("模组体检 // 已加入 {0} 个 jar".format(added))
+                set_status("已加入 {0} 个 jar（合计 {1}）".format(added, len(state["paths"])))
+            if run:
+                start()
+            elif not added:
+                set_status("没有找到 .jar // 试试拖入 mods 文件夹")
+
+        def clear_all():
+            if state["busy"]:
+                return
+            state["paths"] = []
+            state["rows"] = []
+            render()
+            set_status("已清空 // 重新拖入 jar 或点 [ 扫描当前 mods ]")
+        def upgradeable_rows():
+            return [
+                row
+                for row in state["rows"]
+                if row.get("ok") is True
+                and row.get("best_files")
+                and str(row.get("best") or "")
+                != str(row.get("installed_version") or "")
+            ]
+
+        def offer_install(upgrades, auto=False):
+            if not upgrades or state["busy"]:
+                return
+            target = str(target_var.get() or "").strip()
+            preview = "\n".join(
+                "  {0}  {1} → {2}".format(
+                    shorten_text(row.get("title") or row.get("file"), 22),
+                    shorten_text(
+                        row.get("installed_version") or row.get("version") or "?", 20
+                    ),
+                    row.get("best") or "?",
+                )
+                for row in upgrades[:10]
+            )
+            if len(upgrades) > 10:
+                preview += "\n  ... 还有 {0} 个".format(len(upgrades) - 10)
+            if not messagebox.askyesno(
+                ("体检完成：安装最新版本？" if auto else "安装最新版本"),
+                "有 {0} 个模组在 MC {1} 上有合适的构建：\n\n{2}\n\n"
+                "现在下载并替换这些 jar 吗？\n"
+                "（旧 jar 会被删除；任何一个失败只跳过它）".format(
+                    len(upgrades), target, preview
+                ),
+                parent=win,
+            ):
+                set_status(
+                    "已跳过安装 // 需要时可点 [ 一键更新全部 ]"
+                )
+                return
+            state["busy"] = True
+            mods_dir = current_target_dir()
+            set_status("正在安装 0/{0} ...".format(len(upgrades)))
+
+            def worker():
+                done = 0
+                failed = []
+                installed = []
+                tick = {"done": 0}
+
+                def one(row):
+                    try:
+                        return install_mod_build(row, mods_dir), ""
+                    except Exception as exc:  # noqa: BLE001
+                        return None, "{0}: {1}".format(
+                            row.get("file"), str(exc)[:80]
+                        )
+
+                with ThreadPoolExecutor(
+                    max_workers=min(4, len(upgrades)),
+                    thread_name_prefix="akm-audit-up",
+                ) as pool:
+                    futures = {pool.submit(one, row): row for row in upgrades}
+                    for future in as_completed(futures):
+                        row = futures[future]
+                        tick["done"] += 1
+                        self.post(
+                            set_status,
+                            "正在安装 {0}/{1} // {2}".format(
+                                tick["done"], len(upgrades), row.get("file")
+                            ),
+                        )
+                        try:
+                            destination, error = future.result()
+                        except Exception as exc:  # noqa: BLE001
+                            destination, error = None, str(exc)[:80]
+                        if destination:
+                            installed.append(destination)
+                            done += 1
+                        else:
+                            failed.append(error or str(row.get("file")))
+                self.post(finish_install, done, failed, installed)
+
+            def finish_install(done, failed, installed):
+                state["busy"] = False
+                state["paths"] = [
+                    path for path in state["paths"] if os.path.isfile(path)
+                ] + [path for path in installed if os.path.isfile(path)]
+                message = "安装完成 // 成功 {0} / 失败 {1}".format(done, len(failed))
+                set_status(message + ("" if not failed else " // " + failed[0]))
+                self.say(
+                    "模组体检安装 // 成功 {0} / 失败 {1}".format(done, len(failed))
+                )
+                if failed:
+                    messagebox.showwarning(
+                        "安装结果",
+                        message + "\n\n" + "\n".join(failed[:5]),
+                        parent=win,
+                    )
+                start()
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def cf_port_rows():
+            return [row for row in state["rows"] if row.get("cf")]
+
+        def update_all():
+            upgrades = upgradeable_rows()
+            if not upgrades:
+                messagebox.showinfo(
+                    "没有可更新的模组",
+                    "当前结果里没有「在目标版本上有更新构建」的模组。\n"
+                    "先体检一次；没有命中的条目可以看 [ 下移植版 ]。",
+                    parent=win,
+                )
+                return
+            offer_install(upgrades)
+
+        def offer_cf_ports(ports, auto=False):
+            if not ports or state["busy"]:
+                return
+            target = str(target_var.get() or "").strip()
+            preview = "\n".join(
+                "  {0}  →  {1}".format(
+                    shorten_text(row.get("title") or row.get("file"), 22),
+                    shorten_text(row["cf"].get("filename"), 36),
+                )
+                for row in ports[:10]
+            )
+            if len(ports) > 10:
+                preview += "\n  ... 还有 {0} 个".format(len(ports) - 10)
+            if not messagebox.askyesno(
+                "体检完成：下载 CurseForge 移植版本？" if auto else "下载移植版本",
+                "有 {0} 个模组在 MC {1} 上没有可用的原版构建，\n"
+                "但 CurseForge 上有移植版本：\n\n{2}\n\n"
+                "现在下载这些 jar 吗？\n"
+                "（写进当前 mods 目录，原 jar 保留；单个失败只跳过它）".format(
+                    len(ports), target, preview
+                ),
+                parent=win,
+            ):
+                set_status("已跳过移植版本 // 需要时可点 [ 下移植版 ]")
+                return
+            state["busy"] = True
+            mods_dir = current_target_dir()
+            set_status("正在下载移植版本 0/{0} ...".format(len(ports)))
+
+            def finish_ports(done, failed, installed):
+                state["busy"] = False
+                state["paths"] = [
+                    path for path in state["paths"] if os.path.isfile(path)
+                ] + [path for path in installed if os.path.isfile(path)]
+                message = "移植版本完成 // 成功 {0} / 失败 {1}".format(
+                    done, len(failed)
+                )
+                set_status(message + ("" if not failed else " // " + failed[0]))
+                self.say(
+                    "模组体检 // CurseForge 移植版本 成功 {0} / 失败 {1}".format(
+                        done, len(failed)
+                    )
+                )
+                if failed:
+                    messagebox.showwarning(
+                        "移植版本结果",
+                        message + "\n\n" + "\n".join(failed[:5]),
+                        parent=win,
+                    )
+                if installed:
+                    start()
+
+            def worker():
+                done = 0
+                failed = []
+                installed = []
+                tick = {"done": 0}
+
+                def one(row):
+                    port = row.get("cf") or {}
+                    try:
+                        return download_cf_port(port, mods_dir), ""
+                    except Exception as exc:  # noqa: BLE001
+                        return None, "{0}: {1}".format(
+                            port.get("filename"), str(exc)[:80]
+                        )
+
+                with ThreadPoolExecutor(
+                    max_workers=min(3, len(ports)),
+                    thread_name_prefix="akm-audit-cf",
+                ) as pool:
+                    futures = {pool.submit(one, row): row for row in ports}
+                    for future in as_completed(futures):
+                        row = futures[future]
+                        port = row.get("cf") or {}
+                        tick["done"] += 1
+                        self.post(
+                            set_status,
+                            "移植版本 {0}/{1} // {2}".format(
+                                tick["done"], len(ports), port.get("filename")
+                            ),
+                        )
+                        try:
+                            destination, error = future.result()
+                        except Exception as exc:  # noqa: BLE001
+                            destination, error = None, str(exc)[:80]
+                        if destination:
+                            installed.append(destination)
+                            done += 1
+                        else:
+                            failed.append(error or "?")
+                self.post(finish_ports, done, failed, installed)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def refresh_action_labels():
+            upgrades = len(upgradeable_rows())
+            ports = len(cf_port_rows())
+            try:
+                btn_update_all.configure(
+                    text="[ 一键更新全部{0} ]".format(
+                        " ({0})".format(upgrades) if upgrades else ""
+                    )
+                )
+                btn_cf_ports.configure(
+                    text="[ 下移植版{0} ]".format(
+                        " ({0})".format(ports) if ports else ""
+                    )
+                )
+            except Exception:
+                pass
+
+        def start():
+            if state["busy"]:
+                return
+            if not state["paths"]:
+                set_status("先拖入 jar，或点 [ 扫描当前 mods ]")
+                return
+            target = str(target_var.get() or "").strip()
+            if not _mc_tuple(target):
+                set_status("目标版本看不懂：{0}（例：1.21 / 1.21.1）".format(target))
+                return
+            state["busy"] = True
+            state["rows"] = []
+            render()
+            set_status("体检中 ... {0} 个文件".format(len(state["paths"])))
+            allow_patch = bool(patch_var.get())
+            use_net = bool(net_var.get())
+            paths = list(state["paths"])
+
+            def progress(done, total, note):
+                self.post(set_status, "体检中 {0}/{1} // {2}".format(done, total, note))
+
+            def finish(rows, error):
+                state["busy"] = False
+                if rows:
+                    state["rows"] = rows
+                render()
+                hits = len([row for row in state["rows"] if row.get("ok") is True])
+                if error:
+                    set_status("体检失败：{0}".format(str(error)[:140]))
+                    return
+                ports = cf_port_rows()
+                set_status(
+                    "体检完成 // 命中 {0} / 共 {1}{2}".format(
+                        hits,
+                        len(state["rows"]),
+                        " // CF 移植 {0}".format(len(ports)) if ports else "",
+                    )
+                )
+                self.say(
+                    "模组版本体检完成 // 目标 {0} // 命中 {1} / {2}".format(
+                        target, hits, len(state["rows"])
+                    )
+                )
+                upgrades = upgradeable_rows()
+                refresh_target_label()
+                if upgrades:
+                    self.say(
+                        "体检发现 {0} 个模组可升级到 {1} 的最新构建".format(
+                            len(upgrades), target
+                        )
+                    )
+                if ports:
+                    self.say(
+                        "体检发现 {0} 个模组在 CurseForge 上有 {1} 移植版本".format(
+                            len(ports), target
+                        )
+                    )
+                if not upgrades and not ports:
+                    return
+
+                def after_target():
+                    if upgrades:
+                        offer_install(upgrades, auto=True)
+                    if ports:
+                        offer_cf_ports(ports, auto=True)
+
+                # 先问要装到哪个版本文件夹，再问装不装
+                win.after(260, lambda: choose_target_dir(after_target))
+
+            def worker():
+                try:
+                    rows = audit_mod_jars(
+                        paths,
+                        target,
+                        allow_patch,
+                        use_net,
+                        progress,
+                        loader=(self.mod_loader or ""),
+                        check_curseforge=bool(cf_var.get()),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log_debug("mod audit failed:\n" + traceback.format_exc())
+                    self.post(finish, [], str(exc))
+                    return
+                self.post(finish, rows, "")
+
+            threading.Thread(target=worker, daemon=True).start()
+        def export_report():
+            rows = state["rows"]
+            if not rows:
+                messagebox.showinfo("导出报告", "还没有体检结果。", parent=win)
+                return
+            target = str(target_var.get() or "report").replace(".", "_")
+            path = filedialog.asksaveasfilename(
+                parent=win,
+                title="导出体检报告",
+                initialfile="mod_audit_{0}.txt".format(target),
+                defaultextension=".txt",
+                filetypes=[("文本文件", "*.txt")],
+            )
+            if not path:
+                return
+            lines = [
+                "AKM Launcher // 模组版本体检",
+                "目标 MC 版本 : {0}".format(target_var.get()),
+                "包含子版本   : {0}".format("是" if patch_var.get() else "否"),
+                "检查时间     : {0}".format(
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                ),
+                "",
+            ]
+            for row in sorted(
+                rows,
+                key=lambda item: (item.get("ok") is not True, str(item.get("title"))),
+            ):
+                verdict = row.get("ok")
+                if verdict is True:
+                    mark = "OK  "
+                elif row.get("cf"):
+                    mark = "CF  "
+                elif verdict is False:
+                    mark = "MISS"
+                else:
+                    mark = "????"
+                lines.append(
+                    "[{0}] {1}  ({2} / {3} / {4})".format(
+                        mark,
+                        row.get("file"),
+                        row.get("installed_version") or row.get("version") or "-",
+                        row.get("loader") or "?",
+                        row.get("source") or "?",
+                    )
+                )
+                if verdict is True:
+                    lines.append(
+                        "        最新适配: {0}   最高支持: {1}".format(
+                            row.get("best") or "-", row.get("max_mc") or "-"
+                        )
+                    )
+                elif verdict is False:
+                    lines.append(
+                        "        最高只到: {0}   声明: {1}".format(
+                            row.get("max_mc") or "-",
+                            row.get("predicate") or row.get("mc_hint") or "-",
+                        )
+                    )
+                if row.get("cf"):
+                    port = row["cf"]
+                    lines.append(
+                        "        CurseForge 移植: {0}  ({1})  {2}".format(
+                            port.get("filename") or "-",
+                            port.get("version") or "-",
+                            port.get("page") or "",
+                        )
+                    )
+            try:
+                with open(path, "w", encoding="utf-8", newline="\n") as handle:
+                    handle.write("\n".join(lines) + "\n")
+            except OSError as exc:
+                messagebox.showerror("导出失败", str(exc), parent=win)
+                return
+            self.say("体检报告已导出 // {0}".format(path))
+            messagebox.showinfo("导出完成", path, parent=win)
+
+        def move_incompatible():
+            bad = [row for row in state["rows"] if row.get("ok") is False]
+            if not bad:
+                messagebox.showinfo(
+                    "移出不兼容", "没有可移出的条目（先体检一次）。", parent=win
+                )
+                return
+            target = str(target_var.get() or "target").replace(".", "_")
+            folder = os.path.join(
+                os.path.dirname(bad[0]["path"]), "_incompatible_{0}".format(target)
+            )
+            if not messagebox.askyesno(
+                "移出不兼容",
+                "把 {0} 个不支持 MC {1} 的模组移到：\n{2}\n\n"
+                "（只是移动到子文件夹，随时可以还原）继续？".format(
+                    len(bad), target_var.get(), folder
+                ),
+                parent=win,
+            ):
+                return
+            ensure_dir(folder)
+            moved, failed = 0, []
+            for row in bad:
+                destination = os.path.join(folder, os.path.basename(row["path"]))
+                try:
+                    shutil.move(row["path"], destination)
+                    moved += 1
+                except Exception as exc:  # noqa: BLE001
+                    failed.append("{0}: {1}".format(row["file"], str(exc)[:60]))
+            state["paths"] = [path for path in state["paths"] if os.path.isfile(path)]
+            state["rows"] = [
+                row for row in state["rows"] if os.path.isfile(row["path"])
+            ]
+            render()
+            set_status(
+                "已移出 {0} 个不兼容模组 → {1}{2}".format(
+                    moved,
+                    folder,
+                    (" // 失败 " + "；".join(failed[:2])) if failed else "",
+                )
+            )
+            self.say(
+                "模组体检 // 移出 {0} 个不兼容 {1} 的模组".format(
+                    moved, target_var.get()
+                )
+            )
+        option_row = tk.Frame(wrap, bg=C_WHITE)
+        option_row.grid(row=6, column=0, sticky="ew", pady=(8, 0))
+
+        def toggle_option():
+            render()
+            if cf_var.get() and state["rows"] and not cf_port_rows():
+                set_status(
+                    "已开启 CurseForge 检查 // 重新体检一次才会写入移植结果"
+                )
+
+        for label, variable in (("只看命中", only_ok), ("联网查 CurseForge 移植", cf_var)):
+            tk.Checkbutton(
+                option_row,
+                text=label,
+                variable=variable,
+                command=toggle_option,
+                bg=C_WHITE,
+                fg=C_BLACK,
+                activebackground=C_WHITE,
+                activeforeground=C_BLACK,
+                selectcolor=C_WHITE,
+                font=FONT_SMALL,
+                bd=0,
+                highlightthickness=0,
+                takefocus=0,
+                cursor="hand2",
+            ).pack(side="left", padx=(0, 10))
+        btn_cf_ports = self._mk_button(
+            option_row,
+            "[ 下移植版 ]",
+            lambda: offer_cf_ports(cf_port_rows()),
+            font=FONT_SMALL,
+        )
+        btn_cf_ports.pack(side="left", padx=(2, 0))
+        self._mk_button(
+            option_row,
+            "[ 目标文件夹... ]",
+            lambda: choose_target_dir(None),
+            font=FONT_SMALL,
+        ).pack(side="left", padx=(6, 0))
+
+        target_label = tk.Label(
+            wrap,
+            textvariable=target_text_var,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            padx=5,
+            pady=2,
+            bd=1,
+            relief="solid",
+        )
+        target_label.grid(row=7, column=0, sticky="ew", pady=(6, 0))
+        refresh_target_label()
+
+        button_row = tk.Frame(wrap, bg=C_WHITE)
+        button_row.grid(row=8, column=0, sticky="ew", pady=(6, 0))
+        self._mk_button(
+            button_row, "[ 导出报告 ]", export_report, font=FONT_SMALL
+        ).pack(side="left", padx=(0, 4))
+        btn_update_all = self._mk_button(
+            button_row, "[ 一键更新全部 ]", update_all, font=FONT_SMALL
+        )
+        btn_update_all.pack(side="left", padx=4)
+        self._mk_button(
+            button_row, "[ 移出不兼容 → ]", move_incompatible, font=FONT_SMALL
+        ).pack(side="left", padx=4)
+        self._mk_button(button_row, "[ 关闭 ]", lambda: close(), font=FONT_SMALL).pack(
+            side="right"
+        )
+
+        def close():
+            disable_file_drop(win)
+            self._audit_win = None
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        def on_drop(items):
+            add_paths(items, run=True)
+
+        def poll_drop():
+            try:
+                dropped_paths = take_dropped_paths(win)
+            except Exception:
+                dropped_paths = []
+            if dropped_paths:
+                on_drop(dropped_paths)
+            try:
+                win.after(200, poll_drop)
+            except Exception:
+                pass
+
+        def register_drop():
+            mapped = False
+            try:
+                win.update_idletasks()
+                win.update()
+                mapped = drop_registered(win)
+            except Exception:
+                mapped = False
+            if not mapped and enable_file_drop(win, on_drop):
+                mapped = True
+            if mapped:
+                set_status("拖放已就绪 // 把 jar 或 mods 文件夹拖进来")
+                poll_drop()
+            else:
+                set_status("拖放不可用 // 请用 [ 选择 jar... ] 或 [ 扫描当前 mods ]")
+
+        win.after(120, register_drop)
+        win.protocol("WM_DELETE_WINDOW", close)
+        win.bind("<Escape>", lambda _event: close())
+        render()
+        try:
+            win.update_idletasks()
+            win.geometry(
+                "+{0}+{1}".format(
+                    self.root.winfo_rootx() + 40, self.root.winfo_rooty() + 30
+                )
+            )
+        except Exception:
+            pass
+
+    def _audit_pick_files(self, parent=None):
+        files = filedialog.askopenfilenames(
+            title="选择要体检的模组 jar",
+            parent=parent or self.root,
+            initialdir=self.effective_mods_dir(),
+            filetypes=[("模组 jar", "*.jar"), ("所有文件", "*.*")],
+        )
+        return list(files or [])
+
+    def open_external_url(self, url, label=""):
+        target = str(url or "").strip()
+        if not target:
+            return
+        try:
+            webbrowser.open(target)
+            self.say(
+                "打开链接: {0} // {1}".format(label or "站点", target)
+            )
+        except Exception as exc:
+            messagebox.showerror(
+                "无法打开链接",
+                "{0}\n\n{1}".format(target, exc),
+                parent=self.root,
+            )
+
+    def on_open_toolbox(self):
+        if self._toolbox_win is not None:
+            try:
+                self._toolbox_win.deiconify()
+                self._toolbox_win.lift()
+                self._toolbox_win.focus_force()
+                return
+            except Exception:
+                self._toolbox_win = None
+
+        win = tk.Toplevel(self.root)
+        win.title("TOOLBOX // Minecraft 资源导航")
+        win.configure(bg=C_WHITE)
+        win.transient(self.root)
+        win.resizable(True, True)
+        win.protocol("WM_DELETE_WINDOW", self._close_toolbox)
+
+        wrap = tk.Frame(win, bg=C_WHITE, bd=1, relief="solid", padx=10, pady=10)
+        wrap.pack(fill="both", expand=True, padx=8, pady=8)
+
+        tk.Label(
+            wrap,
+            text=title_text("TOOLBOX // MINECRAFT RESOURCE DIRECTORY"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        ).pack(fill="x")
+
+        search_row = tk.Frame(wrap, bg=C_WHITE)
+        search_row.pack(fill="x", pady=(8, 4))
+        tk.Label(
+            search_row,
+            text=title_text("FILTER // 搜索站点"),
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+        ).pack(side="left")
+        self._toolbox_search_var = tk.StringVar(value="")
+        search_entry = tk.Entry(
+            search_row,
+            textvariable=self._toolbox_search_var,
+            font=FONT_MAIN,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            insertbackground=C_BLACK,
+            relief="solid",
+            bd=1,
+            highlightthickness=0,
+        )
+        search_entry.pack(side="left", fill="x", expand=True, padx=(6, 6), ipady=3)
+        search_entry.bind("<KeyRelease>", self._toolbox_filter)
+        self._mk_button(
+            search_row, "[ 清空 ]", self._toolbox_clear_filter, padx=8
+        ).pack(side="left")
+
+        list_frame = tk.Frame(wrap, bg=C_WHITE, bd=1, relief="solid")
+        list_frame.pack(fill="both", expand=True)
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+        self._toolbox_list = tk.Listbox(
+            list_frame,
+            height=13,
+            selectmode="browse",
+            font=FONT_MAIN,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            selectbackground=C_TEAL,
+            selectforeground=C_WHITE,
+            activestyle="none",
+            exportselection=False,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+        )
+        self._toolbox_list.grid(
+            row=0, column=0, sticky="nsew", padx=(2, 0), pady=2
+        )
+        self._toolbox_list.bind("<<ListboxSelect>>", self._toolbox_select)
+        self._toolbox_list.bind(
+            "<Double-Button-1>", self._toolbox_open_selected
+        )
+        self._toolbox_list.bind("<Return>", self._toolbox_open_selected)
+        box_scroll = tk.Scrollbar(
+            list_frame,
+            orient="vertical",
+            command=self._toolbox_list.yview,
+            width=14,
+            bg=C_GRAY,
+            activebackground=C_TEAL,
+            troughcolor=C_WHITE,
+            bd=1,
+            relief="solid",
+            highlightthickness=0,
+        )
+        box_scroll.grid(row=0, column=1, sticky="ns")
+        self._toolbox_list.configure(yscrollcommand=box_scroll.set)
+
+        self._toolbox_detail_var = tk.StringVar(
+            value="选择站点查看地址与说明，双击可直接打开。"
+        )
+        tk.Label(
+            wrap,
+            textvariable=self._toolbox_detail_var,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="nw",
+            justify="left",
+            padx=6,
+            pady=5,
+            bd=1,
+            relief="solid",
+            wraplength=760,
+        ).pack(fill="x", pady=(6, 0))
+
+        button_row = tk.Frame(wrap, bg=C_WHITE)
+        button_row.pack(fill="x", pady=(8, 0))
+        self._mk_button(
+            button_row, "[ 打开链接 ]", self._toolbox_open_selected
+        ).pack(side="left", expand=True, fill="x", padx=2)
+        self._mk_button(
+            button_row, "[ 复制链接 ]", self._toolbox_copy
+        ).pack(side="left", expand=True, fill="x", padx=2)
+        self._mk_button(
+            button_row, "[ 关闭 ]", self._close_toolbox
+        ).pack(side="left", expand=True, fill="x", padx=2)
+
+        self._toolbox_win = win
+        self._toolbox_rows = []
+        self._toolbox_filter()
+        win.update_idletasks()
+        pos_x = self.root.winfo_rootx() + max(
+            0, (self.root.winfo_width() - win.winfo_reqwidth()) // 2
+        )
+        pos_y = self.root.winfo_rooty() + max(
+            0, (self.root.winfo_height() - win.winfo_reqheight()) // 2
+        )
+        win.geometry("+{0}+{1}".format(pos_x, pos_y))
+        win.minsize(760, 560)
+        self.say("工具箱已打开 // MC百科 / Modrinth / CurseForge / 官方站点")
+
+    def _toolbox_filter(self, _event=None):
+        if self._toolbox_list is None:
+            return
+        query = ""
+        if self._toolbox_search_var is not None:
+            query = str(self._toolbox_search_var.get() or "").strip().lower()
+        rows = []
+        for row in TOOLBOX_LINKS:
+            haystack = " ".join(str(part) for part in row).lower()
+            if not query or query in haystack:
+                rows.append(row)
+        self._toolbox_rows = rows
+        self._toolbox_list.delete(0, tk.END)
+        for category, name, url, description in rows:
+            self._toolbox_list.insert(
+                tk.END,
+                "[{0:<4}] {1:<22} {2}".format(
+                    category, name, description[:42]
+                ),
+            )
+        if rows:
+            self._toolbox_list.selection_set(0)
+            self._toolbox_list.activate(0)
+            self._toolbox_list.see(0)
+            self._toolbox_select()
+        elif self._toolbox_detail_var is not None:
+            self._toolbox_detail_var.set("NO MATCH // 没有匹配的站点")
+
+    def _toolbox_clear_filter(self):
+        if self._toolbox_search_var is not None:
+            self._toolbox_search_var.set("")
+        self._toolbox_filter()
+
+    def _toolbox_select(self, _event=None):
+        if self._toolbox_list is None or self._toolbox_detail_var is None:
+            return
+        selection = self._toolbox_list.curselection()
+        if not selection:
+            return
+        index = int(selection[0])
+        if index < 0 or index >= len(self._toolbox_rows):
+            return
+        category, name, url, description = self._toolbox_rows[index]
+        self._toolbox_detail_var.set(
+            "{0} // {1}\n{2}\n{3}".format(
+                category, name, url, description
+            )
+        )
+
+    def _toolbox_open_selected(self, _event=None):
+        if self._toolbox_list is None:
+            return
+        selection = self._toolbox_list.curselection()
+        if not selection:
+            return
+        index = int(selection[0])
+        if 0 <= index < len(self._toolbox_rows):
+            category, name, url, description = self._toolbox_rows[index]
+            self.open_external_url(url, name)
+
+    def _toolbox_copy(self):
+        if self._toolbox_list is None:
+            return
+        selection = self._toolbox_list.curselection()
+        if not selection:
+            return
+        index = int(selection[0])
+        if 0 <= index < len(self._toolbox_rows):
+            url = self._toolbox_rows[index][2]
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(url)
+                self.say("已复制链接: {0}".format(url))
+            except Exception as exc:
+                self.say("剪贴板失败: {0}".format(exc))
+
+    def _close_toolbox(self):
+        win = self._toolbox_win
+        self._toolbox_win = None
+        self._toolbox_list = None
+        self._toolbox_detail_var = None
+        self._toolbox_search_var = None
+        self._toolbox_rows = []
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+    # -- settings / theme ----------------------------------------------------
+
+    def on_open_config_file(self):
+        try:
+            if os.name == "nt":
+                os.startfile(CONFIG_PATH)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", CONFIG_PATH])
+            else:
+                subprocess.Popen(["xdg-open", CONFIG_PATH])
+            self.say("已打开配置文件: {0}".format(CONFIG_PATH))
+        except Exception as exc:
+            messagebox.showerror(
+                "无法打开配置文件", str(exc), parent=self.root
+            )
+
+    def _settings_memory_hint(self):
+        if self._memory_hint_var is None:
+            return
+        try:
+            min_gb = int(self._memory_min_var.get())
+            max_gb = int(self._memory_max_var.get())
+        except Exception:
+            return
+        ram_gb = int(total_ram_mb() / 1024)
+        text = "生效参数: -Xms{0}M -Xmx{1}M".format(min_gb * 1024, max_gb * 1024)
+        if max_gb < min_gb:
+            text += "  //  警告: 最大内存小于最小内存，保存时会自动对齐"
+        elif ram_gb and max_gb > ram_gb:
+            text += "  //  警告: 已超过物理内存 {0} GB，游戏可能无法启动".format(ram_gb)
+        elif ram_gb and max_gb > max(1, ram_gb - 2):
+            text += "  //  提示: 建议给系统留 2 GB 左右"
+        self._memory_hint_var.set(text)
+
+    def _settings_memory_preset(self, gb):
+        if self._memory_max_var is None:
+            return
+        try:
+            gb = int(gb)
+        except (TypeError, ValueError):
+            return
+        self._memory_max_var.set(gb)
+        if self._memory_min_var is not None and self._memory_min_var.get() > gb:
+            self._memory_min_var.set(gb)
+        self._settings_memory_hint()
+
+    def _settings_memory_recommend(self):
+        if self._memory_max_var is None:
+            return
+        ram = total_ram_mb()
+        slider_max = max(2, int((ram or 8192) / 1024))
+        recommended = max(2, int(round(recommended_memory_mb(ram) / 1024)))
+        recommended = min(recommended, slider_max)
+        self._memory_max_var.set(recommended)
+        if self._memory_min_var is not None:
+            current = 1
+            try:
+                current = int(self._memory_min_var.get())
+            except Exception:
+                current = 1
+            self._memory_min_var.set(max(1, min(current, recommended)))
+        self._settings_memory_hint()
+
+    def _settings_apply_memory(self):
+        if self._memory_min_var is None or self._memory_max_var is None:
+            return
+        try:
+            min_gb = max(1, int(self._memory_min_var.get()))
+            max_gb = max(1, int(self._memory_max_var.get()))
+        except Exception:
+            return
+        if max_gb < min_gb:
+            max_gb = min_gb
+            self._memory_max_var.set(max_gb)
+        self.config["memory"] = {
+            "min": "{0}M".format(min_gb * 1024),
+            "max": "{0}M".format(max_gb * 1024),
+        }
+        self._save_config()
+        self._settings_memory_hint()
+        self.say(
+            "内存分配已保存: -Xms{0}M -Xmx{1}M".format(min_gb * 1024, max_gb * 1024)
+        )
+
+    # -- wallpaper / download source -----------------------------------------
+
+    def on_pick_wallpaper(self):
+        path = filedialog.askopenfilename(
+            title="选择启动器背景图片",
+            parent=self.root,
+            filetypes=[
+                ("图片文件", "*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tif *.tiff"),
+                ("所有文件", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        if not wallpaper_supported(path):
+            messagebox.showwarning(
+                "背景图片",
+                "无法识别这个文件。\n请选择 PNG / JPG / BMP / GIF / WEBP 图片。",
+                parent=self.root,
+            )
+            return
+        self.config["wallpaper"] = os.path.abspath(path)
+        self._save_config()
+        self.wallpaper_path = self.config["wallpaper"]
+        self._refresh_wallpaper()
+        self.say("背景图片已应用 // {0}".format(os.path.basename(path)))
+
+    def on_clear_wallpaper(self):
+        if not str(self.config.get("wallpaper") or "").strip():
+            self.say("当前没有自定义背景")
+            return
+        self.config["wallpaper"] = ""
+        self._save_config()
+        self.wallpaper_path = ""
+        self._refresh_wallpaper()
+        self.say("背景图片已清除 // 已恢复默认外观")
+
+    def on_change_language(self, code):
+        """Persist the chosen UI language and restart the window with it."""
+        code = str(code or "").strip().lower()
+        if code not in LANGUAGE_ORDER:
+            code = "zh"
+        if code == str(self.config.get("language") or "zh"):
+            return
+        set_language(code)
+        self.config["language"] = code
+        self._save_config()
+        if self._language_var is not None:
+            try:
+                self._language_var.set(code)
+            except Exception:
+                pass
+        label = language_label(code)
+        busy = (
+            self._vanilla_downloading
+            or self._loader_installing
+            or self._busy
+            or self._launching
+        )
+        if busy:
+            messagebox.showinfo(
+                tr("set.language"),
+                "语言已保存为 {0}（当前任务结束后重新打开启动器生效）。".format(label),
+                parent=self.root,
+            )
+            return
+        if not messagebox.askyesno(
+            tr("set.language"),
+            "界面语言已切换为 {0}。\n立即重建界面使全部文字生效吗？\n"
+            "（选「否」时菜单会立即更新，其他窗口下次打开时生效）".format(label),
+            parent=self.root,
+        ):
+            self._rebuild_menu()
+            return
+        # Rebuild the UI in-process: no second process, no window flash.
+        self._relaunch_ui = True
+        self.say("界面语言已切换为 {0} // 正在重建界面".format(label))
+        self._cancel_timers()
+        try:
+            self.root.quit()
+            self.root.destroy()
+        except Exception:
+            log_debug("rebuild ui failed:\n" + traceback.format_exc())
+            self._relaunch_ui = False
+            if restart_launcher():
+                try:
+                    self.root.quit()
+                    self.root.destroy()
+                except Exception:
+                    pass
+
+    def on_open_lang_dir(self):
+        folder = ensure_lang_dir()
+        ensure_dir(folder)
+        self._open_folder(folder)
+        self.say("语言包目录: {0}".format(folder))
+
+    def on_reload_lang_packs(self):
+        try:
+            packs = load_language_packs(force=True)
+            count = set_language_phrases(current_language())
+        except Exception as exc:
+            messagebox.showerror("语言包", "重新加载失败: {0}".format(exc), parent=self.root)
+            return
+        info = language_pack_info()
+        self._rebuild_menu()
+        messagebox.showinfo(
+            "语言包",
+            "已重新加载 {0} 个语言包\n当前语言 {1} 条短语\n目录: {2}".format(
+                len(packs), count, info.get("dir") or "-"
+            ),
+            parent=self.root,
+        )
+        self.say("语言包已重新加载 // {0} 个语言包".format(len(packs)))
+
+    def on_export_untranslated(self):
+        """Write the Chinese captions missing from the active pack to a JSON file."""
+        code = current_language()
+        if code == "zh":
+            messagebox.showinfo(
+                "导出未翻译文本",
+                "中文模式下没有需要翻译的条目。\n请先切换到其它语言。",
+                parent=self.root,
+            )
+            return
+        source = os.path.join(BASE_DIR, "win1_gui.py")
+        if not os.path.isfile(source):
+            messagebox.showwarning(
+                "导出未翻译文本", "找不到 win1_gui.py，无法提取文本。", parent=self.root
+            )
+            return
+        try:
+            with open(source, "r", encoding="utf-8") as handle:
+                text = handle.read()
+            phrases = _LANG_PHRASES
+            missing = []
+            for raw in re.findall(r'"((?:[^"\\]|\\.)*)"', text):
+                if not any("\u3400" <= ch <= "\u9fff" for ch in raw):
+                    continue
+                value = raw.replace("\\\\", "\\").replace('\\"', '"')
+                if value not in phrases and value not in missing:
+                    missing.append(value)
+            target = os.path.join(BASE_DIR, "lang", "{0}.todo.json".format(code))
+            ensure_dir(os.path.dirname(target))
+            write_json(target, {item: "" for item in sorted(missing)})
+        except Exception as exc:
+            messagebox.showerror("导出未翻译文本", str(exc), parent=self.root)
+            return
+        messagebox.showinfo(
+            "导出未翻译文本",
+            "还有 {0} 条中文文本没有 {1} 翻译。\n已写入:\n{2}\n\n"
+            "把值填好后放进 lang/{1}.json 的 phrases 里即可。".format(
+                len(missing), code, target
+            ),
+            parent=self.root,
+        )
+
+    def _cancel_timers(self):
+        """Stop the periodic UI jobs before the window is torn down."""
+        self._closing = True
+        for attr in (
+            "_ui_job",
+            "_download_tick_job",
+            "_wallpaper_job",
+            "_launch_ticker_id",
+        ):
+            job = getattr(self, attr, None)
+            if job is None:
+                continue
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+            setattr(self, attr, None)
+
+    def _rebuild_menu(self):
+        try:
+            self._build_menu()
+        except Exception:
+            log_debug("rebuild menu failed:\n" + traceback.format_exc())
+
+    def on_change_download_source(self, value):
+        value = str(value or "mirror").lower()
+        if value not in {"mirror", "auto", "official"}:
+            value = "mirror"
+        self.config["download_source"] = value
+        self._save_config()
+        try:
+            if self._source_var is not None:
+                self._source_var.set(value)
+        except Exception:
+            pass
+        self.say(
+            "下载源已切换 // {0}（之后打开的安装窗口都会用它）".format(
+                VANILLA_SOURCE_LABELS.get(value, value)
+            )
+        )
+
+    def _on_root_configure(self, event=None):
+        if event is not None and getattr(event, "widget", None) not in (
+            None,
+            self.root,
+        ):
+            return
+        if not getattr(self, "_widgets_ready", False):
+            return
+        if not str(self.config.get("wallpaper") or "").strip():
+            return
+        self._schedule_wallpaper_refresh()
+
+    def _schedule_wallpaper_refresh(self, delay=420):
+        try:
+            if self._wallpaper_job is not None:
+                self.root.after_cancel(self._wallpaper_job)
+        except Exception:
+            pass
+        try:
+            self._wallpaper_job = self.root.after(delay, self._refresh_wallpaper)
+        except Exception:
+            self._wallpaper_job = None
+
+    def _wallpaper_options(self):
+        path = str(self.config.get("wallpaper") or "").strip()
+        fit = str(self.config.get("wallpaper_fit") or "cover").lower()
+        if fit not in ("cover", "contain"):
+            fit = "cover"
+        try:
+            dim = int(self.config.get("wallpaper_dim") or 0)
+        except (TypeError, ValueError):
+            dim = 0
+        return path, fit, max(0, min(60, dim))
+
+    # -- frosted (semi transparent) panels over the wallpaper ------------------
+    def _panel_alpha(self):
+        """0 = classic opaque white panels, 60 = wallpaper shows through."""
+        try:
+            value = int(self.config.get("panel_alpha") or 0)
+        except (TypeError, ValueError):
+            value = 0
+        return max(0, min(60, value))
+
+    def _build_glass_canvas(self, panel, key):
+        """Canvas parked behind a panel: holds its frosted wallpaper slice."""
+        canvas = tk.Canvas(panel, bg=C_WHITE, bd=0, highlightthickness=0)
+        canvas.place(x=0, y=0, relwidth=1, relheight=1)
+        try:
+            canvas.lower()
+        except Exception:
+            pass
+        self._glass_canvases[key] = canvas
+        try:
+            panel.bind("<Configure>", self._on_panel_configure, add="+")
+        except Exception:
+            pass
+        return canvas
+
+    def _on_panel_configure(self, event=None):
+        """Panel grew/shrank: the frosted slice has to be re-cut to fit."""
+        if not getattr(self, "_widgets_ready", False):
+            return
+        if self._panel_alpha() <= 0:
+            return
+        if not str(self.config.get("wallpaper") or "").strip():
+            return
+        for key, canvas in self._glass_canvases.items():
+            if key not in self._glass_photos:
+                continue
+            try:
+                size = (int(canvas.winfo_width()), int(canvas.winfo_height()))
+            except Exception:
+                continue
+            stored = self._glass_sizes.get(key)
+            if stored is None:
+                continue
+            if abs(size[0] - stored[0]) > 2 or abs(size[1] - stored[1]) > 2:
+                self._schedule_wallpaper_refresh(320)
+                return
+
+    def _panel_rects(self, win_w, win_h):
+        """Window coordinates of the glass areas (the panels' inner canvas)."""
+        rects = {}
+        try:
+            root_x = int(self.root.winfo_rootx())
+            root_y = int(self.root.winfo_rooty())
+        except Exception:
+            return rects
+        for key, attr in (("left", "left_panel"), ("right", "right_panel")):
+            widget = self._glass_canvases.get(key)
+            if widget is None:
+                widget = getattr(self, attr, None)
+            if widget is None:
+                continue
+            try:
+                width = int(widget.winfo_width())
+                height = int(widget.winfo_height())
+                if width < 40 or height < 40:
+                    continue
+                x = int(widget.winfo_rootx()) - root_x
+                y = int(widget.winfo_rooty()) - root_y
+            except Exception:
+                continue
+            if x < 0 or y < 0 or x >= win_w or y >= win_h:
+                continue
+            rects[key] = (x, y, width, height)
+        return rects
+
+    def _apply_glass(self, key, photo, color):
+        self._glass_photos[key] = photo
+        self._glass_colors[key] = color
+        if photo is not None:
+            try:
+                self._glass_sizes[key] = (
+                    int(photo.width()),
+                    int(photo.height()),
+                )
+            except Exception:
+                pass
+        canvas = self._glass_canvases.get(key)
+        if canvas is None:
+            return
+        try:
+            canvas.configure(bg=color)
+            canvas.delete("glass")
+            if photo is not None:
+                canvas.create_image(0, 0, anchor="nw", image=photo, tags="glass")
+            canvas.lower()
+        except Exception:
+            pass
+
+    def _glass_reset_tint(self):
+        for widget, color in self._glass_tinted:
+            try:
+                widget.configure(bg=color)
+            except Exception:
+                pass
+        self._glass_tinted = []
+
+    def _glass_restore_button(self, button, color):
+        try:
+            if str(button.cget("state")) != "disabled":
+                button.configure(bg=color, fg=C_BLACK)
+        except Exception:
+            pass
+
+    def _glass_tone_at(self, tone_map, fx, fy, fallback):
+        """Colour of the frosted wallpaper at one point of the panel."""
+        if tone_map is None:
+            return fallback
+        try:
+            width = int(tone_map.width())
+            height = int(tone_map.height())
+        except Exception:
+            return fallback
+        if width < 1 or height < 1:
+            return fallback
+        x = max(0, min(width - 1, int(fx * width)))
+        y = max(0, min(height - 1, int(fy * height)))
+        pixel = photo_pixel_rgb(tone_map, x, y)
+        if pixel is None:
+            return fallback
+        return "#{0:02X}{1:02X}{2:02X}".format(*pixel)
+
+    @staticmethod
+    def _clamp_tone(sampled, base_rgb, limit=26):
+        """Keep the per-widget sample close to the panel tone (no odd colours)."""
+        if not sampled or not base_rgb:
+            return sampled
+        text = sampled.lstrip("#")
+        if len(text) != 6:
+            return sampled
+        try:
+            pixel = tuple(int(text[index : index + 2], 16) for index in (0, 2, 4))
+        except ValueError:
+            return sampled
+        clamped = []
+        for value, base in zip(pixel, base_rgb):
+            low = max(0, base - limit)
+            high = min(255, base + limit)
+            clamped.append(max(low, min(high, value)))
+        return "#{0:02X}{1:02X}{2:02X}".format(*clamped)
+
+    def _glass_tint_panel(self, panel, color, tone_map=None, area=None):
+        """Repaint the panel's white cards with the slice tone (frosted look)."""
+        if panel is None:
+            return
+        base_rgb = None
+        try:
+            text = str(color or "").lstrip("#")
+            if len(text) == 6:
+                base_rgb = tuple(
+                    int(text[index : index + 2], 16) for index in (0, 2, 4)
+                )
+        except (TypeError, ValueError):
+            base_rgb = None
+        skip = set(id(canvas) for canvas in self._glass_canvases.values())
+        area = area if area is not None else panel
+        try:
+            base_x = int(area.winfo_rootx())
+            base_y = int(area.winfo_rooty())
+            span_x = max(1, int(area.winfo_width()))
+            span_y = max(1, int(area.winfo_height()))
+        except Exception:
+            base_x = base_y = 0
+            span_x = span_y = 1
+        stack = [panel]
+        while stack:
+            widget = stack.pop()
+            try:
+                children = list(widget.winfo_children())
+            except Exception:
+                children = []
+            for child in children:
+                stack.append(child)
+                if id(child) in skip:
+                    continue
+                try:
+                    if str(child.cget("bg")).upper() != C_WHITE:
+                        continue
+                except Exception:
+                    continue
+                tone = color
+                if tone_map is not None:
+                    try:
+                        fx = (
+                            int(child.winfo_rootx())
+                            + int(child.winfo_width()) // 2
+                            - base_x
+                        ) / float(span_x)
+                        fy = (
+                            int(child.winfo_rooty())
+                            + int(child.winfo_height()) // 2
+                            - base_y
+                        ) / float(span_y)
+                    except Exception:
+                        fx = fy = 0.5
+                    tone = self._glass_tone_at(
+                        tone_map,
+                        max(0.0, min(1.0, fx)),
+                        max(0.0, min(1.0, fy)),
+                        color,
+                    )
+                    tone = self._clamp_tone(tone, base_rgb)
+                try:
+                    child.configure(bg=tone)
+                except Exception:
+                    continue
+                self._glass_tinted.append((child, C_WHITE))
+                if isinstance(child, tk.Button) and id(child) not in self._glass_bound:
+                    self._glass_bound.add(id(child))
+                    try:
+                        child.bind(
+                            "<Leave>",
+                            lambda _event, widget=child, tone=tone: (
+                                self._glass_restore_button(widget, tone)
+                            ),
+                            add="+",
+                        )
+                    except Exception:
+                        pass
+
+    def _clear_glass(self):
+        for canvas in self._glass_canvases.values():
+            try:
+                canvas.delete("glass")
+                canvas.configure(bg=C_WHITE)
+            except Exception:
+                pass
+        self._glass_photos = {}
+        self._glass_tones = {}
+        self._glass_colors = {}
+        self._glass_reset_tint()
+
+    def _refresh_wallpaper(self):
+        self._wallpaper_job = None
+        path, fit, dim = self._wallpaper_options()
+        self.wallpaper_path = path
+        active = bool(path) and wallpaper_supported(path)
+        try:
+            # the desktop strip only exists while a wallpaper is set
+            self.root.rowconfigure(2, minsize=92 if active else 0)
+        except Exception:
+            pass
+        hint = getattr(self, "desktop_hint", None)
+        if hint is not None:
+            try:
+                if active:
+                    hint.grid_remove()
+                else:
+                    hint.grid()
+            except Exception:
+                pass
+        if not active:
+            self._clear_wallpaper_visuals()
+            return
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
+        win_w = max(320, int(self.root.winfo_width()))
+        win_h = max(240, int(self.root.winfo_height()))
+        banner = getattr(self, "banner", None)
+        banner_w = max(200, int(banner.winfo_width()) if banner is not None else win_w)
+        banner_h = max(24, int(banner.winfo_height()) if banner is not None else 32)
+        token = self._wallpaper_token + 1
+        self._wallpaper_token = token
+        self._wallpaper_last_size = (win_w, win_h, banner_w, banner_h)
+        surface = C_WHITE
+        veil = dim / 100.0
+        alpha = self._panel_alpha()
+        panels = self._panel_rects(win_w, win_h) if alpha > 0 else {}
+        glass_white = max(0.0, min(0.85, 1.0 - alpha / 100.0))
+
+        def worker():
+            try:
+                backdrop = wallpaper_photo_data(
+                    path, win_w, win_h, veil, fit, surface
+                )
+                strip = wallpaper_photo_data(
+                    path, banner_w, banner_h, min(0.85, veil + 0.45), "cover", surface
+                )
+                glass = {}
+                for key, (px, py, pw, ph) in panels.items():
+                    box = (
+                        px / float(win_w),
+                        py / float(win_h),
+                        (px + pw) / float(win_w),
+                        (py + ph) / float(win_h),
+                    )
+                    aligned = fit == "cover"
+                    slice_data = None
+                    if aligned:
+                        slice_data = wallpaper_photo_data(
+                            path,
+                            pw,
+                            ph,
+                            veil,
+                            fit,
+                            surface,
+                            white=glass_white,
+                            frame=(win_w, win_h),
+                            src_box=box,
+                        )
+                    tone_data = wallpaper_photo_data(
+                        path,
+                        4,
+                        4,
+                        veil,
+                        fit,
+                        surface,
+                        white=glass_white,
+                        frame=(win_w, win_h),
+                        src_box=box if aligned else None,
+                    )
+                    map_data = wallpaper_photo_data(
+                        path,
+                        28,
+                        20,
+                        veil,
+                        fit,
+                        surface,
+                        white=glass_white,
+                        frame=(win_w, win_h),
+                        src_box=box if aligned else None,
+                    )
+                    glass[key] = (slice_data, tone_data, map_data)
+            except Exception as exc:
+                self.post(self._wallpaper_failed, str(exc))
+                return
+            self.post(self._wallpaper_apply, token, backdrop, strip, glass)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _wallpaper_apply(self, token, backdrop_data, strip_data, glass_data=None):
+        if token != self._wallpaper_token:
+            return
+        try:
+            backdrop_photo = tk.PhotoImage(data=backdrop_data)
+            strip_photo = tk.PhotoImage(data=strip_data)
+        except Exception as exc:
+            self._wallpaper_failed(str(exc))
+            return
+        self._wallpaper_photos = (backdrop_photo, strip_photo)
+        canvas = getattr(self, "backdrop", None)
+        if canvas is not None:
+            try:
+                canvas.delete("wallpaper")
+                canvas.create_image(
+                    0, 0, anchor="nw", image=backdrop_photo, tags="wallpaper"
+                )
+                canvas.lower("wallpaper")
+            except Exception:
+                pass
+        banner = getattr(self, "banner", None)
+        if banner is not None:
+            try:
+                banner.delete("banner_bg")
+                banner.create_image(
+                    0, 0, anchor="nw", image=strip_photo, tags="banner_bg"
+                )
+                banner.tag_lower("banner_bg")
+                self._banner_has_image = True
+                self._refresh_banner_text_colors()
+            except Exception:
+                pass
+        self._apply_glass_data(glass_data)
+
+    def _apply_glass_data(self, glass_data=None):
+        """Turn the two main panels into frosted glass over the wallpaper."""
+        if not glass_data:
+            self._clear_glass()
+            return
+        self._clear_glass()
+        for key, payload in glass_data.items():
+            slice_data, tone_data, map_data = payload
+            photo = None
+            if slice_data:
+                try:
+                    photo = tk.PhotoImage(data=slice_data)
+                except Exception:
+                    photo = None
+            color = C_WHITE
+            if tone_data:
+                try:
+                    color = photo_average_color(tk.PhotoImage(data=tone_data))
+                except Exception:
+                    color = C_WHITE
+            tone_map = None
+            if map_data:
+                try:
+                    tone_map = tk.PhotoImage(data=map_data)
+                except Exception:
+                    tone_map = None
+            self._glass_tones[key] = tone_map
+            self._apply_glass(key, photo, color)
+        for key, color in list(self._glass_colors.items()):
+            panel = getattr(self, "{0}_panel".format(key), None)
+            self._glass_tint_panel(
+                panel,
+                color,
+                tone_map=self._glass_tones.get(key),
+                area=self._glass_canvases.get(key),
+            )
+
+    def _wallpaper_failed(self, message):
+        self._clear_wallpaper_visuals()
+        self.say("背景图片渲染失败 // {0}".format(message))
+
+    def _clear_wallpaper_visuals(self):
+        self._wallpaper_token += 1
+        self._wallpaper_photos = None
+        canvas = getattr(self, "backdrop", None)
+        if canvas is not None:
+            try:
+                canvas.delete("wallpaper")
+            except Exception:
+                pass
+        banner = getattr(self, "banner", None)
+        if banner is not None:
+            try:
+                banner.delete("banner_bg")
+                self._banner_has_image = False
+                self._refresh_banner_text_colors()
+            except Exception:
+                pass
+        self._clear_glass()
+
+    def on_open_settings(self):
+        if self._settings_win is not None:
+            try:
+                self._settings_win.deiconify()
+                self._settings_win.lift()
+                self._settings_win.focus_force()
+                return
+            except Exception:
+                self._settings_win = None
+
+        win = tk.Toplevel(self.root)
+        win.title("SETTINGS // 启动器设置（外观 / 背景 / 内存 / 下载源）")
+        win.configure(bg=C_WHITE)
+        win.transient(self.root)
+        win.resizable(True, True)
+        win.protocol("WM_DELETE_WINDOW", self._close_settings)
+
+        wrap = tk.Frame(win, bg=C_WHITE, bd=1, relief="solid", padx=10, pady=10)
+        wrap.pack(fill="both", expand=True, padx=8, pady=8)
+
+        tk.Label(
+            wrap,
+            text=title_text("SETTINGS // GAME MEMORY + LAUNCHER APPEARANCE"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        ).pack(fill="x")
+
+        tk.Label(
+            wrap,
+            text="颜色点 [ 应用主题 ] 生效；背景 / 下载源点了就生效；内存点 [ 应用内存 ] 生效，全部写入 config.json。",
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+        ).pack(fill="x", pady=(6, 6))
+
+        # Scrolled body: the settings sheet is taller than a 660px window.
+        body_area = tk.Frame(wrap, bg=C_WHITE)
+        body_area.pack(fill="both", expand=True)
+        body_canvas = tk.Canvas(
+            body_area, bg=C_WHITE, highlightthickness=0, bd=0, height=430
+        )
+        body_bar = tk.Scrollbar(
+            body_area,
+            orient="vertical",
+            command=body_canvas.yview,
+            width=14,
+            bg=C_GRAY,
+            activebackground=C_TEAL,
+            troughcolor=C_WHITE,
+            bd=1,
+            relief="solid",
+            highlightthickness=0,
+        )
+        body_canvas.configure(yscrollcommand=body_bar.set)
+        body_canvas.pack(side="left", fill="both", expand=True)
+        body_bar.pack(side="right", fill="y")
+        scroll_body = tk.Frame(body_canvas, bg=C_WHITE)
+        body_canvas.create_window(
+            (0, 0), window=scroll_body, anchor="nw", tags="settings_body"
+        )
+        scroll_body.bind(
+            "<Configure>",
+            lambda _event: body_canvas.configure(
+                scrollregion=body_canvas.bbox("all")
+            ),
+        )
+        body_canvas.bind(
+            "<Configure>",
+            lambda event: body_canvas.itemconfigure(
+                "settings_body", width=max(1, event.width)
+            ),
+        )
+
+        def _settings_wheel(event):
+            step = -1 if getattr(event, "delta", 0) > 0 else 1
+            body_canvas.yview_scroll(step, "units")
+
+        for target in (body_canvas, scroll_body):
+            target.bind("<MouseWheel>", _settings_wheel)
+
+        wrap = scroll_body
+
+        wallpaper_box = tk.Frame(
+            wrap, bg=C_GRAY, bd=1, relief="solid", padx=6, pady=6
+        )
+        wallpaper_box.pack(fill="x", pady=(0, 8))
+        tk.Label(
+            wallpaper_box,
+            text=title_text("WALLPAPER // 启动器背景（铺满整个窗口）"),
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=4,
+            pady=2,
+        ).pack(fill="x", pady=(0, 4))
+
+        preview_row = tk.Frame(wallpaper_box, bg=C_GRAY)
+        preview_row.pack(fill="x")
+        self._settings_wallpaper_preview = tk.Label(
+            preview_row,
+            text="NO WALLPAPER",
+            bg=C_BLACK,
+            fg=C_WHITE,
+            font=FONT_SMALL,
+            width=30,
+            height=4,
+            bd=1,
+            relief="solid",
+            anchor="center",
+            justify="center",
+        )
+        self._settings_wallpaper_preview.pack(side="left", padx=(0, 8))
+        info_col = tk.Frame(preview_row, bg=C_GRAY)
+        info_col.pack(side="left", fill="both", expand=True)
+        self._settings_wallpaper_var = tk.StringVar(value="")
+        tk.Label(
+            info_col,
+            textvariable=self._settings_wallpaper_var,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            wraplength=430,
+        ).pack(fill="x")
+        wallpaper_actions = tk.Frame(info_col, bg=C_GRAY)
+        wallpaper_actions.pack(fill="x", pady=(6, 0))
+        self._mk_button(
+            wallpaper_actions, "[ 选择图片... ]", self._settings_pick_wallpaper, padx=6
+        ).pack(side="left", padx=(0, 6))
+        self._mk_button(
+            wallpaper_actions, "[ 清除背景 ]", self._settings_clear_wallpaper, padx=6
+        ).pack(side="left")
+
+        fit_row = tk.Frame(wallpaper_box, bg=C_GRAY)
+        fit_row.pack(fill="x", pady=(8, 0))
+        tk.Label(
+            fit_row,
+            text="显示方式",
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            width=8,
+            anchor="w",
+        ).pack(side="left")
+        self._settings_fit_var = tk.StringVar(
+            value=str(self.config.get("wallpaper_fit") or "cover")
+        )
+        for fit_text, fit_value in (("铺满裁切", "cover"), ("完整显示", "contain")):
+            tk.Radiobutton(
+                fit_row,
+                text=fit_text,
+                value=fit_value,
+                variable=self._settings_fit_var,
+                command=lambda chosen=fit_value: self._settings_apply_fit(chosen),
+                bg=C_GRAY,
+                fg=C_BLACK,
+                activebackground=C_GRAY,
+                activeforeground=C_BLACK,
+                selectcolor=C_WHITE,
+                font=FONT_SMALL,
+                anchor="w",
+                highlightthickness=0,
+                bd=0,
+            ).pack(side="left", padx=(0, 12))
+
+        dim_row = tk.Frame(wallpaper_box, bg=C_GRAY)
+        dim_row.pack(fill="x", pady=(4, 0))
+        tk.Label(
+            dim_row,
+            text="压暗",
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            width=8,
+            anchor="w",
+        ).pack(side="left")
+        try:
+            dim_now = int(self.config.get("wallpaper_dim") or 0)
+        except (TypeError, ValueError):
+            dim_now = 0
+        self._settings_dim_var = tk.IntVar(value=max(0, min(60, dim_now)))
+        self._settings_dim_scale = tk.Scale(
+            dim_row,
+            from_=0,
+            to=60,
+            orient="horizontal",
+            resolution=5,
+            variable=self._settings_dim_var,
+            showvalue=True,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            troughcolor=C_WHITE,
+            highlightthickness=0,
+            bd=1,
+            relief="solid",
+            font=FONT_SMALL,
+            sliderrelief="solid",
+            length=260,
+            command=self._settings_apply_dim,
+        )
+        self._settings_dim_scale.pack(side="left", fill="x", expand=True)
+        self._settings_dim_scale.bind(
+            "<ButtonRelease-1>", lambda _event: self._save_config()
+        )
+        tk.Label(
+            dim_row, text="%", bg=C_GRAY, fg=C_BLACK, font=FONT_SMALL
+        ).pack(side="left", padx=(4, 0))
+
+        alpha_row = tk.Frame(wallpaper_box, bg=C_GRAY)
+        alpha_row.pack(fill="x", pady=(4, 0))
+        tk.Label(
+            alpha_row,
+            text="面板透明",
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            width=8,
+            anchor="w",
+        ).pack(side="left")
+        self._settings_alpha_var = tk.IntVar(value=self._panel_alpha())
+        self._settings_alpha_scale = tk.Scale(
+            alpha_row,
+            from_=0,
+            to=60,
+            orient="horizontal",
+            resolution=5,
+            variable=self._settings_alpha_var,
+            showvalue=True,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            troughcolor=C_WHITE,
+            highlightthickness=0,
+            bd=1,
+            relief="solid",
+            font=FONT_SMALL,
+            sliderrelief="solid",
+            length=260,
+            command=self._settings_apply_panel_alpha,
+        )
+        self._settings_alpha_scale.pack(side="left", fill="x", expand=True)
+        self._settings_alpha_scale.bind(
+            "<ButtonRelease-1>", lambda _event: self._save_config()
+        )
+        tk.Label(
+            alpha_row, text="%", bg=C_GRAY, fg=C_BLACK, font=FONT_SMALL
+        ).pack(side="left", padx=(4, 0))
+        tk.Label(
+            wallpaper_box,
+            text=(
+                "背景铺满整个窗口（含标题条）；「面板透明」大于 0 时，左右两栏会变成"
+                "半透明磨砂玻璃，壁纸从按钮和列表的缝隙里透出来，调到 0 就是原来的"
+                "纯白面板。字看不清就把「压暗」拉大一点。"
+            ),
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            wraplength=580,
+        ).pack(fill="x", pady=(4, 0))
+
+        style_box = tk.Frame(
+            wrap, bg=C_GRAY, bd=1, relief="solid", padx=6, pady=6
+        )
+        style_box.pack(fill="x", pady=(0, 6))
+        tk.Label(
+            style_box,
+            text=title_text("STYLE // 界面风格（矢量风是测试样式）"),
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+        ).pack(fill="x", pady=(0, 4))
+        style_row = tk.Frame(style_box, bg=C_GRAY)
+        style_row.pack(fill="x")
+        for index, style_name in enumerate(UI_STYLES):
+            style_row.columnconfigure(index, weight=1, uniform="style")
+            self._mk_button(
+                style_row,
+                "[ {0}{1} ]".format(
+                    UI_STYLE_LABELS.get(style_name, style_name),
+                    " *" if self.ui_style == style_name else "",
+                ),
+                lambda chosen=style_name: self.on_choose_ui_style(chosen),
+                font=FONT_SMALL,
+            ).grid(row=0, column=index, sticky="ew", padx=2)
+        palette_row = tk.Frame(style_box, bg=C_GRAY)
+        palette_row.pack(fill="x", pady=(4, 0))
+        tk.Label(
+            palette_row, text="矢量风配色", bg=C_GRAY, fg=C_BLACK, font=FONT_SMALL
+        ).pack(side="left", padx=(0, 6))
+        for palette_name, palette_label in (
+            ("indigo", "靛蓝"),
+            ("aurora", "极光绿"),
+            ("sunset", "晚霞橙"),
+        ):
+            self._mk_button(
+                palette_row,
+                "[ {0}{1} ]".format(
+                    palette_label,
+                    " *" if self.ui_palette == palette_name else "",
+                ),
+                lambda chosen=palette_name: self.on_choose_ui_style(
+                    "vector", chosen
+                ),
+                font=FONT_SMALL,
+                padx=6,
+                pady=1,
+            ).pack(side="left", padx=2)
+        tk.Label(
+            style_box,
+            text=(
+                "矢量风 = 圆角卡片 + 无边框按钮 + 圆角标题条（B0.5 测试中）；"
+                "配色三选一，随时可以切回 1985 复古。切换后字体族在重启时完全生效。"
+            ),
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            wraplength=580,
+        ).pack(fill="x", pady=(4, 0))
+
+        preset_box = tk.Frame(
+            wrap, bg=C_GRAY, bd=1, relief="solid", padx=6, pady=6
+        )
+        preset_box.pack(fill="x")
+        tk.Label(
+            preset_box,
+            text=title_text("PRESETS // 颜色预设"),
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+        ).pack(fill="x", pady=(0, 4))
+        preset_row = tk.Frame(preset_box, bg=C_GRAY)
+        preset_row.pack(fill="x")
+        for index, (preset_name, _preset) in enumerate(THEME_PRESETS):
+            for column in range(5):
+                preset_row.columnconfigure(column, weight=1, uniform="preset")
+            self._mk_button(
+                preset_row,
+                "[ {0} ]".format(preset_name),
+                lambda chosen=preset_name: self._settings_apply_preset(chosen),
+                font=FONT_SMALL,
+                padx=3,
+                pady=2,
+            ).grid(
+                row=index // 5,
+                column=index % 5,
+                sticky="ew",
+                padx=2,
+                pady=2,
+            )
+        tk.Label(
+            preset_box,
+            text="下半排为深色预设（深夜蓝 / 暗夜青 / 午夜紫 / 石墨黑）",
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+        ).pack(fill="x", pady=(4, 0))
+
+        field_box = tk.Frame(
+            wrap, bg=C_WHITE, bd=1, relief="solid", padx=6, pady=6
+        )
+        field_box.pack(fill="x", pady=(8, 0))
+        tk.Label(
+            field_box,
+            text=title_text("CUSTOM // 自定义颜色"),
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+        ).grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 4))
+        field_box.columnconfigure(1, weight=1)
+
+        self._settings_vars = {}
+        self._settings_swatches = {}
+        rows = [
+            ("accent", "主强调色", "标题栏 / 按钮悬停 / 选中项"),
+            ("surface", "主背景色", "窗口与内容区底色"),
+            ("secondary", "次背景色", "状态栏 / 分组面板"),
+            ("text", "文字颜色", "正文与列表文字"),
+        ]
+        for index, (key, label, hint) in enumerate(rows, start=1):
+            tk.Label(
+                field_box,
+                text=label,
+                bg=C_WHITE,
+                fg=C_BLACK,
+                font=FONT_MAIN,
+                anchor="w",
+                width=10,
+            ).grid(row=index, column=0, sticky="w", pady=2)
+            value = str(self.theme.get(key, DEFAULT_THEME[key]))
+            var = tk.StringVar(value=value)
+            self._settings_vars[key] = var
+            tk.Entry(
+                field_box,
+                textvariable=var,
+                font=FONT_MAIN,
+                bg=C_WHITE,
+                fg=C_BLACK,
+                insertbackground=C_BLACK,
+                relief="solid",
+                bd=1,
+                highlightthickness=0,
+            ).grid(
+                row=index,
+                column=1,
+                sticky="ew",
+                padx=(0, 6),
+                pady=2,
+                ipady=2,
+            )
+            swatch = tk.Label(
+                field_box,
+                text="",
+                bg=value,
+                width=4,
+                bd=1,
+                relief="solid",
+            )
+            swatch.grid(row=index, column=2, padx=(0, 6), pady=2)
+            self._settings_swatches[key] = swatch
+            self._mk_button(
+                field_box,
+                "[ 选择 ]",
+                lambda target=key: self._settings_pick_color(target),
+                padx=5,
+            ).grid(row=index, column=3, padx=(0, 6), pady=2)
+            tk.Label(
+                field_box,
+                text=hint,
+                bg=C_WHITE,
+                fg=C_BLACK,
+                font=FONT_SMALL,
+                anchor="w",
+            ).grid(row=index, column=4, sticky="w", pady=2)
+            var.trace_add("write", self._settings_update_preview)
+
+        look_box = tk.Frame(wrap, bg=C_GRAY, bd=1, relief="solid", padx=6, pady=6)
+        look_box.pack(fill="x", pady=(8, 0))
+        tk.Label(
+            look_box,
+            text=title_text("DOWNLOAD SOURCE // 下载源（镜像通常快很多）"),
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+        ).pack(fill="x", pady=(0, 4))
+        self._settings_source_var = tk.StringVar(
+            value=str(self.config.get("download_source") or "mirror")
+        )
+        source_row = tk.Frame(look_box, bg=C_GRAY)
+        source_row.pack(fill="x")
+        for source_text, source_value in VANILLA_SOURCE_CHOICES:
+            tk.Radiobutton(
+                source_row,
+                text=source_text,
+                value=source_value,
+                variable=self._settings_source_var,
+                command=lambda chosen=source_value: self.on_change_download_source(
+                    chosen
+                ),
+                bg=C_GRAY,
+                fg=C_BLACK,
+                activebackground=C_GRAY,
+                activeforeground=C_BLACK,
+                selectcolor=C_WHITE,
+                font=FONT_MAIN,
+                anchor="w",
+                highlightthickness=0,
+                bd=0,
+            ).pack(side="left", padx=(0, 10))
+
+        self._settings_mini_var = tk.BooleanVar(
+            value=bool(self.config.get("mini_game_prompt", True))
+        )
+        tk.Checkbutton(
+            look_box,
+            text=" 下载 / 启动时提示小游戏（经典贪吃蛇）",
+            variable=self._settings_mini_var,
+            command=self._settings_apply_mini_prompt,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            activebackground=C_GRAY,
+            activeforeground=C_BLACK,
+            selectcolor=C_WHITE,
+            font=FONT_SMALL,
+            anchor="w",
+            highlightthickness=0,
+            bd=0,
+        ).pack(fill="x", pady=(6, 0))
+
+        memory_box = tk.Frame(
+            wrap, bg=C_GRAY, bd=1, relief="solid", padx=6, pady=6
+        )
+        memory_box.pack(fill="x", pady=(8, 0))
+        memory_head = tk.Frame(memory_box, bg=C_GRAY)
+        memory_head.pack(fill="x", pady=(0, 4))
+        tk.Label(
+            memory_head,
+            text=title_text("GAME MEMORY // 游戏内存分配"),
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+        ).pack(side="left")
+        ram_mb = total_ram_mb()
+        tk.Label(
+            memory_head,
+            text="物理内存: {0}".format(
+                "{0} GB".format(int(ram_mb / 1024)) if ram_mb else "未知"
+            ),
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="e",
+        ).pack(side="right")
+
+        memory_now = normalize_memory_config(self.config.get("memory"), ram_mb)
+        slider_max = max(8, int((ram_mb or 8192) / 1024))
+        self._memory_min_var = tk.IntVar(
+            value=max(1, int(round(memory_now["min_mb"] / 1024)))
+        )
+        self._memory_max_var = tk.IntVar(
+            value=max(1, int(round(memory_now["max_mb"] / 1024)))
+        )
+        self._memory_hint_var = tk.StringVar(value="")
+        for label, var in (
+            ("最小堆 -Xms", self._memory_min_var),
+            ("最大堆 -Xmx", self._memory_max_var),
+        ):
+            line = tk.Frame(memory_box, bg=C_GRAY)
+            line.pack(fill="x", pady=1)
+            tk.Label(
+                line,
+                text=label,
+                bg=C_GRAY,
+                fg=C_BLACK,
+                font=FONT_MAIN,
+                width=11,
+                anchor="w",
+            ).pack(side="left")
+            tk.Scale(
+                line,
+                from_=1,
+                to=slider_max,
+                orient="horizontal",
+                resolution=1,
+                variable=var,
+                showvalue=True,
+                bg=C_GRAY,
+                fg=C_BLACK,
+                troughcolor=C_WHITE,
+                highlightthickness=0,
+                bd=1,
+                relief="solid",
+                font=FONT_SMALL,
+                sliderrelief="solid",
+                length=380,
+            ).pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        memory_row = tk.Frame(memory_box, bg=C_GRAY)
+        memory_row.pack(fill="x", pady=(4, 0))
+        for gb in (2, 4, 8, 16):
+            self._mk_button(
+                memory_row,
+                "[ {0}G ]".format(gb),
+                lambda value=gb: self._settings_memory_preset(value),
+                padx=4,
+            ).pack(side="left", expand=True, fill="x", padx=2)
+        self._mk_button(
+            memory_row, "[ 推荐 ]", self._settings_memory_recommend, padx=4
+        ).pack(side="left", expand=True, fill="x", padx=2)
+        self._mk_button(
+            memory_row, "[ 应用内存 ]", self._settings_apply_memory, padx=4
+        ).pack(side="left", expand=True, fill="x", padx=2)
+
+        tk.Label(
+            memory_box,
+            textvariable=self._memory_hint_var,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            wraplength=740,
+        ).pack(fill="x", pady=(4, 0))
+        for memory_var in (self._memory_min_var, self._memory_max_var):
+            memory_var.trace_add("write", lambda *_args: self._settings_memory_hint())
+        self._settings_memory_hint()
+
+        jvm_box = tk.Frame(wrap, bg=C_WHITE, bd=1, relief="solid", padx=6, pady=6)
+        jvm_box.pack(fill="x", pady=(8, 0))
+        tk.Label(
+            jvm_box,
+            text=title_text("JVM // 启动参数（进阶，追加在 -Xms/-Xmx 之后）"),
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+        ).pack(fill="x", pady=(0, 4))
+        self._settings_jvm_var = tk.StringVar(
+            value=str(self.config.get("jvm_args") or "")
+        )
+        tk.Entry(
+            jvm_box,
+            textvariable=self._settings_jvm_var,
+            font=FONT_SMALL,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            insertbackground=C_BLACK,
+            relief="solid",
+            bd=1,
+            highlightthickness=0,
+        ).pack(fill="x", ipady=3, ipadx=4)
+        jvm_row = tk.Frame(jvm_box, bg=C_WHITE)
+        jvm_row.pack(fill="x", pady=(4, 0))
+        for preset_label, preset_value in JVM_PRESETS:
+            self._mk_button(
+                jvm_row,
+                "[ {0} ]".format(preset_label),
+                lambda value=preset_value: self._settings_jvm_var.set(value),
+                font=FONT_SMALL,
+                padx=4,
+                pady=1,
+            ).pack(side="left", fill="x", expand=True, padx=2)
+        self._mk_button(
+            jvm_row, "[ 保存参数 ]", self._settings_apply_jvm, font=FONT_SMALL, padx=4, pady=1
+        ).pack(side="left", fill="x", expand=True, padx=2)
+        tk.Label(
+            jvm_box,
+            text="留空 = 只用内存参数；预设来自社区常用 G1 调优，冲突时以你填的为准。",
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            wraplength=740,
+        ).pack(fill="x", pady=(4, 0))
+
+        preview_box = tk.Frame(
+            wrap, bg=C_GRAY, bd=1, relief="solid", padx=6, pady=6
+        )
+        preview_box.pack(fill="both", expand=True, pady=(8, 0))
+        tk.Label(
+            preview_box,
+            text=title_text("PREVIEW // 实时预览"),
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+        ).pack(fill="x", pady=(0, 4))
+        preview = tk.Frame(preview_box, bg=C_WHITE, bd=1, relief="solid")
+        preview.pack(fill="both", expand=True)
+        preview_title = tk.Label(
+            preview,
+            text=title_text("AKM // LAUNCHER PREVIEW"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=4,
+        )
+        preview_title.pack(fill="x")
+        preview_body = tk.Frame(preview, bg=C_WHITE, padx=8, pady=8)
+        preview_body.pack(fill="both", expand=True)
+        preview_text = tk.Label(
+            preview_body,
+            text="启动器主页颜色实时预览 // Surface / Secondary / Text",
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+        )
+        preview_text.pack(fill="x")
+        sample_row = tk.Frame(preview_body, bg=C_WHITE)
+        sample_row.pack(fill="x", pady=(6, 0))
+        preview_button = tk.Label(
+            sample_row,
+            text="[ 启动游戏 ]",
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            bd=1,
+            relief="solid",
+            padx=8,
+            pady=2,
+        )
+        preview_button.pack(side="left", padx=(0, 6))
+        preview_select = tk.Label(
+            sample_row,
+            text="选中项 // SELECTED",
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_MAIN,
+            bd=1,
+            relief="solid",
+            padx=8,
+            pady=2,
+        )
+        preview_select.pack(side="left")
+        self._settings_preview = {
+            "frame": preview_body,
+            "title": preview_title,
+            "text": preview_text,
+            "button": preview_button,
+            "select": preview_select,
+        }
+
+        button_row = tk.Frame(wrap, bg=C_WHITE)
+        button_row.pack(fill="x", pady=(8, 0))
+        self._mk_button(
+            button_row, "[ 应用主题 ]", self._settings_apply
+        ).pack(side="left", expand=True, fill="x", padx=2)
+        self._mk_button(
+            button_row, "[ 恢复默认 ]", self._settings_reset
+        ).pack(side="left", expand=True, fill="x", padx=2)
+        self._mk_button(
+            button_row, "[ 关闭 ]", self._close_settings
+        ).pack(side="left", expand=True, fill="x", padx=2)
+
+        self._settings_win = win
+        self._settings_update_preview()
+        self._settings_refresh_wallpaper_ui()
+        win.update_idletasks()
+        pos_x = self.root.winfo_rootx() + max(
+            0, (self.root.winfo_width() - win.winfo_reqwidth()) // 2
+        )
+        pos_y = self.root.winfo_rooty() + max(
+            0, (self.root.winfo_height() - win.winfo_reqheight()) // 2
+        )
+        win.geometry("+{0}+{1}".format(pos_x, pos_y))
+        win.minsize(760, 560)
+        self.say("设置已打开 // 背景 / 颜色 / 内存 / 下载源都在这里")
+
+
+
+    def _settings_apply_mini_prompt(self):
+        var = getattr(self, "_settings_mini_var", None)
+        if var is None:
+            return
+        enabled = bool(var.get())
+        self.config["mini_game_prompt"] = enabled
+        self._save_config()
+        try:
+            if self._mini_game_var is not None:
+                self._mini_game_var.set(enabled)
+        except Exception:
+            pass
+        self.say(
+            "小游戏提示 // {0}".format("已开启" if enabled else "已关闭")
+        )
+
+    def _settings_apply_jvm(self):
+        var = getattr(self, "_settings_jvm_var", None)
+        if var is None:
+            return
+        raw = " ".join(str(var.get() or "").split())
+        self.config["jvm_args"] = raw
+        self._save_config()
+        count = len(self._extra_jvm_arguments())
+        self.say(
+            "JVM 参数已保存 // {0} 项{1}".format(
+                count, "" if count else "（仅使用内存参数）"
+            )
+        )
+
+    def _settings_pick_wallpaper(self):
+        self.on_pick_wallpaper()
+        self._settings_refresh_wallpaper_ui()
+
+    def _settings_clear_wallpaper(self):
+        self.on_clear_wallpaper()
+        self._settings_refresh_wallpaper_ui()
+
+    def _settings_apply_fit(self, value):
+        value = str(value or "cover").lower()
+        if value not in ("cover", "contain"):
+            value = "cover"
+        self.config["wallpaper_fit"] = value
+        self._save_config()
+        self._settings_refresh_wallpaper_ui()
+        self._schedule_wallpaper_refresh(220)
+        self.say("背景显示方式 // {0}".format("铺满裁切" if value == "cover" else "完整显示"))
+
+    def _settings_apply_panel_alpha(self, value=None):
+        try:
+            alpha = int(float(value if value is not None else self._settings_alpha_var.get()))
+        except (TypeError, ValueError):
+            alpha = 0
+        alpha = max(0, min(60, alpha))
+        try:
+            if int(self.config.get("panel_alpha") or 0) == alpha:
+                return
+        except (TypeError, ValueError):
+            pass
+        self.config["panel_alpha"] = alpha
+        self._settings_refresh_wallpaper_ui()
+        self._schedule_wallpaper_refresh(320)
+
+    def _settings_apply_dim(self, value=None):
+        try:
+            dim = int(float(value if value is not None else self._settings_dim_var.get()))
+        except (TypeError, ValueError):
+            dim = 0
+        dim = max(0, min(60, dim))
+        if int(self.config.get("wallpaper_dim") or 0) == dim:
+            return
+        self.config["wallpaper_dim"] = dim
+        self._settings_refresh_wallpaper_ui()
+        self._schedule_wallpaper_refresh(320)
+
+    def _settings_refresh_wallpaper_ui(self):
+        path, fit, dim = self._wallpaper_options()
+        var = getattr(self, "_settings_wallpaper_var", None)
+        preview = getattr(self, "_settings_wallpaper_preview", None)
+        self._settings_preview_photo = None
+        if var is not None:
+            try:
+                if path and os.path.isfile(path):
+                    var.set(
+                        "当前 // {0}  ({1})\n显示方式 // {2}　压暗 // {3}%　面板透明 // {4}%".format(
+                            os.path.basename(path),
+                            format_bytes(os.path.getsize(path)),
+                            "铺满裁切" if fit == "cover" else "完整显示",
+                            dim,
+                            self._panel_alpha(),
+                        )
+                    )
+                else:
+                    var.set(
+                        "当前 // 未设置背景（默认纯白）\n"
+                        "点 [ 选择图片... ] 挑一张图，立刻铺满整个窗口"
+                    )
+            except Exception:
+                pass
+        if preview is None:
+            return
+        if not path or not os.path.isfile(path):
+            self._settings_preview_photo = None
+            self._settings_preview_key = None
+            try:
+                preview.configure(image="", text="NO WALLPAPER")
+            except Exception:
+                pass
+            return
+        # Only re-render when the image / fit / dim actually changed: dragging the
+        # "panel opacity" slider must not queue another GDI+ thumbnail render.
+        key = (path, fit, dim)
+        if (
+            key == getattr(self, "_settings_preview_key", None)
+            and getattr(self, "_settings_preview_photo", None) is not None
+        ):
+            return
+        try:
+            thumb = tk.PhotoImage(
+                data=wallpaper_photo_data(path, 232, 76, dim / 100.0, fit, C_WHITE)
+            )
+            self._settings_preview_photo = thumb
+            self._settings_preview_key = key
+            preview.configure(image=thumb, text="")
+        except Exception:
+            self._settings_preview_key = None
+            try:
+                preview.configure(image="", text="PREVIEW FAILED")
+            except Exception:
+                pass
+
+    def _settings_apply_preset(self, preset_name):
+        for name, preset in THEME_PRESETS:
+            if name != preset_name:
+                continue
+            for key, var in self._settings_vars.items():
+                if key in preset:
+                    var.set(preset[key])
+            self.say(
+                "已载入颜色预设: {0} // 点击 [应用主题] 生效".format(name)
+            )
+            return
+
+    def _settings_pick_color(self, key):
+        var = self._settings_vars.get(key)
+        if var is None:
+            return
+        if colorchooser is None:
+            messagebox.showerror(
+                "调色板不可用", "当前 Python 缺少 tkinter.colorchooser。", parent=self.root
+            )
+            return
+        current = str(var.get() or "").strip()
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", current):
+            current = DEFAULT_THEME.get(key, "#FFFFFF")
+        labels = {
+            "accent": "主强调色",
+            "surface": "主背景色",
+            "secondary": "次背景色",
+            "text": "文字颜色",
+        }
+        try:
+            _rgb, chosen = colorchooser.askcolor(
+                color=current,
+                title="选择{0}".format(labels.get(key, key)),
+                parent=self._settings_win or self.root,
+            )
+        except Exception as exc:
+            messagebox.showerror("调色板失败", str(exc), parent=self.root)
+            return
+        if chosen:
+            var.set(str(chosen).upper())
+
+    def _settings_read_theme(self):
+        if not self._settings_vars:
+            return normalize_theme(self.theme)
+        labels = {
+            "accent": "主强调色",
+            "surface": "主背景色",
+            "secondary": "次背景色",
+            "text": "文字颜色",
+        }
+        theme = {}
+        for key, var in self._settings_vars.items():
+            value = str(var.get() or "").strip()
+            if not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+                messagebox.showerror(
+                    "颜色格式无效",
+                    "{0} 必须是 #RRGGBB（例如 #008080）。".format(
+                        labels.get(key, key)
+                    ),
+                    parent=self._settings_win or self.root,
+                )
+                return None
+            theme[key] = value.upper()
+        return normalize_theme(theme)
+
+    def _settings_update_preview(self, *_args):
+        preview = self._settings_preview
+        if not preview:
+            return
+        values = {}
+        for key, var in self._settings_vars.items():
+            value = str(var.get() or "").strip()
+            valid = bool(re.fullmatch(r"#[0-9a-fA-F]{6}", value))
+            if valid and key in self._settings_swatches:
+                try:
+                    self._settings_swatches[key].configure(bg=value)
+                except Exception:
+                    pass
+            values[key] = value if valid else DEFAULT_THEME.get(key, "#FFFFFF")
+        theme = normalize_theme(values)
+        try:
+            preview["frame"].configure(bg=theme["surface"])
+            preview["title"].configure(
+                bg=theme["accent"], fg=theme["surface"]
+            )
+            preview["text"].configure(
+                bg=theme["surface"], fg=theme["text"]
+            )
+            preview["button"].configure(
+                bg=theme["secondary"], fg=theme["text"]
+            )
+            preview["select"].configure(
+                bg=theme["accent"], fg=theme["surface"]
+            )
+        except Exception:
+            pass
+
+    def _settings_apply(self):
+        theme = self._settings_read_theme()
+        if theme is None:
+            return
+        self._apply_theme(theme)
+        self._close_settings()
+        self.say(
+            "主题已应用并保存 // 强调 {0} / 主背景 {1} / 次背景 {2} / 文字 {3}".format(
+                theme["accent"],
+                theme["surface"],
+                theme["secondary"],
+                theme["text"],
+            )
+        )
+
+    def _settings_reset(self):
+        for key, var in self._settings_vars.items():
+            var.set(DEFAULT_THEME.get(key, "#FFFFFF"))
+        self.say("已恢复默认颜色 // 点击 [应用主题] 生效")
+
+    def _close_settings(self):
+        win = self._settings_win
+        self._settings_win = None
+        self._settings_vars = {}
+        self._settings_swatches = {}
+        self._settings_preview = {}
+        self._settings_wallpaper_var = None
+        self._settings_wallpaper_preview = None
+        self._settings_fit_var = None
+        self._settings_dim_var = None
+        self._settings_preview_photo = None
+        self._settings_jvm_var = None
+        self._settings_mini_var = None
+        self._settings_source_var = None
+        self._memory_min_var = None
+        self._memory_max_var = None
+        self._memory_hint_var = None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+    def on_reset_theme(self):
+        self._close_settings()
+        self._apply_theme(dict(DEFAULT_THEME))
+        self.say("已恢复默认主题 // 经典青蓝")
+
+    def _apply_theme(self, theme):
+        normalized = normalize_theme(theme)
+        mapping = {
+            C_WHITE.upper(): normalized["surface"],
+            C_GRAY.upper(): normalized["secondary"],
+            C_TEAL.upper(): normalized["accent"],
+            C_BLACK.upper(): normalized["text"],
+        }
+        set_global_theme(normalized)
+        self.theme = normalized
+        self.config["theme"] = dict(normalized)
+        self._save_config()
+        backdrop = getattr(self, "backdrop", None)
+        if backdrop is not None:
+            try:
+                backdrop.configure(bg=C_WHITE)
+            except Exception:
+                pass
+        banner = getattr(self, "banner", None)
+        if banner is not None:
+            try:
+                banner.configure(bg=C_TEAL, highlightbackground=C_BLACK)
+            except Exception:
+                pass
+            self._refresh_banner_text_colors()
+        try:
+            self.root.configure(bg=C_WHITE)
+            for pattern, value in (
+                ("*Background", C_GRAY),
+                ("*Foreground", C_BLACK),
+                ("*selectBackground", C_TEAL),
+                ("*selectForeground", C_WHITE),
+                ("*activeBackground", C_GRAY),
+                ("*activeForeground", C_BLACK),
+                ("*troughColor", C_WHITE),
+                ("*highlightBackground", C_GRAY),
+            ):
+                self.root.option_add(pattern, value)
+        except Exception:
+            pass
+        self._recolor_widget_tree(self.root, mapping)
+        for menu in self._all_menus:
+            try:
+                menu.configure(
+                    bg=C_GRAY,
+                    fg=C_BLACK,
+                    activebackground=C_TEAL,
+                    activeforeground=C_WHITE,
+                )
+            except Exception:
+                pass
+            try:
+                menu.configure(selectcolor=C_WHITE)
+            except Exception:
+                pass
+        if getattr(self, "launch_state_label", None) is not None:
+            try:
+                self._set_launch_state(
+                    self.launch_state_var.get(), self._launch_state_mode
+                )
+            except Exception:
+                pass
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
+        if getattr(self, "_wallpaper_photos", None) is not None:
+            self._schedule_wallpaper_refresh(240)
+
+    def _recolor_widget_tree(self, widget, mapping):
+        if not mapping:
+            return
+        options = (
+            "background",
+            "foreground",
+            "activebackground",
+            "activeforeground",
+            "selectbackground",
+            "selectforeground",
+            "troughcolor",
+            "disabledbackground",
+            "disabledforeground",
+            "insertbackground",
+            "highlightbackground",
+            "highlightcolor",
+            "selectcolor",
+        )
+        for option in options:
+            try:
+                value = widget.cget(option)
+            except Exception:
+                continue
+            key = str(value).strip().upper()
+            target = mapping.get(key)
+            if target:
+                try:
+                    widget.configure(**{option: target})
+                except Exception:
+                    pass
+        try:
+            children = widget.winfo_children()
+        except Exception:
+            return
+        for child in children:
+            self._recolor_widget_tree(child, mapping)
+
+    # -- system actions ------------------------------------------------------
+
+    def _bind_shortcuts(self):
+        try:
+            self.root.bind("<Control-f>", self._focus_search)
+            self.root.bind("<Control-F>", self._focus_search)
+            self.root.bind("<F5>", lambda _event: self.refresh_hot())
+        except Exception:
+            pass
+
+    def _focus_search(self, _event=None):
+        try:
+            self.search_entry.focus_set()
+            self.search_entry.select_range(0, "end")
+        except Exception:
+            pass
+        return "break"
+
+    def _update_window_title(self):
+        if current_language() == "zh":
+            self.root.title(
+                "AKM 启动器 // {0} {1}".format(
+                    self.mc_version, self.mod_loader.upper()
+                )
+            )
+            return
+        self.root.title(
+            "AKM Launcher // {0} {1}".format(
+                self.mc_version, self.mod_loader.upper()
+            )
+        )
+
+    def _open_folder(self, path):
+        ensure_dir(path)
+        try:
+            if os.name == "nt":
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+            self.say("已打开目录: {0}".format(path))
+        except Exception as exc:
+            messagebox.showerror(
+                "无法打开目录", "{0}\n\n{1}".format(path, exc), parent=self.root
+            )
+
+    def on_open_base_dir(self):
+        self._open_folder(BASE_DIR)
+
+    def on_open_game_dir(self):
+        if self.isolation_enabled() and self.isolated_version():
+            self._open_folder(self.ensure_isolation_dirs())
+            return
+        self._open_folder(self.mc_dir)
+
+    def on_open_mods_dir(self):
+        if self.isolation_enabled() and self.isolated_version():
+            self._open_folder(self.effective_mods_dir())
+            return
+        self._open_folder(self.mods_dir)
+
+    def on_open_logs(self):
+        self._open_folder(LOG_DIR)
+
+    def on_reload_config(self):
+        if self._vanilla_downloading or self._loader_installing:
+            messagebox.showwarning(
+                "安装进行中",
+                "安装期间不能重新载入配置，请先取消下载。",
+                parent=self.root,
+            )
+            return
+        self.config = ensure_config()
+        self.auth = ensure_auth()
+        self.alias = ensure_alias()
+        self.mc_dir = resolve_path(self.config.get("minecraft_dir"))
+        self.mods_dir = os.path.join(self.mc_dir, "mods")
+        ensure_dir(self.mods_dir)
+        self._login_flow = str(self.config.get("auth_flow") or "browser")
+        self.version_var.set(self.mc_version)
+        self.loader_var.set(self.mod_loader)
+        source_now = str(self.config.get("download_source") or "mirror").lower()
+        if source_now not in {"mirror", "auto", "official"}:
+            source_now = "mirror"
+        try:
+            self._source_var.set(source_now)
+        except Exception:
+            pass
+        self._refresh_wallpaper()
+        if self._isolation_var is not None:
+            self._isolation_var.set(bool(self.config.get("version_isolation")))
+        self._refresh_isolation_label()
+        if self._shelf_loader_var is not None:
+            self._shelf_loader_value = str(
+                self.config.get("mod_filter_loader") or "auto"
+            )
+            self._shelf_loader_var.set(self._shelf_loader_value)
+        self._refresh_shelf_label()
+        self._update_window_title()
+        self._refresh_identity()
+        self.refresh_versions()
+        self.say("配置 / 词库 / 授权已重新载入")
+        self.refresh_hot()
+
+    def on_change_version(self, version):
+        version = str(version)
+        self.config["mc_version"] = version
+        self.config["loader_version"] = ""
+        self.version_var.set(version)
+        self._save_config()
+        self._update_window_title()
+        self._refresh_shelf_label()
+        self._refresh_version_bar()
+        self.say("版本切片已切换 -> {0} // 重新装载榜单".format(version))
+        self.refresh_hot()
+
+    def on_change_loader(self, loader):
+        loader = str(loader)
+        self.config["loader"] = loader
+        self.config["loader_version"] = ""
+        self.loader_var.set(loader)
+        self._save_config()
+        self._update_window_title()
+        self._refresh_shelf_label()
+        self._refresh_version_bar()
+        self.say("加载器已切换 -> {0} // 重新装载榜单".format(loader))
+        self.refresh_hot()
+
+    def on_install_dependency(self):
+        if getattr(sys, "frozen", False):
+            try:
+                import minecraft_launcher_lib  # noqa: F401
+
+                bundled = "已内置"
+            except Exception:
+                bundled = "未内置"
+            self.say("EXE 依赖检查: minecraft-launcher-lib {0}".format(bundled))
+            messagebox.showinfo(
+                "依赖状态",
+                "当前运行的是打包 EXE。\n"
+                "minecraft-launcher-lib: {0}\n\n"
+                "EXE 版本无需 pip；若缺失请重新打包并带上 --collect-all "
+                "minecraft-launcher-lib。".format(bundled),
+                parent=self.root,
+            )
+            return
+        self.say("启动 pip 安装序列: minecraft-launcher-lib")
+        threading.Thread(target=self._pip_worker, daemon=True).start()
+
+    def _pip_worker(self):
+        command = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "minecraft-launcher-lib",
+        ]
+        tail = []
+        try:
+            flags = 0x08000000 if os.name == "nt" else 0
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=flags,
+            )
+            if process.stdout is not None:
+                for line in process.stdout:
+                    text = line.strip()
+                    if not text:
+                        continue
+                    tail.append(text)
+                    if len(tail) > 6:
+                        tail.pop(0)
+                    self.say("pip :: {0}".format(text[:150]))
+            code = process.wait()
+            if code == 0:
+                self.say("minecraft-launcher-lib 安装完成")
+                self.post(
+                    lambda: messagebox.showinfo(
+                        "依赖已就绪",
+                        "minecraft-launcher-lib 安装 / 更新完成，可以点火起飞。",
+                        parent=self.root,
+                    )
+                )
+            else:
+                self.say("pip 退出码 {0}".format(code))
+                detail = "\n".join(tail[-6:]) or "(无输出)"
+                self.post(
+                    lambda msg=detail: messagebox.showerror(
+                        "依赖安装失败",
+                        "pip 返回非零退出码。\n\n{0}".format(msg),
+                        parent=self.root,
+                    )
+                )
+        except Exception as exc:
+            log_debug("pip failed:\n" + traceback.format_exc())
+            self.say("依赖安装异常: {0}".format(exc))
+            message = str(exc)
+            self.post(
+                lambda msg=message: messagebox.showerror(
+                    "依赖安装失败", msg, parent=self.root
+                )
+            )
+
+
+    # -- sponsor / about / shutdown -----------------------------------------
+
+    def _donate_payload_bytes(self):
+        """XOR-decrypt the embedded QR payload in RAM (never touches disk)."""
+        key = QR_CIPHER_KEY
+        data = ENCRYPTED_QR_DATA
+        if not key or not data:
+            return None, "NO PAYLOAD // 未找到加密载荷"
+        try:
+            key_bytes = bytes(key)
+            cipher = bytes(data)
+        except Exception:
+            return None, "PAYLOAD INVALID // 载荷整数列表损坏"
+        if not key_bytes or not cipher:
+            return None, "EMPTY PAYLOAD"
+        raw = bytes(
+            byte ^ key_bytes[index % len(key_bytes)]
+            for index, byte in enumerate(cipher)
+        )
+        if not raw.startswith(b"\x89PNG\r\n\x1a\n"):
+            return None, "INTEGRITY CHECK FAILED // 载荷校验失败"
+        expected = str(QR_PAYLOAD_SHA256 or "").strip().lower()
+        if expected:
+            actual = hashlib.sha256(raw).hexdigest()
+            if actual != expected:
+                return None, "SHA-256 MISMATCH // 载荷被篡改"
+        return raw, ""
+
+    def _donate_photo_image(self):
+        raw, error = self._donate_payload_bytes()
+        if raw is None:
+            return None, error
+        try:
+            encoded = base64.b64encode(raw).decode("ascii")
+            photo = tk.PhotoImage(data=encoded)
+        except Exception as exc:
+            return None, "RENDER FAILED // {0}".format(exc)
+        return photo, ""
+
+    def _bind_donate_hover(self, button, hover_bg, hover_fg=C_WHITE):
+        normal_bg = str(button.cget("bg"))
+        normal_fg = str(button.cget("fg"))
+
+        def on_enter(_event):
+            try:
+                button.configure(bg=hover_bg, fg=hover_fg, relief="sunken")
+            except Exception:
+                pass
+
+        def on_leave(_event):
+            try:
+                button.configure(bg=normal_bg, fg=normal_fg, relief="solid")
+            except Exception:
+                pass
+
+        button.bind("<Enter>", on_enter)
+        button.bind("<Leave>", on_leave)
+        try:
+            # Keep strong references so the callbacks survive garbage collection
+            # and can be exercised by tests.
+            button._akm_hover_enter = on_enter
+            button._akm_hover_leave = on_leave
+        except Exception:
+            pass
+
+    def _close_donate_dialog(self):
+        win = self._donate_win
+        self._donate_win = None
+        self._donate_photo = None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+    def _open_afdian(self):
+        try:
+            webbrowser.open(AFDIAN_URL)
+            self.say(">>> [SUPPLY] 已呼出浏览器 // {0}".format(AFDIAN_URL))
+        except Exception as exc:
+            messagebox.showerror(
+                "浏览器启动失败",
+                "{0}\n\n{1}".format(AFDIAN_URL, exc),
+                parent=self.root,
+            )
+
+    def on_sponsor(self):
+        self.show_donate_dialog()
+
+    def show_donate_dialog(self):
+        """Windows 1.0 style supply panel with the in-memory decrypted QR."""
+        win = self._donate_win
+        if win is not None:
+            try:
+                win.deiconify()
+                win.lift()
+                win.focus_force()
+                self.say(
+                    ">>> [SUPPLY] 已激活官方能量补给通道 (爱发电: {0})".format(
+                        AFDIAN_DISPLAY
+                    )
+                )
+                return
+            except Exception:
+                self._donate_win = None
+
+        self.say(
+            ">>> [SUPPLY] 已激活官方能量补给通道 (爱发电: {0})".format(
+                AFDIAN_DISPLAY
+            )
+        )
+
+        win = tk.Toplevel(self.root)
+        win.title("AKM // OFFICIAL SUPPLY CHANNEL")
+        win.configure(bg=C_WHITE)
+        win.resizable(False, False)
+        win.transient(self.root)
+        try:
+            win.attributes("-topmost", True)
+        except Exception:
+            pass
+        win.protocol("WM_DELETE_WINDOW", self._close_donate_dialog)
+
+        outer = tk.Frame(win, bg=C_WHITE, bd=1, relief="solid", padx=12, pady=12)
+        outer.pack(fill="both", expand=True, padx=8, pady=8)
+
+        tk.Label(
+            outer,
+            text=title_text("OFFICIAL SUPPLY CHANNEL // 官方能量补给"),
+            bg=C_TEAL,
+            fg=C_WHITE,
+            font=FONT_TITLE,
+            anchor="w",
+            padx=6,
+            pady=4,
+            bd=1,
+            relief="solid",
+        ).pack(fill="x")
+
+        photo, error = self._donate_photo_image()
+        if photo is not None:
+            try:
+                longest = max(int(photo.width()), int(photo.height()))
+                # Keep the QR at (almost) full size so it stays scannable.
+                factor = max(1, (longest + 559) // 560)
+                if factor > 1:
+                    photo = photo.subsample(factor, factor)
+            except Exception:
+                pass
+
+        image_box = tk.Frame(outer, bg=C_BLACK, bd=0, padx=1, pady=1)
+        image_box.pack(pady=(10, 6))
+        if photo is not None:
+            self._donate_photo = photo
+            tk.Label(image_box, image=photo, bg=C_WHITE, bd=0).pack()
+        else:
+            tk.Label(
+                image_box,
+                text="[ QR SIGNAL OFFLINE ]\n{0}".format(
+                    error or "NO PAYLOAD // 未找到加密载荷"
+                ),
+                bg=C_WHITE,
+                fg=C_BLACK,
+                font=FONT_MAIN,
+                width=30,
+                height=6,
+                justify="center",
+            ).pack()
+
+        tk.Label(
+            outer,
+            text=title_text("AFDIAN // 爱发电 : {0}".format(AFDIAN_DISPLAY)),
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_MAIN,
+            anchor="w",
+        ).pack(fill="x")
+        tk.Label(
+            outer,
+            text="扫码或点击下方按钮打开官方主页，感谢你为 AKM 补充能量。",
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            wraplength=320,
+        ).pack(fill="x", pady=(2, 0))
+
+        row = tk.Frame(outer, bg=C_WHITE)
+        row.pack(fill="x", pady=(10, 0))
+        go_button = tk.Button(
+            row,
+            text="[ 🌐 访问爱发电主页 ]",
+            command=self._open_afdian,
+            font=FONT_MAIN,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            activebackground=C_BLACK,
+            activeforeground=C_WHITE,
+            bd=1,
+            relief="solid",
+            padx=6,
+            pady=6,
+            cursor="hand2",
+        )
+        go_button.pack(side="left", expand=True, fill="x", padx=2)
+        close_button = tk.Button(
+            row,
+            text="[ 收到并关闭 ]",
+            command=self._close_donate_dialog,
+            font=FONT_MAIN,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            activebackground=C_TEAL,
+            activeforeground=C_WHITE,
+            bd=1,
+            relief="solid",
+            padx=6,
+            pady=6,
+            cursor="hand2",
+        )
+        close_button.pack(side="left", expand=True, fill="x", padx=2)
+        self._bind_donate_hover(go_button, C_BLACK)
+        self._bind_donate_hover(close_button, C_TEAL)
+
+        win.update_idletasks()
+        pos_x = self.root.winfo_rootx() + max(
+            0, (self.root.winfo_width() - win.winfo_width()) // 2
+        )
+        pos_y = self.root.winfo_rooty() + max(
+            0, (self.root.winfo_height() - win.winfo_height()) // 2
+        )
+        win.geometry("+{0}+{1}".format(pos_x, pos_y))
+        self._donate_win = win
+        try:
+            win.focus_force()
+        except Exception:
+            pass
+
+    def on_copy_sponsor(self):
+        url = str(self.config.get("afdian_url") or AFDIAN_URL).strip()
+        if not url:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(url)
+            self.say("赞助链接已复制: {0}".format(url))
+        except Exception as exc:
+            self.say("剪贴板失败: {0}".format(exc))
+
+    def on_about(self):
+        text = (
+            "AKM (Adaptive Kinetic Minecraft) Launcher v{0}\n"
+            "1985 WINDOWS 1.0 INDUSTRIAL SHELL\n"
+            "----------------------------------------\n"
+            "GUI      : tkinter / standard library only\n"
+            "NETWORK  : urllib + Modrinth v2 API\n"
+            "DOWNLOAD : ThreadPoolExecutor (4 lanes)\n"
+            "VANILLA  : official Mojang + BMCLAPI mirror\n"
+            "LOADERS  : Forge / NeoForge / Fabric / Quilt\n"
+            "PACKS    : Modrinth .mrpack 导入（自动装版本/加载器）\n"
+            "MODS     : 中文检索 + 版本栏筛选 + 加载器筛选\n"
+            "ISOLATE  : 版本隔离（每版本独立 mods / saves）\n"
+            "JAVA     : 内置 Temurin 8/11/17/21/25 一键下载\n"
+            "MEMORY   : -Xms / -Xmx 滑杆自由分配\n"
+            "LAUNCH   : minecraft-launcher-lib\n"
+            "AUTH     : Microsoft browser / device code + offline\n"
+            "GUIDE    : 顶部 [联机教程] 蓝盾 / 局域网联机步骤\n"
+            "TARGET   : {1} / {2}\n"
+            "GAME DIR : {3}\n"
+            "----------------------------------------\n"
+            "快捷键: 离线名输入框回车 = 点火 / Ctrl+F = 检索\n"
+            "       列表双击 = 直装 / 列表回车 = 直装\n"
+            "       搜索框回车 = 中文检索 / F5 = 刷新热门"
+        ).format(
+            app_version_tag(),
+            self.mc_version,
+            self.mod_loader,
+            self.effective_game_dir(),
+        )
+        messagebox.showinfo("关于 AKM Launcher", text, parent=self.root)
+
+    def on_diag(self):
+        try:
+            import importlib.util
+
+            has_mll = importlib.util.find_spec("minecraft_launcher_lib") is not None
+        except Exception:
+            has_mll = False
+        lines = [
+            "AKM {0} // 运行环境自检".format(app_version_tag()),
+            "----------------------------------------",
+            "程序目录 : {0}".format(BASE_DIR),
+            "游戏目录 : {0}".format(self.mc_dir),
+            "mods目录 : {0}".format(self.mods_dir),
+            "config   : {0}".format("OK" if os.path.exists(CONFIG_PATH) else "MISSING"),
+            "auth     : {0} ({1})".format(
+                "OK" if os.path.exists(AUTH_PATH) else "MISSING",
+                self.auth.get("mode", "offline"),
+            ),
+            "词库条目 : {0}".format(len(self.alias)),
+            "Python   : {0}".format(sys.version.split()[0]),
+            "Tk       : {0}".format(getattr(tk, "TkVersion", "?")),
+            "运行形态 : {0}".format("EXE (frozen)" if getattr(sys, "frozen", False) else "PYTHON SOURCE"),
+            "启动版本 : {0}".format(self.config.get("launch_version") or "(AUTO)"),
+            "启动依赖 : {0}".format("INSTALLED" if has_mll else "MISSING"),
+            "Java配置 : {0}".format(self.config.get("java") or "(自动检测)"),
+            "目标版本 : {0} / {1}".format(self.mc_version, self.mod_loader),
+            "当前身份 : {0}".format(
+                self.auth.get("ms_name")
+                if self.is_ms_mode
+                else self.auth.get("username") or "Steve"
+            ),
+        ]
+        messagebox.showinfo("运行环境自检", "\n".join(lines), parent=self.root)
+
+    def on_close(self):
+        if (
+            self._busy
+            or self._launching
+            or self._vanilla_downloading
+            or self._loader_installing
+        ):
+            if not messagebox.askyesno(
+                "退出 AKM",
+                "仍有网络任务、原版/加载器安装或点火序列在运行，确定退出吗？",
+                parent=self.root,
+            ):
+                return
+        self._vanilla_cancel.set()
+        self._loader_cancel.set()
+        self._device_cancel.set()
+        self._close_device_client_dialog()
+        self._close_device_dialog()
+        self._cancel_browser_dialog()
+        self._close_token_dialog()
+        self._close_accounts()
+        self._close_vanilla_dialog()
+        self._close_loader_dialog()
+        self._close_create_pack()
+        self._cancel_timers()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# 7. Self test (no GUI) and entry point
+# ---------------------------------------------------------------------------
+
+
+def run_selftest():
+    lines = []
+
+    def emit(text):
+        lines.append(text)
+        try:
+            if sys.stdout is not None:
+                print(text)
+        except Exception:
+            pass
+
+    emit("=" * 68)
+    emit("AKM LAUNCHER // SELFTEST")
+    emit("=" * 68)
+    config, auth, alias = bootstrap_files()
+    game_dir = resolve_path(config.get("minecraft_dir"))
+    mods_dir = os.path.join(game_dir, "mods")
+    ensure_dir(mods_dir)
+
+    emit("[EXE ] frozen       : {0}".format(bool(getattr(sys, "frozen", False))))
+    emit("[PATH] base dir     : {0}".format(BASE_DIR))
+    emit("[PATH] game dir     : {0}".format(game_dir))
+    emit("[PATH] mods dir     : {0}".format(mods_dir))
+    emit("[FILE] config.json  : {0}".format(CONFIG_PATH))
+    emit("[FILE] auth.json    : {0}".format(AUTH_PATH))
+    emit("[FILE] mod_alias    : {0}".format(ALIAS_PATH))
+    emit("[DATA] alias count  : {0}".format(len(alias)))
+    emit("[DATA] auth mode    : {0}".format(auth.get("mode")))
+    emit(
+        "[DATA] mc/loader    : {0} / {1}".format(
+            config.get("mc_version"), config.get("loader")
+        )
+    )
+    emit(
+        "[DATA] launch ver   : {0}".format(
+            config.get("launch_version") or "(AUTO)"
+        )
+    )
+    emit(
+        "[CFG ] download src : {0} (order {1})".format(
+            VANILLA_SOURCE_LABELS.get(
+                str(config.get("download_source") or "mirror"),
+                config.get("download_source") or "mirror",
+            ),
+            " -> ".join(source_order(config.get("download_source"))),
+        )
+    )
+    isolation_on = bool(config.get("version_isolation"))
+    iso_version = str(config.get("launch_version") or "").strip()
+    if isolation_on and iso_version:
+        iso_dir = os.path.join(game_dir, "versions", iso_version)
+    else:
+        iso_dir = game_dir
+    emit(
+        "[CFG ] isolation   : {0} // game dir {1}".format(
+            "ON" if isolation_on else "OFF", iso_dir
+        )
+    )
+    local_versions = list_local_versions(game_dir)
+    emit("[DATA] local vers   : {0}".format(len(local_versions)))
+    for version_id in local_versions[:5]:
+        emit("       - {0}".format(version_id))
+    emit(
+        "[DATA] offline UUID : {0} -> {1}".format(
+            auth.get("username") or "Steve",
+            offline_uuid(str(auth.get("username") or "Steve")),
+        )
+    )
+
+    try:
+        loader_version = fetch_fabric_loader_version(
+            str(config.get("mc_version") or "1.21.1")
+        )
+        emit("[NET ] Fabric loader: {0}".format(loader_version))
+    except Exception as exc:
+        emit("[NET ] Fabric check failed: {0}".format(exc))
+
+    try:
+        hits = modrinth_search(
+            "",
+            limit=int((config.get("modrinth") or {}).get("hot_limit") or 8),
+            index="downloads",
+            mc_version=str(config.get("mc_version") or "1.21.1"),
+            loader=str(config.get("loader") or "fabric"),
+        )
+        emit(
+            "[NET ] Modrinth     : {0} hits // {1}/{2}".format(
+                len(hits),
+                config.get("mc_version"),
+                str(config.get("loader") or "").upper() or "ALL",
+            )
+        )
+        for hit in hits[:3]:
+            try:
+                emit("       " + format_hit(hit))
+            except Exception:
+                emit("       " + str(hit.get("slug")))
+    except Exception as exc:
+        emit("[NET ] Modrinth check failed: {0}".format(exc))
+
+    try:
+        shader_hits, shader_total = content_search_page(
+            "", "shader", 5, "downloads", ""
+        )
+        pack_hits, pack_total = content_search_page(
+            "", "resourcepack", 5, "downloads", ""
+        )
+        emit(
+            "[NET ] shaders     : {0}/{1} hits // folder {2}".format(
+                len(shader_hits), shader_total, CONTENT_KIND_FOLDERS.get("shader")
+            )
+        )
+        emit(
+            "[NET ] resourcepack: {0}/{1} hits // folder {2}".format(
+                len(pack_hits),
+                pack_total,
+                CONTENT_KIND_FOLDERS.get("resourcepack"),
+            )
+        )
+        if shader_hits:
+            emit("       " + format_hit(shader_hits[0]))
+        if pack_hits:
+            emit("       " + format_hit(pack_hits[0]))
+    except Exception as exc:
+        emit("[NET ] shaders     : failed ({0})".format(str(exc)[:90]))
+
+    try:
+        import minecraft_launcher_lib  # noqa: F401
+
+        emit("[DEP ] launcher lib : INSTALLED")
+    except Exception:
+        emit("[DEP ] launcher lib : MISSING (use [关于] menu to install)")
+    try:
+        if QR_CIPHER_KEY and ENCRYPTED_QR_DATA:
+            key_len = len(bytes(QR_CIPHER_KEY))
+            data_len = len(bytes(ENCRYPTED_QR_DATA))
+            magic_ok = not bytes(ENCRYPTED_QR_DATA).startswith(b"\x89PNG")
+            emit(
+                "[DATA] qr payload   : OK (key {0}B / data {1}B / plain-magic {2})".format(
+                    key_len, data_len, "no" if magic_ok else "YES"
+                )
+            )
+        else:
+            emit("[DATA] qr payload   : MISSING (run make_qr_payload.py)")
+    except Exception as exc:
+        emit("[DATA] qr payload   : FAILED ({0})".format(exc))
+    try:
+        icon_path = resource_path(APP_ICON_NAME)
+        if os.path.isfile(icon_path):
+            emit(
+                "[UI  ] app icon     : OK ({0}, {1}B)".format(
+                    APP_ICON_NAME, os.path.getsize(icon_path)
+                )
+            )
+        else:
+            emit("[UI  ] app icon     : MISSING (window uses the default icon)")
+    except Exception as exc:
+        emit("[UI  ] app icon     : FAILED ({0})".format(exc))
+    try:
+        wallpaper_path = str(config.get("wallpaper") or "").strip()
+        if not wallpaper_path:
+            emit("[UI  ] wallpaper    : none (设置 -> 外观 / 背景 / 内存)")
+        elif not wallpaper_supported(wallpaper_path):
+            emit(
+                "[UI  ] wallpaper    : MISSING ({0})".format(wallpaper_path)
+            )
+        else:
+            wp_fit = str(config.get("wallpaper_fit") or "cover")
+            try:
+                wp_dim = int(config.get("wallpaper_dim") or 0)
+            except (TypeError, ValueError):
+                wp_dim = 0
+            probe = render_wallpaper_png(
+                wallpaper_path, 64, 64, wp_dim / 100.0, wp_fit, C_WHITE
+            )
+            emit(
+                "[UI  ] wallpaper    : OK ({0} // {1} // dim {2}% // png {3}B)".format(
+                    os.path.basename(wallpaper_path),
+                    wp_fit,
+                    wp_dim,
+                    len(probe),
+                )
+            )
+    except Exception as exc:
+        emit("[UI  ] wallpaper    : FAILED ({0})".format(exc))
+    try:
+        avatar_png = base64.b64decode(fallback_avatar_png("akm-selftest"))
+        emit(
+            "[UI  ] avatar       : OK (fallback {0}B // sources {1})".format(
+                len(avatar_png), len(AVATAR_SOURCES)
+            )
+        )
+    except Exception as exc:
+        emit("[UI  ] avatar       : FAILED ({0})".format(exc))
+    try:
+        dark_names = [name for name in DARK_THEME_NAMES]
+        emit(
+            "[UI  ] themes       : {0} presets ({1} dark: {2})".format(
+                len(THEME_PRESETS), len(dark_names), " / ".join(dark_names)
+            )
+        )
+    except Exception as exc:
+        emit("[UI  ] themes       : FAILED ({0})".format(exc))
+    try:
+        thumb = base64.b64decode(instance_thumb_png(local_versions[0] if local_versions else "akm", 72))
+        emit(
+            "[TOOL] instances    : {0} 张卡片 // thumb {1}B // modrinth update API {2}".format(
+                len(local_versions),
+                len(thumb),
+                "on" if callable(globals().get("modrinth_version_files")) else "off",
+            )
+        )
+    except Exception as exc:
+        emit("[TOOL] instances    : FAILED ({0})".format(exc))
+    try:
+        probe = SnakeModel(cols=12, rows=10)
+        moved = probe.step()
+        emit(
+            "[UI  ] minigame     : snake {0}x{1} // step={2} // best {3} // prompt {4}".format(
+                probe.cols,
+                probe.rows,
+                moved,
+                int(config.get("snake_best") or 0),
+                "on" if config.get("mini_game_prompt", True) else "off",
+            )
+        )
+    except Exception as exc:
+        emit("[UI  ] minigame     : FAILED ({0})".format(exc))
+    try:
+        g2048 = Game2048Model(rng=random.Random(1))
+        mines = MinesweeperModel(rng=random.Random(2))
+        tetris = TetrisModel(rng=random.Random(3))
+        mines.reveal(mines.cols // 2, mines.rows // 2)
+        tetris.hard_drop()
+        emit(
+            "[UI  ] minigames    : 2048 tiles={0} // mines revealed={1} // tetris piece={2} score={3}".format(
+                sum(1 for value in g2048.grid if value),
+                len(mines.revealed),
+                tetris.current["name"] if tetris.current else "-",
+                tetris.score,
+            )
+        )
+    except Exception as exc:
+        emit("[UI  ] minigames    : FAILED ({0})".format(exc))
+    try:
+        instances = config.get("instances")
+        if not isinstance(instances, dict):
+            instances = {}
+        total_play = sum(
+            int(row.get("play_seconds") or 0)
+            for row in instances.values()
+            if isinstance(row, dict)
+        )
+        emit(
+            "[DATA] instances    : {0} 条记录 // 累计 {1}".format(
+                len(instances), format_playtime(total_play) or "0"
+            )
+        )
+    except Exception as exc:
+        emit("[DATA] instances    : FAILED ({0})".format(exc))
+    try:
+        jvm_extra = str(config.get("jvm_args") or "").strip()
+        emit(
+            "[CFG ] jvm args     : {0}".format(
+                "{0} 项 // {1}".format(
+                    len(re.findall(r'"[^"]*"|\S+', jvm_extra)), jvm_extra[:60]
+                )
+                if jvm_extra
+                else "(默认，仅 -Xms/-Xmx)"
+            )
+        )
+    except Exception as exc:
+        emit("[CFG ] jvm args     : FAILED ({0})".format(exc))
+    try:
+        reports = crash_report_paths(game_dir)
+        if reports:
+            emit(
+                "[TOOL] crash scan   : {0} 份报告 // 最新 {1}".format(
+                    len(reports), os.path.basename(reports[0])
+                )
+            )
+        else:
+            emit("[TOOL] crash scan   : no crash-reports (正常)")
+    except Exception as exc:
+        emit("[TOOL] crash scan   : FAILED ({0})".format(exc))
+    try:
+        saves_dir = os.path.join(game_dir, "saves")
+        saves = [
+            name
+            for name in (os.listdir(saves_dir) if os.path.isdir(saves_dir) else [])
+            if os.path.isdir(os.path.join(saves_dir, name))
+        ]
+        emit("[TOOL] saves        : {0} 个存档".format(len(saves)))
+    except Exception as exc:
+        emit("[TOOL] saves        : FAILED ({0})".format(exc))
+    try:
+        import minecraft_launcher_lib.mod_loader as mll_loader
+
+        emit(
+            "[DEP ] mod loaders  : {0}".format(
+                ", ".join(mll_loader.list_mod_loader())
+            )
+        )
+    except Exception as exc:
+        emit("[DEP ] mod loaders  : FAILED ({0})".format(exc))
+    try:
+        ram = total_ram_mb()
+        memory = normalize_memory_config(config.get("memory"), ram)
+        emit(
+            "[CFG ] memory      : -Xms{0}M -Xmx{1}M (RAM {2} MB)".format(
+                memory["min_mb"], memory["max_mb"], ram or 0
+            )
+        )
+    except Exception as exc:
+        emit("[CFG ] memory      : FAILED ({0})".format(exc))
+    try:
+        runtimes = installed_java_runtimes(game_dir)
+        if runtimes:
+            emit(
+                "[JAVA] runtime     : {0}".format(
+                    ", ".join(
+                        "Java{0} ({1})".format(row["major"], format_bytes(row["size"]))
+                        for row in runtimes
+                    )
+                )
+            )
+        else:
+            emit("[JAVA] runtime     : none (游戏 -> Java 运行时管理)")
+    except Exception as exc:
+        emit("[JAVA] runtime     : FAILED ({0})".format(exc))
+    try:
+        neoforge_map = neoforge_mirror_pairs(timeout=10)
+        neoforge_mc = sort_versions_desc(list(neoforge_map.keys()))
+        emit(
+            "[NET ] neoforge    : {0} MC versions via BMCLAPI (newest {1})".format(
+                len(neoforge_mc), neoforge_mc[0] if neoforge_mc else "-"
+            )
+        )
+    except Exception as exc:
+        emit("[NET ] neoforge    : mirror failed ({0})".format(str(exc)[:80]))
+    try:
+        probe = "0123456789abcdef0123456789abcdef01234567"
+        asset_mirror = "{0}/assets/{1}/{2}".format(
+            BMCLAPI_BASE, probe[:2], probe
+        )
+        client_mirror = "{0}/version/{1}/client".format(BMCLAPI_BASE, "1.20.1")
+        health = SourceHealth(threshold=2)
+        health.note("mirror", False)
+        first = health.blocked("mirror")
+        health.note("mirror", False)
+        second = health.blocked("mirror")
+        health.reset()
+        emit(
+            "[DL  ] asset url    : {0}".format(
+                asset_mirror.replace(BMCLAPI_BASE, "bmclapi")
+            )
+        )
+        emit(
+            "[DL  ] client url   : {0}".format(
+                client_mirror.replace(BMCLAPI_BASE, "bmclapi")
+            )
+        )
+        emit(
+            "[DL  ] workers      : lib={0} asset={1} timeouts={2}/{3}s".format(
+                LIBRARY_WORKERS, ASSET_WORKERS, ASSET_TIMEOUT, LIBRARY_TIMEOUT
+            )
+        )
+        emit(
+            "[DL  ] health       : strike1={0} strike2={1} reset={2}".format(
+                first, second, health.blocked("mirror")
+            )
+        )
+        emit(
+            "[DL  ] cancel api   : event={0} pool={1}".format(
+                hasattr(threading, "Event"), hasattr(open_download_stream, "__call__")
+            )
+        )
+    except Exception as exc:
+        emit("[DL  ] probe        : FAILED ({0})".format(exc))
+    try:
+        probe = DownloadMonitor()
+        probe.reset("selftest task")
+        probe.begin("k1", "client.jar", 1000)
+        probe.update("k1", 400)
+        mid = probe.snapshot()
+        probe.finish("k1", "done", 1000)
+        probe.note_cached("lib.jar", 2048)
+        probe.set_phase("libraries", 3, 9, "selftest")
+        done = probe.snapshot()
+        emit(
+            "[DL  ] monitor     : active={0} bytes={1} cached={2} done={3}".format(
+                mid["active_total"], mid["active_bytes"], done["counts"]["cached"], done["counts"]["done"]
+            )
+        )
+        emit(
+            "[DL  ] monitor snap: phase={0} speed={1}/s".format(
+                done["phase"][0], format_bytes(done["speed"])
+            )
+        )
+        emit(
+            "[INST] unified     : loaders={0} helper={1}".format(
+                ",".join(LOADER_INSTALL_ORDER),
+                hasattr(loader_versions_for, "__call__"),
+            )
+        )
+    except Exception as exc:
+        emit("[INST] probe       : FAILED ({0})".format(exc))
+    try:
+        bad_rows = [key for key, row in _UI_TEXT.items() if len(row) != len(LANGUAGE_CHOICES)]
+        emit(
+            "[I18N] languages   : {0} // keys={1} // bad_rows={2}".format(
+                ",".join(LANGUAGE_ORDER), len(_UI_TEXT), len(bad_rows)
+            )
+        )
+        set_language("en")
+        en_title = title_text("JAVA RUNTIME // 内置 Java")
+        set_language("zh")
+        zh_title = title_text("JAVA RUNTIME // 内置 Java")
+        emit(
+            "[I18N] title strip : zh={0} // en={1}".format(zh_title, en_title)
+        )
+        emit(
+            "[DL  ] cdn pin     : node={0} // hits={1}".format(
+                asset_cdn_node() or "-", asset_cdn_hits()
+            )
+        )
+        set_language(config.get("language"))
+    except Exception as exc:
+        emit("[I18N] probe       : FAILED ({0})".format(exc))
+    try:
+        packs = load_language_packs(force=True)
+        info = language_pack_info()
+        emit(
+            "[LANG] packs       : {0} // dir={1} // errors={2}".format(
+                ",".join(sorted(packs)), info.get("dir") or "-", len(info["errors"])
+            )
+        )
+        en_phrases = len((packs.get("en") or {}).get("phrases") or {})
+        set_language("en")
+        sample = translate_ui("确定")
+        set_language("ar")
+        shaped = shape_arabic("\u0645\u0631\u062d\u0628\u0627")
+        set_language(config.get("language"))
+        emit(
+            "[LANG] phrase test : en 确定 -> {0} // {1} phrases".format(
+                sample, en_phrases
+            )
+        )
+        emit(
+            "[LANG] arabic shp  : {0}".format(
+                " ".join("{0:04X}".format(ord(ch)) for ch in shaped)
+            )
+        )
+    except Exception as exc:
+        emit("[LANG] probe       : FAILED ({0})".format(exc))
+    emit("[OK  ] selftest complete")
+
+    ensure_dir(LOG_DIR)
+    log_path = os.path.join(LOG_DIR, "selftest.log")
+    try:
+        with open(log_path, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+    except OSError as exc:
+        try:
+            if sys.stdout is not None:
+                print("[WARN] selftest log failed: {0}".format(exc))
+        except Exception:
+            pass
+    return 0
+
+
+def main(argv=None):
+    args = list(sys.argv[1:] if argv is None else argv)
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    bootstrap_files()
+    if "--selftest" in args:
+        return run_selftest()
+    if tk is None:
+        print("tkinter 不可用，无法启动图形界面。")
+        return 2
+    while True:
+        try:
+            app = Win1App()
+        except Exception:
+            log_debug("launcher start failed:\n" + traceback.format_exc())
+            raise
+        app.run()
+        if not getattr(app, "_relaunch_ui", False):
+            break
+        # language switch: rebuild a brand new window in the same process
+        try:
+            app.root = None
+        except Exception:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
