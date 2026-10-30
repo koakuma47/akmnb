@@ -1,7 +1,7 @@
 {
-  "version": "B0.6",
-  "url": "https://raw.githubusercontent.com/<user>/<repo>/main/release/AKM_Launcher_B0.6.zip",
-  "sha256": "6508A23DA0D5D74A9BC05237CD6825C6FE3B022937C4636969438AF29EB46A6A",
+  "version": "B0.7",
+  "url": "https://raw.githubusercontent.com/<user>/<repo>/main/release/AKM_Launcher_B0.7.zip",
+  "sha256": "CEACCB61DFC6E26967689C69D1B08065C9C560503425E72D8BA15C13FBF6FD5D",
   "page": "https://github.com/<user>/<repo>/releases",
-  "notes": "B0.6: 新增科幻风 / 千禧年两套界面预设（钴蓝主色，可随时互切），模组战备架加离线缓存 + 自动重试，断网也不再空货架"
+  "notes": "B0.7: 矢量风 / 科幻风 / 千禧年 的按钮也换成自绘主题按钮（圆角药丸 / 切角 HUD / 铬色高光），带悬停与禁用态；复古 <-> 现代互切自动重建界面"
 }

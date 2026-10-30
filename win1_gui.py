@@ -79,7 +79,7 @@ except Exception:  # pragma: no cover - tkinter always ships with CPython on Win
 # ---------------------------------------------------------------------------
 
 APP_NAME = "AKM Launcher"
-APP_VERSION = "B0.6"
+APP_VERSION = "B0.7"
 
 # ---------------------------------------------------------------------------
 # Internationalisation (zh / en / ja / ru / ar)
@@ -4196,6 +4196,487 @@ CREATE_PACK = [
         "loaders": (),
     },
 ]
+# ---------------------------------------------------------------------------
+# 1b. Themed button (vector / sci-fi / millennium)
+#     Tk's own Button cannot draw rounded or chamfered shapes, so the modern
+#     styles paint themselves on a Canvas: shape + gloss/shadow + text, with
+#     hover / pressed / disabled states.  1985 retro keeps the real tk.Button.
+# ---------------------------------------------------------------------------
+
+_BUTTON_FONT_CACHE = {}
+
+
+def _button_font(spec):
+    """Shared Tk font object for a (family, size, style) button spec."""
+    parts = list(spec) if isinstance(spec, (tuple, list)) else [spec]
+    if not parts:
+        parts = [UI_FONT or "TkDefaultFont", 10]
+    if UI_FONT and str(parts[0]) != UI_FONT:
+        parts[0] = UI_FONT
+    key = tuple(str(part) for part in parts)
+    cached = _BUTTON_FONT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        font = tkfont.Font(font=tuple(parts))
+    except Exception:
+        font = tkfont.Font(family=UI_FONT or "TkDefaultFont", size=10)
+    if len(_BUTTON_FONT_CACHE) > 40:
+        _BUTTON_FONT_CACHE.clear()
+    _BUTTON_FONT_CACHE[key] = font
+    return font
+
+
+def repaint_themed_buttons():
+    """Re-draw every themed button (after a palette / style switch)."""
+    alive = []
+    for button in ThemedButton.instances:
+        try:
+            if button.winfo_exists():
+                button.repaint()
+                alive.append(button)
+        except Exception:
+            continue
+    ThemedButton.instances = alive
+
+
+class ThemedButton(tk.Canvas):
+    """Flat / HUD / chrome button that follows the active UI style."""
+
+    instances = []
+
+    def __init__(
+        self,
+        parent,
+        text="",
+        command=None,
+        font=None,
+        padx=8,
+        pady=4,
+        bg=None,
+        fg=None,
+        **_ignored
+    ):
+        self._text = str(text or "")
+        self._command = command
+        self._font_spec = font if font is not None else FONT_MAIN
+        self._pad_x = int(padx)
+        self._pad_y = int(pady)
+        self._fill_role = self._role_fill(bg)
+        self._ink_role = self._role_ink(fg)
+        self._state = "normal"
+        self._hover = False
+        self._pressed = False
+        self._size = (0, 0)
+        width, height = self._measure()
+        tk.Canvas.__init__(
+            self,
+            parent,
+            width=width,
+            height=height,
+            bd=0,
+            highlightthickness=0,
+            takefocus=0,
+            cursor="hand2",
+            bg=self._parent_bg(parent),
+        )
+        self.bind("<Configure>", self._on_configure)
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        ThemedButton.instances.append(self)
+        self._paint()
+
+    # -- colours ---------------------------------------------------------
+    @staticmethod
+    def _role_fill(value):
+        text = str(value or "").strip().upper()
+        if not text:
+            return "surface"
+        table = {
+            C_WHITE.upper(): "surface",
+            C_GRAY.upper(): "secondary",
+            C_TEAL.upper(): "accent",
+            C_BLACK.upper(): "inverted",
+        }
+        return table.get(text, text)
+
+    @staticmethod
+    def _role_ink(value):
+        text = str(value or "").strip().upper()
+        if not text:
+            return "auto"
+        if text == C_TEAL.upper():
+            return "accent"
+        if text == C_BLACK.upper():
+            return "text"
+        if text == C_WHITE.upper() or text == UI_ON_ACCENT.upper():
+            return "on_accent"
+        return text
+
+    @staticmethod
+    def _parent_bg(parent):
+        try:
+            return str(parent.cget("bg"))
+        except Exception:
+            return UI_PAGE
+
+    def _measure(self):
+        try:
+            metrics = _button_font(self._font_spec)
+            lines = self._text.split("\n") or [""]
+            width = max(metrics.measure(line) for line in lines)
+            height = metrics.metrics("linespace") * len(lines)
+        except Exception:
+            width, height = 80, 16
+        return (
+            int(width + 2 * self._pad_x + 18),
+            int(height + 2 * self._pad_y + 8),
+        )
+
+    def _size_hint(self):
+        return self._measure()
+
+    # -- widget API ------------------------------------------------------
+    def configure(self, cnf=None, **kwargs):
+        options = dict(cnf or {})
+        options.update(kwargs)
+        passthrough = {}
+        repaint = False
+        for key, value in options.items():
+            name = str(key).lower()
+            if name == "text":
+                text = str(value or "")
+                if text != self._text:
+                    self._text = text
+                    repaint = True
+            elif name == "state":
+                self._state = str(value or "normal")
+                self._hover = False
+                self._pressed = False
+                try:
+                    tk.Canvas.configure(
+                        self,
+                        cursor="arrow" if self._state == "disabled" else "hand2",
+                    )
+                except Exception:
+                    pass
+                repaint = True
+            elif name == "command":
+                self._command = value
+            elif name == "font":
+                self._font_spec = value
+                repaint = True
+            elif name == "padx":
+                self._pad_x = int(value)
+                repaint = True
+            elif name == "pady":
+                self._pad_y = int(value)
+                repaint = True
+            elif name in ("bg", "background", "activebackground"):
+                self._fill_role = self._role_fill(value)
+                repaint = True
+            elif name in ("fg", "foreground", "activeforeground"):
+                self._ink_role = self._role_ink(value)
+                repaint = True
+            elif name in _THEMED_IGNORED_OPTIONS:
+                continue
+            else:
+                passthrough[key] = value
+        if passthrough:
+            try:
+                tk.Canvas.configure(self, **passthrough)
+            except Exception:
+                pass
+        if repaint:
+            self._paint()
+
+    config = configure
+
+    def cget(self, key):
+        name = str(key).lower()
+        if name == "text":
+            return self._text
+        if name == "state":
+            return self._state
+        if name == "command":
+            return self._command
+        if name == "font":
+            return self._font_spec
+        if name in ("fg", "foreground"):
+            return C_TEAL if self._ink_role in ("auto", "accent") else C_BLACK
+        if name == "bg":
+            return C_TEAL if self._fill_role == "accent" else C_WHITE
+        if name == "relief":
+            return "flat"
+        if name in ("bd", "borderwidth", "highlightthickness"):
+            return 0
+        return tk.Canvas.cget(self, key)
+
+    def invoke(self):
+        if self._state == "disabled" or not callable(self._command):
+            return None
+        return self._command()
+
+    def repaint(self):
+        self._size = (0, 0)
+        self._paint()
+
+    # -- events ----------------------------------------------------------
+    def _on_configure(self, event):
+        size = (int(event.width), int(event.height))
+        if size != self._size:
+            self._size = size
+            self._paint()
+
+    def _on_enter(self, _event=None):
+        if self._state == "disabled":
+            return
+        self._hover = True
+        self._paint()
+
+    def _on_leave(self, _event=None):
+        if not self._hover and not self._pressed:
+            return
+        self._hover = False
+        self._pressed = False
+        self._paint()
+
+    def _on_press(self, _event=None):
+        if self._state == "disabled":
+            return
+        self._pressed = True
+        self._paint()
+
+    def _on_release(self, event=None):
+        if self._state == "disabled":
+            return
+        was = self._pressed
+        self._pressed = False
+        inside = True
+        if event is not None:
+            inside = (
+                0 <= int(event.x) <= self.winfo_width()
+                and 0 <= int(event.y) <= self.winfo_height()
+            )
+        self._paint()
+        if was and inside:
+            self.invoke()
+
+    # -- painting --------------------------------------------------------
+    def _colors(self):
+        fill_role = self._fill_role
+        ink_role = self._ink_role
+        disabled = self._state == "disabled"
+        active = (self._hover or self._pressed) and not disabled
+        accent_btn = fill_role == "accent"
+        if fill_role == "accent":
+            body = C_TEAL
+            default_ink = UI_ON_ACCENT
+        elif fill_role == "inverted":
+            body = C_BLACK
+            default_ink = C_WHITE
+        elif fill_role == "secondary":
+            body = (
+                blend_color(C_GRAY, C_WHITE, 0.45)
+                if UI_STYLE == "millennium"
+                else C_GRAY
+            )
+            if UI_STYLE == "scifi":
+                body = blend_color(C_GRAY, C_TEAL, 0.12)
+                default_ink = blend_color(C_TEAL, C_WHITE, 0.55)
+            else:
+                default_ink = C_TEAL
+        elif fill_role == "surface":
+            body = blend_color(
+                C_WHITE, C_TEAL, 0.16 if UI_STYLE == "scifi" else 0.05
+            )
+            default_ink = (
+                blend_color(C_TEAL, C_WHITE, 0.58)
+                if UI_STYLE == "scifi"
+                else C_TEAL
+            )
+        else:
+            body = fill_role
+            default_ink = C_BLACK
+        ink = {
+            "auto": default_ink,
+            "accent": C_TEAL,
+            "text": C_BLACK,
+            "on_accent": UI_ON_ACCENT,
+        }.get(ink_role, ink_role)
+        if active:
+            body = UI_ACCENT2 if accent_btn else C_TEAL
+            ink = ink_on(body) if UI_STYLE == "scifi" else UI_ON_ACCENT
+        if disabled:
+            body = blend_color(UI_PAGE, C_WHITE, 0.55)
+            ink = UI_MUTED
+            active = False
+        edge = blend_color(C_TEAL, C_WHITE, 0.55)
+        if UI_STYLE == "millennium":
+            edge = blend_color(C_TEAL, "#FFFFFF", 0.45)
+        elif UI_STYLE == "vector":
+            edge = blend_color(C_TEAL, C_WHITE, 0.80)
+        if disabled:
+            edge = UI_OUTLINE
+        if self._pressed and not disabled:
+            body = blend_color(body, "#000000", 0.16)
+        return {
+            "body": body,
+            "ink": ink,
+            "edge": edge,
+            "active": active,
+            "disabled": disabled,
+        }
+
+    def _paint(self):
+        try:
+            width = int(self.winfo_width())
+            height = int(self.winfo_height())
+        except Exception:
+            return
+        if width <= 2 or height <= 2:
+            width, height = self._measure()
+        if width <= 2 or height <= 2:
+            return
+        try:
+            self.delete("all")
+        except Exception:
+            return
+        colors = self._colors()
+        try:
+            self._draw(width, height, colors)
+        except Exception:
+            self.create_rectangle(
+                2,
+                2,
+                width - 2,
+                height - 2,
+                fill=colors["body"],
+                outline=colors["edge"],
+            )
+            self.create_text(
+                width // 2,
+                height // 2,
+                text=self._text,
+                fill=colors["ink"],
+                font=_button_font(self._font_spec),
+            )
+
+    def _draw(self, width, height, colors):
+        style = UI_STYLE
+        body = colors["body"]
+        ink = colors["ink"]
+        edge = colors["edge"]
+        x0, y0 = 1, 1
+        x1, y1 = width - 2, height - 2
+        if x1 <= x0 or y1 <= y0:
+            return
+        span = y1 - y0
+        if style == "scifi":
+            corner, radius = "chamfer", 5
+        elif style == "millennium":
+            corner, radius = "round", max(4, min(10, span // 2))
+        else:
+            corner, radius = "round", max(4, min(13, span // 2))
+        if colors["active"]:
+            shadow = (
+                blend_color(UI_PAGE, "#000000", 0.12) if UI_DARK else UI_SHADOW
+            )
+            draw_ui_shape(
+                self, x0, y0 + 2, x1, y1 + 2, radius, corner,
+                fill=shadow, outline="",
+            )
+        draw_ui_shape(
+            self,
+            x0,
+            y0,
+            x1,
+            y1,
+            radius,
+            corner,
+            fill=body,
+            outline=edge,
+            width=2 if style == "millennium" else 1,
+        )
+        if style == "millennium" and not colors["disabled"]:
+            draw_ui_shape(
+                self,
+                x0 + 3,
+                y0 + 2,
+                x1 - 3,
+                y0 + max(4, span // 2),
+                max(2, radius - 3),
+                corner,
+                fill=blend_color(body, "#FFFFFF", 0.50),
+                outline="",
+            )
+            self.create_line(
+                x0 + radius,
+                y1 - 1,
+                x1 - radius,
+                y1 - 1,
+                fill=blend_color(body, "#000000", 0.20),
+                width=1,
+            )
+        elif style == "scifi":
+            tick = max(4, min(9, span // 4))
+            self.create_line(
+                x0 + 4, y0, x0 + 4 + tick, y0, fill=UI_ACCENT2, width=2
+            )
+            self.create_line(
+                x1 - 4, y1, x1 - 4 - tick, y1, fill=UI_ACCENT2, width=2
+            )
+            if not colors["disabled"]:
+                self.create_line(
+                    x0 + 4,
+                    y1,
+                    x0 + 4 + tick,
+                    y1,
+                    fill=blend_color(edge, body, 0.35),
+                    width=1,
+                )
+        elif style == "vector" and not colors["active"]:
+            self.create_line(
+                x0 + radius,
+                y1,
+                x1 - radius,
+                y1,
+                fill=blend_color(body, C_TEAL, 0.30),
+                width=1,
+            )
+        self.create_text(
+            width // 2,
+            height // 2,
+            text=self._text,
+            fill=ink,
+            font=_button_font(self._font_spec),
+        )
+
+
+_THEMED_IGNORED_OPTIONS = frozenset(
+    (
+        "relief",
+        "bd",
+        "borderwidth",
+        "highlightthickness",
+        "highlightbackground",
+        "highlightcolor",
+        "disabledforeground",
+        "disabledbackground",
+        "selectcolor",
+        "insertbackground",
+        "selectbackground",
+        "selectforeground",
+        "troughcolor",
+        "wraplength",
+        "justify",
+        "anchor",
+    )
+)
+
+
 
 # ---------------------------------------------------------------------------
 # 2. Low level helpers: files, JSON, errors, retries, formatting
@@ -10178,52 +10659,21 @@ class Win1App:
     def _mk_button(self, parent, text, command, font=FONT_MAIN, padx=8, pady=4):
         mode = ui_style_spec()["button"]
         if mode != "bevel":
-            # modern 家族：flat（矢量）/ tech（科幻霓虹描边）/ chrome（千禧高光）
-            base_fg = C_BLACK
-            hover_fg = UI_ON_ACCENT
-            if mode == "tech":
-                base_bg = C_GRAY
-                options = dict(
-                    relief="flat",
-                    bd=0,
-                    highlightthickness=1,
-                    highlightbackground=blend_color(C_TEAL, C_WHITE, 0.55),
-                    highlightcolor=C_TEAL,
-                )
-            elif mode == "chrome":
-                base_bg = C_GRAY
-                base_fg = C_TEAL
-                options = dict(relief="raised", bd=2, highlightthickness=0)
-            else:
-                base_bg = C_WHITE
-                options = dict(relief="flat", bd=0, highlightthickness=0)
-            button = tk.Button(
+            # modern 家族：Canvas 自绘圆角 / 切角 / 铬色按钮
+            default_bg = (
+                C_GRAY if mode in ("tech", "chrome") else C_WHITE
+            )
+            default_fg = C_BLACK if mode == "tech" else C_TEAL
+            return ThemedButton(
                 parent,
                 text=text,
                 command=command,
                 font=font,
-                bg=base_bg,
-                fg=base_fg,
-                activebackground=C_TEAL,
-                activeforeground=hover_fg,
-                padx=padx + 4,
-                pady=pady + 1,
-                takefocus=0,
-                cursor="hand2",
-                **options
+                padx=padx,
+                pady=pady,
+                bg=default_bg,
+                fg=default_fg,
             )
-
-            def on_enter(_event, widget=button):
-                if str(widget.cget("state")) != "disabled":
-                    widget.configure(bg=C_TEAL, fg=hover_fg)
-
-            def on_leave(_event, widget=button):
-                if str(widget.cget("state")) != "disabled":
-                    widget.configure(bg=base_bg, fg=base_fg)
-
-            button.bind("<Enter>", on_enter)
-            button.bind("<Leave>", on_leave)
-            return button
         button = tk.Button(
             parent,
             text=text,
@@ -10641,6 +11091,12 @@ class Win1App:
         palette = str(palette or self.ui_palette or "indigo").lower()
         if target == self.ui_style and palette == self.ui_palette:
             return
+        if bool(ui_style_spec(self.ui_style)["modern"]) != bool(
+            ui_style_spec(target)["modern"]
+        ):
+            # 1985 原生描边按钮 <-> Canvas 自绘按钮，必须整窗重建才不会半新半旧
+            self._rebuild_ui_for_style(target, palette)
+            return
         self._apply_ui_style_live(target, palette)
         self._refresh_style_buttons()
         try:
@@ -10655,6 +11111,28 @@ class Win1App:
                     want_font
                 )
             )
+
+    def _rebuild_ui_for_style(self, style, palette):
+        """Save the new style and rebuild the window so every widget matches."""
+        new_style, new_palette = set_ui_style(style, palette, theme=self.theme)
+        self.config["ui_style"] = new_style
+        self.config["ui_style_palette"] = new_palette
+        self._save_config()
+        try:
+            self._close_settings()
+        except Exception:
+            pass
+        try:
+            self._cancel_timers()
+        except Exception:
+            pass
+        self._relaunch_ui = True
+        try:
+            self.root.quit()
+            self.root.destroy()
+        except Exception:
+            log_debug("style rebuild failed:\n" + traceback.format_exc())
+            self._relaunch_ui = False
 
     def _apply_ui_style_live(self, style, palette=None):
         """Switch the look of the running window (B0.5, still beta)."""
@@ -10694,6 +11172,10 @@ class Win1App:
         self._restyle_menus()
         self._rebuild_banner_style()
         self._style_panel_frames()
+        try:
+            repaint_themed_buttons()
+        except Exception:
+            pass
         self._ensure_window_fits()
         self._schedule_card_refresh(60)
         try:
