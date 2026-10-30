@@ -1,3 +1,5 @@
+其实理论上大肥鱼才是作，所以你能看出来下面的内容ai味爆棚
+
 # AKM Launcher (Adaptive Kinetic Minecraft) B0.5
 
 1985 Windows 1.0 工业风格的单人 Minecraft 启动器，位于 `.`。
@@ -1403,17 +1405,6 @@ CI 签名需要仓库 Secrets：`WINDOWS_CERT_PFX_BASE64`、`WINDOWS_CERT_PASSWO
 - 赞助入口只通过 `webbrowser.open()` 打开配置的 HTTPS 页面，不接收、
   不存储任何支付凭据。
 - 所有网络与子进程操作都在后台线程执行，Tkinter 主循环不会被阻塞。
-
----
-
-## 关于这个仓库
-
-- 只放**源码**：`win1_gui.py` / `lang/` / 打包与签名脚本 / 文档
-- **不放**：`config.json`、`auth.json`（含微软 refresh token）、`logs/`、
-  `.minecraft/`、`release/`、`*.exe`、`icons/`、以及补给站收款码
-  （`donate.png` / `qr_payload.py`，属于作者私有内容，克隆后不会带上）
-- 收款码缺失时启动器会自动降级成「收款码未配置」，其它功能不受影响
-- 想自己开补给站：把收款码命名成 `donate.png` 放在同目录，执行
   `python make_qr_payload.py` 生成 `qr_payload.py`，再改 `AFDIAN_URL`
 - 第一次运行会自动生成 `config.json` / `auth.json`，这两个文件已在
   `.gitignore` 里，**不要提交**
