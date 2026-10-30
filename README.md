@@ -13,10 +13,11 @@
 
 **最新版：B0.8**
 
-- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vB0.8/AKM_Launcher_B0.8.zip>
-- 发布页（含历史版本）：<https://github.com/koakuma47/akmnb/releases/tag/vB0.8>
+- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vB0.8/AKM_Launcher_vB0.8.zip>
+- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vB0.8>
 
 单文件免安装，解压后双击 `AKM_Launcher.exe` 就能用，不需要装 Python。
+下载后想核对完整性，可以和发布页里 `SHA256.txt` 的值比对一下。
 
 ## 怎么用
 
