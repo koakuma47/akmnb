@@ -1,10 +1,13 @@
 其实理论上大肥鱼才是作，所以你能看出来下面的内容ai味爆棚
 
-# AKM Launcher (Adaptive Kinetic Minecraft) B0.5
+# AKM Launcher (Adaptive Kinetic Minecraft) B0.7
 
-1985 Windows 1.0 工业风格的单人 Minecraft 启动器，位于 `.`。
-GUI 仅使用 Python 标准库 `tkinter`，启动引擎使用可选的
-`minecraft-launcher-lib`。
+一个 1985 Windows 复古风格的 Minecraft 启动器，作用是省掉手动装游戏这一步：
+
+- 微软账号登录，或者离线登录
+- 一键装好原版 + 模组加载器（Forge / NeoForge / Fabric / Quilt），自动配 Java
+- 从 Modrinth 找模组、下载、检查版本是否对得上
+- 顺手管实例、光影、材质包和整合包
 
 ## 运行
 
