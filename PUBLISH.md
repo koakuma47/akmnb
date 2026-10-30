@@ -17,6 +17,7 @@ tools/lang_extract.py   语言包提取小工具
 README.md / RELEASE_NOTES.txt  说明与更新日志
 LICENSE                 MIT
 .gitignore              已加固
+.gitattributes          保持字节原样（* -text，不转换换行符）
 PUBLISH.md              本文件
 ```
 
@@ -48,22 +49,47 @@ PUBLISH.md              本文件
 
 ## 3. 上传方式（任选一种）
 
-### 方式 A：装了 Git（推荐）
+### 方式 A：装了 Git（推荐，已实测通过）
+
+Git for Windows 2.56.0（含 Git Credential Manager）安装位置：
+`C:\Program Files\Git\cmd\git.exe`，新开的终端里直接 `git --version` 就能用。
 
 ```powershell
 cd <这个文件夹>
-git init
+git init -b main
+git config core.autocrlf false          # 关键：不做换行符转换，仓库字节 = 本地字节
+git config user.name  "<用户名>"
+git config user.email "<用户名>@users.noreply.github.com"
 git add .
 git commit -m "AKM Launcher B0.5 source"
-git branch -M main
 git remote add origin https://github.com/<用户名>/<仓库名>.git
 git push -u origin main
 ```
 
-第一次 push 会弹浏览器登录（Git Credential Manager）；也可以直接用 PAT：
+仓库里已带 `.gitattributes`（内容 `* -text`），以后修改也不会被自动改换行符，
+所以 `win1_gui.py` 的 SHA256 和本地完全一致（B0.5 为 `4BCE71E1…E551E`）。
+
+如果远端已经有一个 `Initial commit`（网页上勾了 README 建库），push 会被拒
+（`! [rejected] main -> main (fetch first)`），按下面处理，保留一个干净的历史：
+
+```powershell
+git fetch origin
+git reset --soft origin/main            # HEAD 落到远端那次提交，本地文件不动
+git commit -m "AKM Launcher B0.5 source"
+git push -u origin main
+```
+
+第一次 push 若没凭据会弹浏览器登录（GCM）；本机已缓存
+`git:https://github.com` 凭据，所以直接就能推。也可以改用 PAT：
 
 ```powershell
 git remote set-url origin https://<用户名>:<PAT>@github.com/<用户名>/<仓库名>.git
+```
+
+推完自检（应看到 20 个文件、没有 `auth.json` / `config.json` / `donate.png`）：
+
+```powershell
+git ls-tree -r --name-only HEAD
 ```
 
 ### 方式 B：没装 Git，用 GitHub API（脚本已备好）
@@ -96,12 +122,15 @@ PAT 建议你留本地自己跑方式 B。
 
 ## 4. 之后怎么更新
 
-改了主程序之后：
+改了主程序之后（这个文件夹已经是 git 仓库，直接增量提交）：
 
 ```powershell
-cd <项目目录>
-python _publish_build.py                       # 重新生成脱敏副本
-python "tools\gh_push.py" --apply              # 覆盖上传改动过的文件
+cd <这个文件夹>
+python "<私有项目目录>\_publish_build.py"       # 重新生成脱敏副本（覆盖本目录文件）
+git status                                      # 看一眼改了哪些
+git add -A
+git commit -m "update: 改了什么"
+git push                                        # 首次已 -u，之后不用带 origin main
 ```
 
 ## 5. 上传后建议做的 3 件事
