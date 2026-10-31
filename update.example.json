@@ -1,7 +1,7 @@
 {
-  "version": "G1.4",
-  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.4/AKM_Launcher_vG1.4.zip",
-  "sha256": "A7D91E515FE82124249492B761D2B7B537A6373256F72D241793D1A4D2FB3716",
-  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.4",
-  "notes": "G1.4：修复游戏无法启动（Forge 补丁产物缺失自动自检 + 重装）、终止启动后点火按钮不恢复"
+  "version": "G1.5",
+  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.5/AKM_Launcher_vG1.5.zip",
+  "sha256": "8499D33E0A8733F9BC499E771CFE9F2EBD904B24420C1206B9E4F5B35F79CB08",
+  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.5",
+  "notes": "G1.5：启动预热（点火 0.84s→0.09s）+ 启动加速 JVM 参数 + 安装完成后自动收起下载详情窗口"
 }

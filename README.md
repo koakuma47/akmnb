@@ -1,4 +1,4 @@
-# AKM Launcher (Adaptive Kinetic Minecraft) G1.4
+# AKM Launcher (Adaptive Kinetic Minecraft) G1.5
 
 **免费开源：不收费、无内购、无付费版 —— 任何向你收费的都是盗卖。**
 
@@ -11,22 +11,22 @@
 
 ## 下载
 
-**最新正式版：G1.4**
+**最新正式版：G1.5**
 
-- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vG1.4/AKM_Launcher_vG1.4.zip>
-- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vG1.4>
+- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vG1.5/AKM_Launcher_vG1.5.zip>
+- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vG1.5>
 
 单文件免安装，解压后双击 `AKM_Launcher.exe` 就能用，不需要装 Python。
 下载后想核对完整性，可以和发布页里 `SHA256.txt` 的值比对一下。
 
-> **G1.4 更新：修了「点了点火但游戏起不来」。** 原因是 Forge 安装器的处理器只跑了一半，
-> `forge-…-client.jar` 和 `libraries/net/minecraft/client/*-srg.jar` 没生成，游戏侧报
-> `Invalid paths argument, contained no existing paths`。现在启动前会把命令里所有 jar 和
-> 加载器补丁产物都核对一遍，缺了自动按版本号重跑一次加载器安装器补齐，再启动。
-> 同时修好了「点终止启动后点火按钮一直灰着」：取消信号现在会传进安装回调，
-> 另加 4 秒兜底强制恢复按钮。
+> **G1.5 更新：点火的等待变短了。** 启动器起来 1.4 秒后会在后台把 Java 检测、
+> 版本 JSON 解析、启动命令组装算好缓存，点 [ 点燃起飞 ] 时直接复用 ——
+> 实测点火耗时 **0.84 秒 → 0.09 秒**。同时默认给 JVM 加上 `-Xms` 给满 +
+> G1 / `DisableExplicitGC` 等参数（设置里可关），加载期扩堆和 GC 停顿更少。
+> 另外：原版 / 加载器安装完成后，「下载详情」窗口会自己收起来，不用再手动关。
 >
-> G1.3：装原版提速，client.jar 这类大文件改多连接分段下载（同线路 0.3 → 1 MB/s 以上）。
+> G1.4：修了「点火但游戏起不来」（Forge 补丁产物缺失自动检测 + 重装）与
+> 「终止启动后点火按钮一直灰着」。G1.3：大文件多连接分段下载，client.jar 提速 3 倍。
 
 ## 怎么用
 
