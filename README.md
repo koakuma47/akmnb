@@ -1,4 +1,4 @@
-# AKM Launcher (Adaptive Kinetic Minecraft) G1.3
+# AKM Launcher (Adaptive Kinetic Minecraft) G1.4
 
 **免费开源：不收费、无内购、无付费版 —— 任何向你收费的都是盗卖。**
 
@@ -11,19 +11,22 @@
 
 ## 下载
 
-**最新正式版：G1.3**
+**最新正式版：G1.4**
 
-- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vG1.3/AKM_Launcher_vG1.3.zip>
-- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vG1.3>
+- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vG1.4/AKM_Launcher_vG1.4.zip>
+- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vG1.4>
 
 单文件免安装，解压后双击 `AKM_Launcher.exe` 就能用，不需要装 Python。
 下载后想核对完整性，可以和发布页里 `SHA256.txt` 的值比对一下。
 
-> **G1.3 更新：装原版变快了。** 之前 client.jar 这类大文件只开一条连接，实测只有
-> 0.2~0.4 MB/s；现在 ≥4 MB 的文件会切成多段、按大小开 8/16/32 条连接同时拉，
-> 同一条线路能到 1 MB/s 以上（32 连接实测峰值 2.3 MB/s），装 1.20.1 时客户端那一步
-> 从 70 秒缩到 23 秒。另外 BMCLAPI 的 `/version/x/client` 其实是两次 302 跳到 Mojang，
-> 现在只解析一次，分片直接连 CDN。
+> **G1.4 更新：修了「点了点火但游戏起不来」。** 原因是 Forge 安装器的处理器只跑了一半，
+> `forge-…-client.jar` 和 `libraries/net/minecraft/client/*-srg.jar` 没生成，游戏侧报
+> `Invalid paths argument, contained no existing paths`。现在启动前会把命令里所有 jar 和
+> 加载器补丁产物都核对一遍，缺了自动按版本号重跑一次加载器安装器补齐，再启动。
+> 同时修好了「点终止启动后点火按钮一直灰着」：取消信号现在会传进安装回调，
+> 另加 4 秒兜底强制恢复按钮。
+>
+> G1.3：装原版提速，client.jar 这类大文件改多连接分段下载（同线路 0.3 → 1 MB/s 以上）。
 
 ## 怎么用
 
