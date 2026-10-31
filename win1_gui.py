@@ -79,7 +79,7 @@ except Exception:  # pragma: no cover - tkinter always ships with CPython on Win
 # ---------------------------------------------------------------------------
 
 APP_NAME = "AKM Launcher"
-APP_VERSION = "G1.0"
+APP_VERSION = "G1.1"
 
 # ---------------------------------------------------------------------------
 # Internationalisation (zh / en / ja / ru / ar)
@@ -843,7 +843,8 @@ def restart_launcher():
         return False
 
 BANNER_TEXT = "AKM LAUNCHER"
-BANNER_SUBTITLE = "MINECRAFT 启动器 // 1985 风格控制台"
+# 顶部横幅只保留启动器名字；需要副标题时在这里补文本即可（布局会自动出现分隔线）
+BANNER_SUBTITLE = ""
 USER_AGENT = (
     "AKM-Launcher/1.0 (Windows 10; +https://github.com/akm-launcher) "
     "python-urllib/3"
@@ -12114,7 +12115,6 @@ class Win1App:
             title_box = banner.bbox(self.banner_title_id)
             offset = (title_box[2] + 18) if title_box else 170
             offset = min(max(offset, 140), max(170, width - 200))
-            banner.coords(self.banner_divider_id, offset, center - 11, offset, center + 11)
             right = max(90, width - pad - 18)
             banner.coords(self.banner_version_id, right, center)
             box = banner.bbox(self.banner_version_id)
@@ -12128,6 +12128,18 @@ class Win1App:
                 chip_left = box[0] - 15
             else:
                 chip_left = width - 40
+            if not str(self._banner_sub_text or "").strip():
+                # 只留启动器名字：分隔线 / 副标题一起收起来
+                for item in (
+                    getattr(self, "banner_divider_id", None),
+                    getattr(self, "banner_sub_id", None),
+                ):
+                    if item is not None:
+                        banner.itemconfigure(item, state="hidden")
+                return
+            banner.itemconfigure(self.banner_divider_id, state="normal")
+            banner.itemconfigure(self.banner_sub_id, state="normal")
+            banner.coords(self.banner_divider_id, offset, center - 11, offset, center + 11)
             available = max(40, chip_left - (offset + 16) - 12)
             banner.itemconfigure(
                 self.banner_sub_id,
@@ -12186,10 +12198,13 @@ class Win1App:
                     self.banner_divider2_id, fill="#000000" if photo else "#004A4A"
                 )
             if getattr(self, "banner_leader_id", None) is not None:
+                leader_hidden = photo or not str(
+                    getattr(self, "_banner_sub_text", "") or ""
+                ).strip()
                 banner.itemconfigure(
                     self.banner_leader_id,
                     fill="#FFFFFF" if photo else "#3F9E9E",
-                    state="hidden" if photo else "normal",
+                    state="hidden" if leader_hidden else "normal",
                 )
             state = "hidden" if photo else "normal"
             for item in getattr(self, "banner_bands", []) or []:
@@ -12282,12 +12297,6 @@ class Win1App:
             title_box = banner.bbox(self.banner_title_id)
             offset = (title_box[2] + 14) if title_box else 150
             offset = min(max(offset, 120), max(150, width - 170))
-            banner.coords(
-                self.banner_divider_id, offset, center - 9, offset, center + 9
-            )
-            banner.coords(
-                self.banner_divider2_id, offset + 2, center - 9, offset + 2, center + 9
-            )
             right = max(80, width - 14)
             banner.coords(self.banner_version_id, right, center)
             box = banner.bbox(self.banner_version_id)
@@ -12301,20 +12310,47 @@ class Win1App:
                     center + 9,
                 )
                 chip_left = box[0] - 11
-            available = max(40, chip_left - (offset + 12) - 8)
-            banner.itemconfigure(
-                self.banner_sub_id,
-                text=shorten_text(self._banner_sub_text, max(6, int(available // 6.4))),
-            )
-            banner.coords(self.banner_sub_id, offset + 12, center)
-            sub_box = banner.bbox(self.banner_sub_id)
-            leader_left = (sub_box[2] + 12) if sub_box else offset + 40
-            leader_right = chip_left - 12
-            if leader_right - leader_left < 8:
-                leader_right = leader_left
-            banner.coords(
-                self.banner_leader_id, leader_left, center, leader_right, center
-            )
+            if str(self._banner_sub_text or "").strip():
+                banner.itemconfigure(self.banner_divider_id, state="normal")
+                banner.itemconfigure(self.banner_divider2_id, state="normal")
+                banner.itemconfigure(self.banner_sub_id, state="normal")
+                banner.itemconfigure(self.banner_leader_id, state="normal")
+                banner.coords(
+                    self.banner_divider_id, offset, center - 9, offset, center + 9
+                )
+                banner.coords(
+                    self.banner_divider2_id,
+                    offset + 2,
+                    center - 9,
+                    offset + 2,
+                    center + 9,
+                )
+                available = max(40, chip_left - (offset + 12) - 8)
+                banner.itemconfigure(
+                    self.banner_sub_id,
+                    text=shorten_text(
+                        self._banner_sub_text, max(6, int(available // 6.4))
+                    ),
+                )
+                banner.coords(self.banner_sub_id, offset + 12, center)
+                sub_box = banner.bbox(self.banner_sub_id)
+                leader_left = (sub_box[2] + 12) if sub_box else offset + 40
+                leader_right = chip_left - 12
+                if leader_right - leader_left < 8:
+                    leader_right = leader_left
+                banner.coords(
+                    self.banner_leader_id, leader_left, center, leader_right, center
+                )
+            else:
+                # 只保留启动器名字：副标题、刻线、虚线引导全部隐藏
+                for item in (
+                    self.banner_divider_id,
+                    self.banner_divider2_id,
+                    self.banner_sub_id,
+                    self.banner_leader_id,
+                ):
+                    if item is not None:
+                        banner.itemconfigure(item, state="hidden")
             banner.coords(self.banner_accent_id, 0, height - 4, width, height - 2)
             banner.coords(self.banner_rule_id, 0, height - 1, width, height - 1)
         except Exception:
