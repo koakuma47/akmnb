@@ -1,7 +1,7 @@
 {
-  "version": "B0.8",
-  "url": "https://raw.githubusercontent.com/<user>/<repo>/main/release/AKM_Launcher_B0.8.zip",
-  "sha256": "66E8029C2561B2A9D5433D53AA04B37255DF03C556E8A49FA6CC737D89630B86",
-  "page": "https://github.com/<user>/<repo>/releases",
-  "notes": "B0.8: 战备架一次 48 个模组、默认矢量风、顶栏换成大按钮、新增 Win7 风与计算器"
+  "version": "G1.0",
+  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.0/AKM_Launcher_vG1.0.zip",
+  "sha256": "",
+  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.0",
+  "notes": "G1.0 正式版：5 套界面风格（复古/矢量/科幻/千禧年/Win7）、顶栏大按钮、模组战备架 48 个、计算器、全免费"
 }

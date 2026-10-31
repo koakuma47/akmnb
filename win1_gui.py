@@ -79,7 +79,7 @@ except Exception:  # pragma: no cover - tkinter always ships with CPython on Win
 # ---------------------------------------------------------------------------
 
 APP_NAME = "AKM Launcher"
-APP_VERSION = "B0.8"
+APP_VERSION = "G1.0"
 
 # ---------------------------------------------------------------------------
 # Internationalisation (zh / en / ja / ru / ar)
@@ -10528,7 +10528,6 @@ class Win1App:
     def __init__(self):
         self._enable_dpi()
         self.config, self.auth, self.alias = bootstrap_files()
-        self._migrate_defaults()
         set_language(self.config.get("language"))
         self._relaunch_ui = False
         self.theme = set_global_theme(self.config.get("theme"))
@@ -10766,6 +10765,7 @@ class Win1App:
         self._update_controls()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(90, self._poll_ui)
+        self._migrate_defaults()
         self.say("AKM 系统就绪 // 目标 {0} / {1}".format(self.mc_version, self.mod_loader))
         self.root.after(200, self.refresh_hot)
         self.root.after(300, self.refresh_versions)
@@ -11746,26 +11746,34 @@ class Win1App:
                 continue
 
     def _center_window(self, width, height):
-        if UI_VECTOR:
-            width = max(width, 1040)
-            height = max(height, 660 if UI_STYLE == "retro" else 780)
         self.root.update_idletasks()
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
+        if UI_VECTOR:
+            width = max(width, 1040)
+            height = max(height, 660 if UI_STYLE == "retro" else 780)
+        width = min(width, max(900, screen_w - 60))
+        height = min(height, max(600, screen_h - 90))
         pos_x = max(0, int((screen_w - width) / 2))
         pos_y = max(0, int((screen_h - height) / 2) - 20)
         self.root.geometry("{0}x{1}+{2}+{3}".format(width, height, pos_x, pos_y))
-        self.root.minsize(960, 760 if UI_VECTOR else 660)
+        self.root.minsize(min(960, width), min(760 if UI_VECTOR else 660, height))
 
     def _ensure_window_fits(self):
-        """Grow the window so the current style is not clipped."""
+        """Grow the window so the current style is not clipped (screen aware)."""
         try:
             self.root.update_idletasks()
-            need_w = max(self.root.winfo_reqwidth(), self.root.winfo_width())
-            need_h = max(self.root.winfo_reqheight(), self.root.winfo_height())
+            screen_w = self.root.winfo_screenwidth()
+            screen_h = self.root.winfo_screenheight()
+            max_w = max(900, screen_w - 60)
+            max_h = max(600, screen_h - 90)
+            need_w = min(max(self.root.winfo_reqwidth(), self.root.winfo_width()), max_w)
+            need_h = min(max(self.root.winfo_reqheight(), self.root.winfo_height()), max_h)
             if UI_VECTOR:
-                need_h = max(need_h, 780)
-            self.root.minsize(960, 760 if UI_VECTOR else 660)
+                need_h = max(need_h, min(780, max_h))
+            self.root.minsize(
+                min(960, need_w), min(760 if UI_VECTOR else 660, need_h)
+            )
             if (
                 need_w > self.root.winfo_width()
                 or need_h > self.root.winfo_height()
