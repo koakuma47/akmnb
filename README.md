@@ -1,4 +1,4 @@
-# AKM Launcher (Adaptive Kinetic Minecraft) G1.2
+# AKM Launcher (Adaptive Kinetic Minecraft) G1.3
 
 **免费开源：不收费、无内购、无付费版 —— 任何向你收费的都是盗卖。**
 
@@ -11,19 +11,19 @@
 
 ## 下载
 
-**最新正式版：G1.2**
+**最新正式版：G1.3**
 
-- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vG1.2/AKM_Launcher_vG1.2.zip>
-- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vG1.2>
+- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vG1.3/AKM_Launcher_vG1.3.zip>
+- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vG1.3>
 
 单文件免安装，解压后双击 `AKM_Launcher.exe` 就能用，不需要装 Python。
 下载后想核对完整性，可以和发布页里 `SHA256.txt` 的值比对一下。
 
-> **G1.2 更新：模组体检加了「加载器筛查」。** 1.20.2 之后 NeoForge 和 Forge 彻底
-> 分家，同一个模组在 1.21 上常常只有 NeoForge 版，装进 Forge 实例必崩。体检窗口
-> 现在多一排 `[ 不限 ] [ NEOFORGE ] [ FORGE ] [ FABRIC ] [ QUILT ]`，会对每个
-> 加载器单独核对目标版本有没有构建；只有别的加载器的包会被标成琥珀色 `[LDR!]`，
-> 「一键更新」也只会装你那个加载器的 jar。
+> **G1.3 更新：装原版变快了。** 之前 client.jar 这类大文件只开一条连接，实测只有
+> 0.2~0.4 MB/s；现在 ≥4 MB 的文件会切成多段、按大小开 8/16/32 条连接同时拉，
+> 同一条线路能到 1 MB/s 以上（32 连接实测峰值 2.3 MB/s），装 1.20.1 时客户端那一步
+> 从 70 秒缩到 23 秒。另外 BMCLAPI 的 `/version/x/client` 其实是两次 302 跳到 Mojang，
+> 现在只解析一次，分片直接连 CDN。
 
 ## 怎么用
 

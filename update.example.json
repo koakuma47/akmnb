@@ -1,7 +1,7 @@
 {
-  "version": "G1.2",
-  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.2/AKM_Launcher_vG1.2.zip",
-  "sha256": "246D3D572E9158FAB9A5591F147857E924636A13415E1CF79EEB362C75F4466D",
-  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.2",
-  "notes": "G1.2：模组体检新增加载器筛查（NeoForge / Forge / Fabric / Quilt），1.20.2 后跨加载器的包会被标为不可用"
+  "version": "G1.3",
+  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.3/AKM_Launcher_vG1.3.zip",
+  "sha256": "D69EA51C03D2B8EFA20AF35EFC1B496841D17A153AE4408E4F91D47282603D86",
+  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.3",
+  "notes": "G1.3：装原版提速 —— client.jar 等大文件改多连接分段下载，同一条线路从 0.3 MB/s 提到 1 MB/s 以上"
 }
