@@ -1,4 +1,4 @@
-AKM Launcher G1.3 发布说明
+AKM Launcher G1.4 发布说明
 ====================================
 
 一、这是什么
@@ -13,7 +13,57 @@ AKM Launcher G1.3 发布说明
   5. 模组战备架、模组加载器、整合包、版本隔离、光影材质、四个小游戏
   6. 模组版本体检：拖入 jar + 目标版本 -> 筛出有对应版本的模组（含加载器筛查）
 
-三、G1.3：原版下载提速（大文件多连接分段下载）
+三、G1.4：修复「游戏无法启动」+ 终止启动按钮卡死
+
+  [ 重大问题 ] 点 [ 点燃起飞 ] 后游戏起不来
+  真正的原因不是 Java、不是内存，而是 Forge 的补丁产物缺文件。
+  游戏日志里的关键行：
+    java.io.IOException: Invalid paths argument, contained no existing paths:
+      libraries\net\minecraft\client\1.20.1-20230612.114412\
+        client-1.20.1-20230612.114412-srg.jar
+      ...-extra.jar
+      libraries\net\minecraftforge\forge\1.20.1-47.4.28\
+        forge-1.20.1-47.4.28-client.jar
+
+  这三个 jar 不是下载来的，是 Forge 安装器的「处理器」现场生成的。
+  加载器安装只跑了一半（版本 JSON 和 universal jar 有了，处理器没跑完）时，
+  启动器以前查不出来：它只检查了启动命令里 -cp 的条目，而这三个文件
+  根本不在命令里 —— Forge 是启动时自己按版本号算路径去找的。
+
+  [ 修复 ] 启动前做完整自检 + 自动修复
+  - 启动命令里所有 .jar 都检查（-cp、以及 Forge/NeoForge 的
+    legacyClassPath 之类的长参数），缺一个都不放过
+  - 额外按「安装目录」核对加载器产物：Forge 的 -universal.jar / -client.jar，
+    1.20.1 及更早还要检查 libraries\net\minecraft\client 下的 *-srg.jar；
+    NeoForge 检查 universal / installer
+  - 一旦确认缺失，自动按版本号解析出「加载器 + MC 版本 + 加载器版本」
+    （1.20.1-forge-47.4.28 / fabric-loader-0.16.5-1.21.1 都认），
+    重跑一次加载器安装器把处理器补上，再补一遍原版库/资源，然后重新组装命令
+  - 修完仍然缺，才报错并写清楚怎么办（去 [ 游戏 ] -> [ 模组加载器 ] 重装）
+  - 顺手修掉一个自己挖的坑：-DignoreList= / -DmergeModules= 里的模块名
+    （asm-commons、jna-5.10.0.jar 之类）以前会被误判成「缺失文件」，
+    导致每次启动 Forge 都白跑一次修复
+
+  [ 修复 ] 点 [ 终止启动 ] 后「点燃起飞」一直是灰的
+  - 以前取消只在三个瞬间检查，卡在安装/组装里就一直等：现在把
+    终止信号传进 minecraft-launcher-lib 的安装回调，几十毫秒内就会中断
+  - 再加一道兜底：点终止 4 秒后如果序列还在跑，自动把界面放回
+    「LAUNCH: CANCELLED」并让点火按钮恢复可点，真跑起来前还会再检查一次
+    取消标记，不会莫名其妙把游戏拉起来
+  - 终止时进度条也会一起归零
+
+  [ 实测 ]
+  - 复现：1.20.1-forge-47.4.28 缺 3 个补丁 jar -> 启动必崩（已复现）
+  - 自检：修复前 self-check 报出缺失文件；补上后启动命令 104 个 jar 全在
+  - 自动修复：155 秒跑完 Forge 安装器（下载 installer + 跑处理器），
+    之后 libraries\net\minecraft\client 出现，forge-1.20.1-47.4.28-client.jar 生成
+  - 修复后点火：游戏正常进入，日志跑到
+    「Created: 1024x1024x4 minecraft:textures/atlas/armor_trims.png-atlas」，
+    15 秒后进程仍在运行
+  - 按钮：点火中 disabled -> 点终止 -> 4 秒兜底后 normal；
+    正常取消路径也是 normal（state=LAUNCH: CANCELLED）
+
+四、上一版（G1.3）：原版下载提速（大文件多连接分段下载）
 
   [ 问题 ] 装原版时 client.jar 那一阶段特别慢
   实测下来不是网速的问题，是「一个文件只开一条连接」：
@@ -42,7 +92,7 @@ AKM Launcher G1.3 发布说明
   - SHA1 校验通过，文件大小与官方一致（23028853 字节）
   - 小文件（< 4 MB）仍然走单连接 + keep-alive，行为不变
 
-四、上一版（G1.2）：模组体检加「加载器筛查」
+五、上一版（G1.2）：模组体检加「加载器筛查」
 
   1.20.2 之后 NeoForge 和 Forge 彻底分道扬镳，同一个模组在 1.21 上往往只发
   NeoForge 版，Forge 实例装上去直接崩。体检现在会把这个坑单独标出来。
@@ -73,7 +123,7 @@ AKM Launcher G1.3 发布说明
   - 联网（目标 1.20.1 + NEOFORGE）：EntityCulling 没有 NeoForge 构建，
     回退到 Forge 构建并判为可用（1.20.1 同代兼容）
 
-五、上一版（G1.1）：顶部横幅只留启动器名字
+六、上一版（G1.1）：顶部横幅只留启动器名字
 
   [ 界面 ] 顶部横幅只留启动器名字
   - 删掉横幅副标题「MINECRAFT 启动器 // 1985 风格控制台」
@@ -86,7 +136,7 @@ AKM Launcher G1.3 发布说明
     标题 "AKM LAUNCHER" 与版本徽标 G1.1 正常显示
   - 矢量风与 1985 复古分别截图确认：横幅只剩图标 + 名字 + 版本
 
-六、上一版（G1.0）：正式版
+七、上一版（G1.0）：正式版
 
   本版把 B0.8 的功能收口，修掉几处边角问题，正式定版为 G1.0。
 

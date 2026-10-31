@@ -79,7 +79,7 @@ except Exception:  # pragma: no cover - tkinter always ships with CPython on Win
 # ---------------------------------------------------------------------------
 
 APP_NAME = "AKM Launcher"
-APP_VERSION = "G1.3"
+APP_VERSION = "G1.4"
 
 # ---------------------------------------------------------------------------
 # Internationalisation (zh / en / ja / ru / ar)
@@ -13124,7 +13124,12 @@ class Win1App:
             return
         if self._launching:
             self._launch_cancel.set()
+            self._set_launch_state("LAUNCH: CANCELLING", "active")
             self.say("已发送终止信号 // 启动序列正在停止")
+            try:
+                self.root.after(4000, self._launch_cancel_watchdog)
+            except Exception:
+                pass
             return
         process = self.game_process
         if process is not None:
@@ -15824,6 +15829,7 @@ class Win1App:
         cancel=None,
         progress=None,
         monitor=None,
+        java=None,
     ):
         """Install one mod loader into self.mc_dir.
 
@@ -15864,7 +15870,7 @@ class Win1App:
         import minecraft_launcher_lib.mod_loader as mll_loader
 
         loader = mll_loader.get_mod_loader(loader_id)
-        java_path = str(self.config.get("java") or "").strip() or None
+        java_path = str(java or self.config.get("java") or "").strip() or None
         row_key = "loader:{0}".format(loader_id)
         if monitor is not None:
             monitor.ensure(
@@ -22059,8 +22065,21 @@ class Win1App:
         self._launching = False
         self._launch_cancel.clear()
         self._set_launch_state("LAUNCH: CANCELLED", "idle")
+        self.post(self._set_task_progress, 0, 0, False)
         self._update_controls()
         self.say("启动已终止 // 游戏进程没有创建，可随时重新点火")
+
+    def _launch_cancel_watchdog(self):
+        """用户点了终止但线程还卡在安装/组装里：4 秒后强制把界面放回可用状态。"""
+        if not getattr(self, "_launching", False):
+            return
+        if not self._launch_cancel.is_set():
+            return
+        self._launching = False
+        self._set_launch_state("LAUNCH: CANCELLED", "idle")
+        self.post(self._set_task_progress, 0, 0, False)
+        self._update_controls()
+        self.say("启动序列已强制中止 // 点火按钮已恢复，可以重新点火")
 
     def _check_launch_cancel(self):
         if self._launch_cancel.is_set():
@@ -22112,22 +22131,29 @@ class Win1App:
             self._launching = False
             self.post(self._update_controls)
 
-    def _install_callback(self, label="核心"):
+    def _install_callback(self, label="核心", cancel=None):
         state = {"max": 0, "last": 0.0, "pct": -1}
 
+        def check():
+            if cancel is not None:
+                check_cancel(cancel)
+
         def set_status(text):
+            check()
             now = time.time()
             if now - state["last"] > 0.4:
                 state["last"] = now
                 self.say("{0} :: {1}".format(label, text))
 
         def set_max(value):
+            check()
             try:
                 state["max"] = int(value)
             except Exception:
                 state["max"] = 0
 
         def set_progress(value):
+            check()
             try:
                 current = int(value)
             except Exception:
@@ -22204,7 +22230,9 @@ class Win1App:
             self.say("本地版本缺少客户端 jar，尝试修复: {0}".format(selected))
             self.post(self._set_launch_state, "LAUNCH: REPAIR", "active")
             mll.install.install_minecraft_version(
-                selected, self.mc_dir, self._install_callback()
+                selected,
+                self.mc_dir,
+                self._install_callback(cancel=self._launch_cancel),
             )
             self.post(self.refresh_versions)
             self.say("所选版本修复完成: {0}".format(selected))
@@ -22271,7 +22299,9 @@ class Win1App:
         )
         self.post(self._set_launch_state, "LAUNCH: INSTALL CORE", "active")
         mll.install.install_minecraft_version(
-            version_id, self.mc_dir, self._install_callback()
+            version_id,
+            self.mc_dir,
+            self._install_callback(cancel=self._launch_cancel),
         )
         if not os.path.exists(version_json):
             raise LauncherError(
@@ -22304,18 +22334,160 @@ class Win1App:
             current = str(data.get("inheritsFrom") or "").strip()
         return "", 0
 
-    def _missing_classpath_entry(self, command):
-        try:
-            for index, part in enumerate(command):
-                text = str(part)
-                if text in {"-cp", "-classpath"} and index + 1 < len(command):
-                    classpath = str(command[index + 1])
-                    for entry in classpath.split(os.pathsep):
-                        entry = entry.strip().strip('"')
-                        if not entry or "*" in entry:
+    def _launch_jar_paths(self, command):
+        """Every .jar the launch command points at.
+
+        Covers ``-cp`` as well as Forge/NeoForge's ``-DlegacyClassPath=`` and
+        ``-DignoreList=`` (those jars - the srg/extra/patched client - are
+        produced by the loader's processors, and a half-finished loader install
+        leaves the command pointing at files that do not exist).
+        """
+        found = []
+        for part in command or []:
+            text = str(part or "")
+            if ".jar" not in text.lower():
+                continue
+            for chunk in text.split(";"):
+                piece = chunk.strip().strip('"').strip("'")
+                if not piece:
+                    continue
+                if "=" in piece:
+                    piece = piece.split("=", 1)[1].strip().strip('"').strip("'")
+                if not piece.lower().endswith(".jar"):
+                    continue
+                if "\\" not in piece and "/" not in piece:
+                    # -DignoreList / -DmergeModules carry bare module names
+                    continue
+                if piece.lower().startswith(("http://", "https://")):
+                    continue
+                found.append(piece)
+        return found
+
+    def _loader_missing_files(self, version_id):
+        """加载器补丁产物是否齐全（Forge 的 -client.jar 由安装器处理器生成）。
+
+        Forge 1.19 ~ 1.20.1 启动时会自己去 ``libraries/net/minecraft/client``
+        找 ``*-srg.jar`` / ``*-extra.jar``，这些文件不在启动命令里，所以只能按
+        安装目录检查；缺了就是安装器没跑完，重装一次加载器即可。
+        """
+        loader_id, mc_version, loader_version = self._version_loader_parts(version_id)
+        if not loader_id or not mc_version or not loader_version:
+            return ""
+        libs = os.path.join(self.mc_dir, "libraries")
+        if loader_id == "forge":
+            base = os.path.join(
+                libs,
+                "net",
+                "minecraftforge",
+                "forge",
+                "{0}-{1}".format(mc_version, loader_version),
+            )
+            for suffix in ("-universal.jar", "-client.jar"):
+                path = os.path.join(
+                    base,
+                    "forge-{0}-{1}{2}".format(mc_version, loader_version, suffix),
+                )
+                if not os.path.isfile(path):
+                    return path
+            if _mc_compare(_mc_tuple(mc_version), (1, 20, 1)) <= 0:
+                client_root = os.path.join(libs, "net", "minecraft", "client")
+                has_srg = False
+                if os.path.isdir(client_root):
+                    for name in os.listdir(client_root):
+                        folder = os.path.join(client_root, name)
+                        if not os.path.isdir(folder):
                             continue
-                        if not os.path.exists(entry):
-                            return entry
+                        try:
+                            jars = os.listdir(folder)
+                        except OSError:
+                            continue
+                        if any(item.endswith("-srg.jar") for item in jars):
+                            has_srg = True
+                            break
+                if not has_srg:
+                    return os.path.join(
+                        client_root,
+                        "{0}-<timestamp>".format(mc_version),
+                        "client-{0}-<timestamp>-srg.jar".format(mc_version),
+                    )
+        elif loader_id == "neoforge":
+            base = os.path.join(
+                libs, "net", "neoforged", "neoforge", loader_version
+            )
+            for suffix in ("-universal.jar", "-installer.jar"):
+                path = os.path.join(
+                    base, "neoforge-{0}{1}".format(loader_version, suffix)
+                )
+                if os.path.isfile(path):
+                    return ""
+            return os.path.join(
+                base, "neoforge-{0}-universal.jar".format(loader_version)
+            )
+        return ""
+
+    def _version_loader_parts(self, version_id):
+        """版本 id -> (loader, mc_version, loader_version)，认不出就返回空。"""
+        vid = str(version_id or "").strip()
+        match = re.match(r"^fabric-loader-(.+)-(\d+\.\d+(?:\.\d+)?)$", vid)
+        if match:
+            return "fabric", match.group(2), match.group(1)
+        match = re.match(r"^quilt-loader-(.+)-(\d+\.\d+(?:\.\d+)?)$", vid)
+        if match:
+            return "quilt", match.group(2), match.group(1)
+        match = re.match(r"^(\d+\.\d+(?:\.\d+)?)-forge-(.+)$", vid)
+        if match:
+            return "forge", match.group(1), match.group(2)
+        match = re.match(r"^(\d+\.\d+(?:\.\d+)?)-neoforge-(.+)$", vid)
+        if match:
+            return "neoforge", match.group(1), match.group(2)
+        return "", "", ""
+
+    def _repair_launch_version(self, mll, version_id):
+        """补齐启动缺失的文件。
+
+        加载器版本（Forge / NeoForge / Fabric / Quilt）先按加载器重跑一遍安装器：
+        Forge 的 srg / patched client jar 只有安装器的处理器会生成，
+        ``install_minecraft_version`` 补不了。最后再走一次原版补齐库与资源。
+        """
+        self._check_launch_cancel()
+        loader_id, mc_version, loader_version = self._version_loader_parts(version_id)
+        if loader_id:
+            label = LOADER_LABELS.get(loader_id, loader_id)
+            self.say(
+                "重装加载器 {0} {1} // 补齐 srg / patched jar".format(
+                    label, loader_version or ""
+                )
+            )
+            java_path = str(self.config.get("java") or "").strip()
+            if not java_path:
+                required = 21 if loader_id == "neoforge" else 17
+                java_path = (
+                    find_java_executable(self.mc_dir, "", required) or ""
+                )
+            self._install_loader_sync(
+                loader_id,
+                mc_version,
+                loader_version,
+                cancel=self._launch_cancel,
+                progress=self._vanilla_progress_from_thread,
+                monitor=DOWNLOAD_MONITOR,
+                java=java_path or None,
+            )
+            self._check_launch_cancel()
+        self.say("补齐原版库 / 资源 / 客户端 jar ...")
+        mll.install.install_minecraft_version(
+            version_id,
+            self.mc_dir,
+            self._install_callback(cancel=self._launch_cancel),
+        )
+        self._check_launch_cancel()
+
+    def _missing_classpath_entry(self, command):
+        """First jar the command references that is not on disk ("" when fine)."""
+        try:
+            for path in self._launch_jar_paths(command):
+                if not os.path.exists(path):
+                    return path
         except Exception:
             return ""
         return ""
@@ -22410,7 +22582,9 @@ class Win1App:
                         mll.runtime.install_jvm_runtime(
                             java_component,
                             self.mc_dir,
-                            self._install_callback("Java 运行时"),
+                            self._install_callback(
+                                "Java 运行时", cancel=self._launch_cancel
+                            ),
                         )
                     except Exception as exc:
                         raise LauncherError(
@@ -22459,10 +22633,10 @@ class Win1App:
             self.say("启动命令组装失败，尝试修复本地版本 ...")
             self.post(self._set_launch_state, "LAUNCH: REPAIR", "active")
             try:
-                mll.install.install_minecraft_version(
-                    version_id, self.mc_dir, self._install_callback()
-                )
+                self._repair_launch_version(mll, version_id)
                 command = build_command()
+            except OperationCancelled:
+                raise
             except Exception as repair_exc:
                 raise LauncherError(
                     "组装启动命令失败: {0}\n修复尝试失败: {1}".format(
@@ -22472,28 +22646,33 @@ class Win1App:
         if not command:
             raise LauncherError("启动命令为空，无法点火")
 
-        missing_entry = self._missing_classpath_entry(command)
+        missing_entry = self._missing_classpath_entry(command) or self._loader_missing_files(
+            version_id
+        )
         if missing_entry:
-            self.say(
-                "启动类路径缺少文件，尝试修复: {0}".format(missing_entry)
-            )
+            self.say("启动文件缺失，尝试修复: {0}".format(missing_entry))
             self.post(self._set_launch_state, "LAUNCH: REPAIR", "active")
             try:
-                mll.install.install_minecraft_version(
-                    version_id, self.mc_dir, self._install_callback()
-                )
+                self._repair_launch_version(mll, version_id)
                 command = build_command()
+            except OperationCancelled:
+                raise
             except Exception as repair_exc:
                 raise LauncherError(
-                    "启动类路径缺少文件: {0}\n修复失败: {1}".format(
+                    "启动文件缺失: {0}\n修复失败: {1}".format(
                         missing_entry, repair_exc
                     )
                 ) from None
-            missing_entry = self._missing_classpath_entry(command)
+            missing_entry = self._missing_classpath_entry(command) or self._loader_missing_files(
+                version_id
+            )
             if missing_entry:
                 raise LauncherError(
-                    "启动类路径仍缺少文件: {0}\n"
-                    "请删除该版本后重新安装，或检查游戏目录权限。".format(
+                    "启动文件仍然缺失: {0}\n"
+                    "这通常是模组加载器没装完整（Forge / NeoForge 的处理器没跑完，"
+                    "srg / patched jar 没生成）。\n"
+                    "请到 [ 游戏 ] -> [ 模组加载器 ] 重新安装一次该加载器，"
+                    "或删除该版本目录后重新安装。".format(
                         missing_entry
                     )
                 )
@@ -22512,6 +22691,7 @@ class Win1App:
         log_handle.flush()
 
         self.post(self._set_launch_state, "LAUNCH: STARTING", "active")
+        self._check_launch_cancel()
         creation_flags = 0x08000000 if os.name == "nt" else 0
         try:
             process = subprocess.Popen(
