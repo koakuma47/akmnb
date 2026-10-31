@@ -79,7 +79,7 @@ except Exception:  # pragma: no cover - tkinter always ships with CPython on Win
 # ---------------------------------------------------------------------------
 
 APP_NAME = "AKM Launcher"
-APP_VERSION = "G1.2"
+APP_VERSION = "G1.3"
 
 # ---------------------------------------------------------------------------
 # Internationalisation (zh / en / ja / ru / ar)
@@ -1295,6 +1295,23 @@ ASSET_WORKERS = 32
 ASSET_TIMEOUT = 25
 LIBRARY_TIMEOUT = 60
 CLIENT_TIMEOUT = 90
+# Big files (client.jar ~27 MB, big natives, loader installers) come down faster
+# over several range connections: one socket is capped around 0.2-0.4 MB/s while
+# 12-16 parallel ranges reach the link speed (~1.3 MB/s measured).
+PARALLEL_MIN_BYTES = 4 * 1024 * 1024
+PARALLEL_WORKERS = 32
+PARALLEL_CHUNK_MIN = 1024 * 1024
+
+
+def parallel_worker_count(size):
+    """More sockets for bigger files: throughput scales with the connection
+    count (measured on one link: x8 0.6 MB/s, x16 0.7, x24 1.3, x32 2.3)."""
+    size = int(size or 0)
+    if size >= 16 * 1024 * 1024:
+        return PARALLEL_WORKERS
+    if size >= 8 * 1024 * 1024:
+        return 16
+    return 8
 VANILLA_PHASE_LABELS = {
     "manifest": "VERSION MANIFEST",
     "version_json": "VERSION JSON",
@@ -7339,6 +7356,8 @@ def install_java_runtime(major, mc_dir, progress=None, cancel=None, say=None):
         progress=progress,
         cancel=cancel,
         timeout=180,
+        parallel=True,
+        label="java-{0}.zip".format(major),
     )
     unpack_dir = tempfile.mkdtemp(prefix="akm-java-{0}-".format(major), dir=root)
     target = java_runtime_dir(mc_dir, major)
@@ -7472,6 +7491,10 @@ class _DownloadStream(object):
         self._response = response
         self._conn = conn
         self._key = key
+        try:
+            self.status = int(getattr(response, "status", 0) or 0)
+        except Exception:
+            self.status = 0
 
     def read(self, amount=None):
         if amount is None:
@@ -7538,10 +7561,17 @@ def _pooled_conn(key, timeout):
     return conn
 
 
-def open_download_stream(url, timeout=60, keepalive=False):
-    """Open ``url``; with ``keepalive`` reuse this thread's TLS connection."""
+def open_download_stream(url, timeout=60, keepalive=False, extra_headers=None):
+    """Open ``url``; with ``keepalive`` reuse this thread's TLS connection.
+
+    ``extra_headers`` lets the range-download path ask for a byte window on the
+    same connection machinery (no urllib, no per-chunk handshake).
+    """
+    headers = {"User-Agent": USER_AGENT}
+    if extra_headers:
+        headers.update({str(k): str(v) for k, v in extra_headers.items()})
     if not keepalive:
-        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        request = urllib.request.Request(url, headers=headers)
         try:
             response = urllib.request.urlopen(request, timeout=timeout)
         except urllib.error.HTTPError as exc:
@@ -7561,11 +7591,13 @@ def open_download_stream(url, timeout=60, keepalive=False):
                 conn.request(
                     "GET",
                     path,
-                    headers={
-                        "User-Agent": USER_AGENT,
-                        "Accept-Encoding": "identity",
-                        "Connection": "keep-alive",
-                    },
+                    headers=dict(
+                        headers,
+                        **{
+                            "Accept-Encoding": "identity",
+                            "Connection": "keep-alive",
+                        }
+                    ),
                 )
                 response = conn.getresponse()
                 break
@@ -7589,7 +7621,7 @@ def open_download_stream(url, timeout=60, keepalive=False):
                 remember_asset_cdn(location)
             current = urllib.parse.urljoin(current, location)
             continue
-        if response.status != 200:
+        if response.status not in (200, 206):
             try:
                 response.read()
             except Exception:
@@ -7837,6 +7869,273 @@ class DownloadMonitor(object):
 DOWNLOAD_MONITOR = DownloadMonitor()
 
 
+class _ParallelUnsupported(Exception):
+    """The source does not offer byte ranges - caller keeps the single stream."""
+
+
+def probe_source_url(url, timeout=20):
+    """Resolve redirects once and report (final_url, status, total_size).
+
+    BMCLAPI answers ``/version/<id>/client`` with a 302 chain that ends on
+    piston-data; probing once means every range chunk hits the CDN directly
+    instead of paying two redirect round-trips per chunk.
+    """
+    current = str(url or "")
+    if not current:
+        return "", 0, 0
+    for _hop in range(5):
+        parts = urllib.parse.urlsplit(current)
+        path = parts.path or "/"
+        if parts.query:
+            path = path + "?" + parts.query
+        conn = None
+        status = 0
+        location = ""
+        total = 0
+        try:
+            if parts.scheme == "https":
+                conn = http.client.HTTPSConnection(
+                    parts.netloc, timeout=timeout, context=_TLS_CONTEXT
+                )
+            else:
+                conn = http.client.HTTPConnection(parts.netloc, timeout=timeout)
+            conn.request(
+                "GET",
+                path,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Range": "bytes=0-0",
+                    "Accept-Encoding": "identity",
+                },
+            )
+            response = conn.getresponse()
+            status = response.status
+            location = str(response.getheader("Location") or "").strip()
+            content_range = str(response.getheader("Content-Range") or "")
+            if "/" in content_range:
+                tail = content_range.rsplit("/", 1)[-1].strip()
+                if tail.isdigit():
+                    total = int(tail)
+            if not total:
+                # a host that ignores Range answers 200 + full Content-Length
+                length = str(response.getheader("Content-Length") or "")
+                if length.isdigit():
+                    total = int(length)
+            try:
+                response.read()
+            except Exception:
+                pass
+        except Exception:
+            return current, 0, 0
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        if status in (301, 302, 303, 307, 308) and location:
+            current = urllib.parse.urljoin(current, location)
+            continue
+        return current, status, total
+    return current, 0, 0
+
+
+def parallel_download(
+    url_pairs,
+    dest,
+    sha1="",
+    size=0,
+    progress=None,
+    cancel=None,
+    timeout=60,
+    health=None,
+    monitor=None,
+    label="",
+    workers=None,
+    chunk=None,
+):
+    """Fetch one big file over several range connections.
+
+    A single socket is capped far below the link speed (measured: client.jar
+    ~0.2-0.4 MB/s on one stream versus ~1.3 MB/s over 16 ranges), so big files
+    are split into pieces pulled in parallel and stitched back together.
+    Raises :class:`_ParallelUnsupported` when the host does not do byte ranges,
+    so the caller can keep the plain single-stream path.
+    """
+    expected_size = int(size or 0)
+    pairs = [(tag, url) for tag, url in (url_pairs or []) if url]
+    if not pairs:
+        raise _ParallelUnsupported("no url")
+    if expected_size and expected_size < PARALLEL_MIN_BYTES:
+        raise _ParallelUnsupported("small file")
+
+    probes = []
+    for tag, url in pairs:
+        final, status, total = probe_source_url(url, timeout=min(20, timeout))
+        probes.append((tag, final, status, total))
+    if expected_size <= 0:
+        # caller did not know the size (java archive): take what the probe saw
+        sizes = [
+            total
+            for _tag, _final, status, total in probes
+            if status in (200, 206) and total > 0
+        ]
+        expected_size = max(sizes) if sizes else 0
+    if expected_size < PARALLEL_MIN_BYTES:
+        raise _ParallelUnsupported("small file")
+
+    resolved = []
+    seen = set()
+    for tag, final, status, total in probes:
+        if status != 206:
+            # 200 means the host ignored Range: every chunk would get the
+            # whole file, so keep this source for the single-stream path only
+            continue
+        if total and total != expected_size:
+            continue
+        if not final or final in seen:
+            continue
+        seen.add(final)
+        resolved.append((tag, final))
+    if not resolved:
+        raise _ParallelUnsupported("no range support")
+
+    wanted = int(workers or 0) or parallel_worker_count(expected_size)
+    wanted = max(2, min(wanted, PARALLEL_WORKERS, 32))
+    piece = int(chunk or 0) or -(-expected_size // wanted)
+    piece = max(PARALLEL_CHUNK_MIN, min(piece, expected_size))
+
+    jobs = []
+    start = 0
+    index = 0
+    while start < expected_size:
+        end = min(start + piece, expected_size) - 1
+        tag, url = resolved[index % len(resolved)]
+        jobs.append({"tag": tag, "url": url, "start": start, "end": end})
+        start = end + 1
+        index += 1
+
+    ensure_dir(os.path.dirname(dest))
+    tmp_path = "{0}.{1}.ptmp".format(dest, threading.get_ident())
+    display = str(label or os.path.basename(dest) or dest)
+    if monitor is not None:
+        monitor.begin(dest, display, expected_size)
+
+    counter = {"done": 0}
+    counter_lock = threading.Lock()
+    used_tags = []
+    throttle = {"last": 0.0}
+
+    def note_progress(step, tag):
+        with counter_lock:
+            counter["done"] += step
+            done = counter["done"]
+        used_tags.append(tag)
+        if monitor is not None:
+            monitor.update(dest, done, expected_size)
+        if progress is not None:
+            now = time.time()
+            if done >= expected_size or now - throttle["last"] >= 0.2:
+                throttle["last"] = now
+                try:
+                    progress(done, expected_size)
+                except Exception:
+                    pass
+
+    def fetch(job):
+        last_error = None
+        span = "{0}-{1}".format(job["start"], job["end"])
+        for attempt in range(2):
+            check_cancel(cancel)
+            tag = job["tag"]
+            url = job["url"]
+            if attempt:
+                other = [item for item in resolved if item[1] != url]
+                if other:
+                    tag, url = other[0]
+            stream = None
+            try:
+                stream = open_download_stream(
+                    url,
+                    timeout,
+                    keepalive=True,
+                    extra_headers={"Range": "bytes=" + span},
+                )
+                if getattr(stream, "status", 0) not in (0, 206):
+                    raise _ParallelUnsupported("no 206 for " + span)
+                expected = job["end"] - job["start"] + 1
+                got = 0
+                with open(tmp_path, "r+b") as handle:
+                    handle.seek(job["start"])
+                    while got < expected:
+                        check_cancel(cancel)
+                        block = stream.read(min(256 * 1024, expected - got))
+                        if not block:
+                            break
+                        handle.write(block)
+                        got += len(block)
+                        note_progress(len(block), tag)
+                if got != expected:
+                    raise LauncherError(
+                        "区间不完整 {0}: {1}/{2}".format(span, got, expected)
+                    )
+                if health is not None:
+                    health.note(tag, True)
+                return tag
+            except OperationCancelled:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if health is not None and isinstance(exc, _HttpStatusError):
+                    health.note(tag, False)
+            finally:
+                if stream is not None:
+                    try:
+                        stream.close(drain=True)
+                    except Exception:
+                        pass
+            if attempt == 0:
+                time.sleep(0.15)
+        raise LauncherError(
+            "分片下载失败 {0}: {1}".format(span, str(last_error)[:80])
+        )
+
+    try:
+        with open(tmp_path, "wb") as handle:
+            handle.truncate(expected_size)
+        with ThreadPoolExecutor(
+            max_workers=min(len(jobs), wanted), thread_name_prefix="akm-range"
+        ) as pool:
+            for _tag in pool.map(fetch, jobs):
+                pass
+        actual = os.path.getsize(tmp_path)
+        if actual != expected_size:
+            raise LauncherError(
+                "合并后大小不符: {0}/{1}".format(actual, expected_size)
+            )
+        if sha1 and sha1_file(tmp_path).lower() != str(sha1).lower():
+            raise LauncherError("SHA1 校验失败（分片下载）")
+        os.replace(tmp_path, dest)
+    except OperationCancelled:
+        _cleanup(tmp_path)
+        if monitor is not None:
+            monitor.finish(dest, "cancelled")
+        raise
+    except Exception:
+        _cleanup(tmp_path)
+        if monitor is not None:
+            monitor.finish(dest, "failed")
+        raise
+    if monitor is not None:
+        monitor.finish(dest, "done", expected_size)
+    if progress is not None:
+        try:
+            progress(expected_size, expected_size)
+        except Exception:
+            pass
+    return "downloaded", (used_tags[0] if used_tags else resolved[0][0])
+
+
 def download_to_dest(
     url_pairs,
     dest,
@@ -7849,13 +8148,16 @@ def download_to_dest(
     health=None,
     monitor=None,
     label="",
+    parallel=False,
+    workers=None,
 ):
     """Download one file with mirror/official fallback and optional SHA1.
 
     ``keepalive`` reuses this worker thread's TLS connection (big win for the
     thousands of tiny asset files), ``health`` lets the caller blacklist a
     source that keeps answering 404 for the rest of the install, ``monitor``
-    feeds the live "下载详情" file list.
+    feeds the live "下载详情" file list, ``parallel`` splits big files into
+    range requests (falls back to one stream when the host says no).
     """
     ensure_dir(os.path.dirname(dest))
     expected_size = int(size or 0)
@@ -7886,6 +8188,31 @@ def download_to_dest(
         usable = [item for item in pairs if not health.blocked(item[0])]
         if usable:
             pairs = usable
+    if parallel and pairs and (expected_size == 0 or expected_size >= PARALLEL_MIN_BYTES):
+        try:
+            return parallel_download(
+                pairs,
+                dest,
+                sha1=expected_sha1,
+                size=expected_size,
+                progress=progress,
+                cancel=cancel,
+                timeout=max(timeout, 30),
+                health=health,
+                monitor=monitor,
+                label=display,
+                workers=workers,
+            )
+        except OperationCancelled:
+            if monitor is not None:
+                monitor.finish(dest, "cancelled")
+            raise
+        except _ParallelUnsupported:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            # 分片失败就退回单连接，别让整个安装卡住
+            last_error = exc
+            log_debug("parallel download fell back: {0}".format(exc))
     for tag, url in pairs:
         for attempt in range(2):
             try:
@@ -8152,6 +8479,7 @@ def install_vanilla_game(
         timeout=CLIENT_TIMEOUT,
         monitor=monitor,
         label="client.jar",
+        parallel=True,
     )
     if say:
         say("客户端 jar: {0} ({1})".format(client_status, client_source))
@@ -8255,6 +8583,7 @@ def install_vanilla_game(
             health=health,
             monitor=monitor,
             label=os.path.basename(task["dest"]),
+            parallel=True,
         )
         if task["extract"]:
             extract_natives(task["dest"], task["extract"][0], task["extract"][1])
