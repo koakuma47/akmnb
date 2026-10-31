@@ -1,4 +1,4 @@
-# AKM Launcher (Adaptive Kinetic Minecraft) G1.1
+# AKM Launcher (Adaptive Kinetic Minecraft) G1.2
 
 **免费开源：不收费、无内购、无付费版 —— 任何向你收费的都是盗卖。**
 
@@ -11,16 +11,19 @@
 
 ## 下载
 
-**最新正式版：G1.1**
+**最新正式版：G1.2**
 
-- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vG1.1/AKM_Launcher_vG1.1.zip>
-- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vG1.1>
+- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vG1.2/AKM_Launcher_vG1.2.zip>
+- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vG1.2>
 
 单文件免安装，解压后双击 `AKM_Launcher.exe` 就能用，不需要装 Python。
 下载后想核对完整性，可以和发布页里 `SHA256.txt` 的值比对一下。
 
-> G1.1 只是小更新：顶部横幅去掉「MINECRAFT 启动器 // 1985 风格控制台」这行副标题，
-> 只留启动器名字 + 版本徽标；五种界面风格都是干净的标题条，功能没有变化。
+> **G1.2 更新：模组体检加了「加载器筛查」。** 1.20.2 之后 NeoForge 和 Forge 彻底
+> 分家，同一个模组在 1.21 上常常只有 NeoForge 版，装进 Forge 实例必崩。体检窗口
+> 现在多一排 `[ 不限 ] [ NEOFORGE ] [ FORGE ] [ FABRIC ] [ QUILT ]`，会对每个
+> 加载器单独核对目标版本有没有构建；只有别的加载器的包会被标成琥珀色 `[LDR!]`，
+> 「一键更新」也只会装你那个加载器的 jar。
 
 ## 怎么用
 

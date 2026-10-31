@@ -1,7 +1,7 @@
 {
-  "version": "G1.1",
-  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.1/AKM_Launcher_vG1.1.zip",
-  "sha256": "EA089E4060BE88C3DED10717246D678D270D351373CD1CE3176F29F5F6C56698",
-  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.1",
-  "notes": "G1.1 小更新：顶部横幅只留启动器名字（去掉 1985 风格控制台副标题），功能不变"
+  "version": "G1.2",
+  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.2/AKM_Launcher_vG1.2.zip",
+  "sha256": "246D3D572E9158FAB9A5591F147857E924636A13415E1CF79EEB362C75F4466D",
+  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.2",
+  "notes": "G1.2：模组体检新增加载器筛查（NeoForge / Forge / Fabric / Quilt），1.20.2 后跨加载器的包会被标为不可用"
 }
