@@ -79,7 +79,7 @@ except Exception:  # pragma: no cover - tkinter always ships with CPython on Win
 # ---------------------------------------------------------------------------
 
 APP_NAME = "AKM Launcher"
-APP_VERSION = "G1.1"
+APP_VERSION = "G1.2"
 
 # ---------------------------------------------------------------------------
 # Internationalisation (zh / en / ja / ru / ar)
@@ -3042,6 +3042,140 @@ def release_versions(values):
     return cleaned
 
 
+# -- loader matrix: NeoForge and Forge split after 1.20.1 --------------------
+
+AUDIT_LOADERS = ("neoforge", "forge", "fabric", "quilt")
+LOADER_SHORTS = {
+    "neoforge": "NEO",
+    "forge": "FRG",
+    "fabric": "FAB",
+    "quilt": "QLT",
+}
+# NeoForge 1.20.1 was still a Forge fork; from 1.20.2 on it is a separate
+# loader, so a build published for Forge can no longer be assumed to load on
+# NeoForge (and vice versa) once the target version is above this one.
+NEOFORGE_FORK_MC = (1, 20, 1)
+
+
+def loader_label(name):
+    key = str(name or "").strip().lower()
+    if not key:
+        return "不限"
+    return LOADER_LABELS.get(key, key.title())
+
+
+def loader_matches(target_loader, build_loader, target_mc=""):
+    """Can a build published for ``build_loader`` run under ``target_loader``?
+
+    True / False, or None when either side is unknown.
+    """
+    target = str(target_loader or "").strip().lower()
+    build = str(build_loader or "").strip().lower()
+    if not target or not build:
+        return None
+    if target == build:
+        return True
+    if target == "quilt" and build == "fabric":
+        return True  # Quilt 能直接加载 Fabric 模组
+    if target == "neoforge" and build == "forge":
+        target_tuple = _mc_tuple(target_mc)
+        if not target_tuple:
+            return None
+        return _mc_compare(target_tuple, NEOFORGE_FORK_MC) <= 0
+    return False
+
+
+def loader_builds_text(builds):
+    """{'neoforge': {...}, 'fabric': {...}} -> 'NEOFORGE 4.0.1 / FABRIC 0.5.3'."""
+    parts = []
+    for name in AUDIT_LOADERS:
+        item = (builds or {}).get(name)
+        if not item:
+            continue
+        version = item.get("version") if isinstance(item, dict) else str(item)
+        parts.append("{0} {1}".format(loader_label(name).upper(), version or "?"))
+    return " / ".join(parts)
+
+
+def loader_builds_short(builds):
+    """Compact column form: 'NEO/FAB' (empty string when nothing is known)."""
+    return "/".join(
+        LOADER_SHORTS.get(name, name[:3].upper())
+        for name in AUDIT_LOADERS
+        if (builds or {}).get(name)
+    )
+
+
+def pick_loader_build(builds, target_loader, target_mc=""):
+    """Best build for the requested loader -> (loader_name, info) or (None, None)."""
+    builds = builds or {}
+    wanted = str(target_loader or "").strip().lower()
+    if not wanted:
+        return None, None
+    order = [wanted]
+    if wanted == "quilt":
+        order.append("fabric")
+    elif wanted == "neoforge":
+        order.append("forge")  # only accepted while still on the 1.20.1 fork
+    for name in order:
+        info = builds.get(name)
+        if not info:
+            continue
+        if loader_matches(wanted, name, target_mc):
+            return name, info
+    return None, None
+
+
+def audit_loader_mismatch(row):
+    """目标版本有构建，但只有别的加载器的构建（1.20.2 后 NeoForge/Forge 分家）。"""
+    return row.get("ok") is True and row.get("loader_ok") is False
+
+
+def apply_loader_filter(rows, target_loader, target_mc=""):
+    """Recompute loader_ok / usable / preferred build for every audit row.
+
+    Called by ``audit_mod_jars`` after the network pass and again whenever the
+    user switches the target loader, so the column updates without re-querying.
+    """
+    wanted = str(target_loader or "").strip().lower()
+    for row in rows:
+        builds = row.get("loader_builds") or {}
+        row["loader_target"] = wanted
+        if builds:
+            results = [loader_matches(wanted, name, target_mc) for name in builds]
+            if any(item is True for item in results):
+                row["loader_ok"] = True
+            elif any(item is False for item in results):
+                row["loader_ok"] = False
+            else:
+                row["loader_ok"] = None
+        else:
+            # 没联网数据时，用 jar 自己声明的加载器兜底判断
+            row["loader_ok"] = loader_matches(
+                wanted, row.get("loader"), target_mc
+            )
+        pick_name, pick_info = pick_loader_build(builds, wanted, target_mc)
+        row["best_loader"] = pick_name or ""
+        if pick_info:
+            # 目标加载器有构建时，优先装它（否则会装成别的加载器的包）
+            row["ok"] = True
+            row["source"] = "modrinth"
+            if pick_info.get("version"):
+                row["best"] = pick_info["version"]
+            if pick_info.get("files"):
+                row["best_files"] = pick_info["files"]
+            if pick_info.get("loaders"):
+                row["best_loaders"] = ",".join(pick_info["loaders"])
+            row["best_id"] = pick_info.get("id") or row.get("best_id") or ""
+        if row.get("ok") is True and row.get("loader_ok") is False:
+            row["usable"] = False
+        elif row.get("ok") is None:
+            row["usable"] = None
+        else:
+            row["usable"] = bool(row.get("ok"))
+    return rows
+
+
 def audit_mod_jars(
     paths,
     target,
@@ -3095,7 +3229,45 @@ def audit_mod_jars(
             if isinstance(data, dict):
                 newest.update(data)
         if progress:
-            progress(2, 3, "找到 {0} 个 {1} 构建".format(len(newest), target))
+            progress(2, 4, "找到 {0} 个 {1} 构建".format(len(newest), target))
+        # per-loader matrix: which loaders shipped a build for exactly this MC version
+        matrix = {}
+        for index, name in enumerate(AUDIT_LOADERS, start=1):
+            hits_for_loader = 0
+            for chunk in _chunks(digests, 100):
+                try:
+                    data = modrinth_version_files(
+                        chunk, update=True, loaders=[name], game_versions=[target]
+                    )
+                except Exception:
+                    log_debug("audit loader matrix failed:\n" + traceback.format_exc())
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                for digest, info in data.items():
+                    if not isinstance(info, dict):
+                        continue
+                    matrix.setdefault(digest, {})[name] = {
+                        "version": str(info.get("version_number") or ""),
+                        "id": str(info.get("id") or ""),
+                        "loaders": [
+                            str(item) for item in (info.get("loaders") or [])
+                        ],
+                        "files": [
+                            item
+                            for item in (info.get("files") or [])
+                            if isinstance(item, dict) and item.get("url")
+                        ],
+                    }
+                    hits_for_loader += 1
+            if progress:
+                progress(
+                    2,
+                    4,
+                    "加载器筛查 {0}/{1} // {2} 命中 {3}".format(
+                        index, len(AUDIT_LOADERS), name, hits_for_loader
+                    ),
+                )
         project_ids = sorted(
             {
                 str(info.get("project_id"))
@@ -3114,6 +3286,7 @@ def audit_mod_jars(
             row["project_id"] = project_id
             row["installed_version"] = str(info.get("version_number") or "")
             row["installed_loaders"] = ",".join(info.get("loaders") or [])
+            row["loader_builds"] = matrix.get(digest) or {}
             if project.get("slug"):
                 row["slug"] = str(project.get("slug"))
             game_versions = [str(item) for item in (project.get("game_versions") or [])]
@@ -3153,6 +3326,7 @@ def audit_mod_jars(
         else:
             row["ok"] = None
             row["source"] = "unknown"
+    apply_loader_filter(rows, loader, target)
     if use_network and check_curseforge:
         try:
             ports = audit_curseforge_ports(
@@ -6325,7 +6499,11 @@ def audit_curseforge_ports(
     slug guesses, and a hit is only accepted when the CurseForge project title
     really matches the local mod title, so we never hand the user a wrong jar.
     """
-    pending = [row for row in rows if row.get("ok") is not True][:limit]
+    pending = [
+        row
+        for row in rows
+        if row.get("ok") is not True or row.get("loader_ok") is False
+    ][:limit]
     if not pending:
         return 0
     cache = {}
@@ -23356,14 +23534,14 @@ class Win1App:
         win.transient(self.root)
         win.resizable(True, True)
         try:
-            win.minsize(800, 580)
+            win.minsize(820, 620)
         except Exception:
             pass
 
         wrap = tk.Frame(win, bg=C_WHITE, bd=1, relief="solid", padx=10, pady=8)
         wrap.pack(fill="both", expand=True, padx=8, pady=8)
         wrap.columnconfigure(0, weight=1)
-        wrap.rowconfigure(5, weight=1)
+        wrap.rowconfigure(6, weight=1)
 
         tk.Label(
             wrap,
@@ -23430,8 +23608,71 @@ class Win1App:
                 patch_var = variable
             else:
                 net_var = variable
+
+        # 目标加载器：1.20.2 起 NeoForge / Forge 分家，构建不能跨加载器混用
+        loader_row = tk.Frame(wrap, bg=C_GRAY, bd=1, relief="solid", padx=4, pady=4)
+        loader_row.grid(row=2, column=0, sticky="ew", pady=(5, 0))
+        tk.Label(
+            loader_row, text="目标加载器", bg=C_GRAY, fg=C_BLACK, font=FONT_SMALL
+        ).pack(side="left", padx=(4, 6))
+        loader_var = tk.StringVar(value=self.mod_loader)
+        loader_buttons = {}
+
+        def loader_button_text(name, selected):
+            label = "不限" if not name else loader_label(name).upper()
+            return "[ {0}{1} ]".format(label, " *" if selected else "")
+
+        def sync_loader_buttons():
+            chosen = loader_var.get()
+            for key, button in loader_buttons.items():
+                try:
+                    button.configure(text=loader_button_text(key, key == chosen))
+                except Exception:
+                    pass
+
+        def pick_loader(name):
+            loader_var.set(name)
+            sync_loader_buttons()
+            if state["rows"]:
+                apply_loader_filter(
+                    state["rows"], name, str(target_var.get() or "").strip()
+                )
+                render()
+                bad = len(
+                    [row for row in state["rows"] if audit_loader_mismatch(row)]
+                )
+                set_status(
+                    "加载器切到 {0} // 重新判定 {1} 个，不符 {2} 个{3}".format(
+                        loader_label(name),
+                        len(state["rows"]),
+                        bad,
+                        " // 点 [ 运行体检 ] 可重新联网核对" if bad else "",
+                    )
+                )
+
+        for key in ("",) + AUDIT_LOADERS:
+            button = self._mk_button(
+                loader_row,
+                loader_button_text(key, key == loader_var.get()),
+                lambda value=key: pick_loader(value),
+                font=FONT_SMALL,
+                padx=5,
+                pady=0,
+            )
+            button.pack(side="left", padx=1)
+            loader_buttons[key] = button
+        sync_loader_buttons()
+        tk.Label(
+            loader_row,
+            text="// 1.20.2 起 NeoForge / Forge 已分家",
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+        ).pack(side="left", padx=(10, 2))
+
         action_row = tk.Frame(wrap, bg=C_WHITE)
-        action_row.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        action_row.grid(row=3, column=0, sticky="ew", pady=(6, 0))
         status_var = tk.StringVar(value="等待投放 // 把 jar 拖进这个窗口")
         self._mk_button(
             action_row,
@@ -23475,19 +23716,22 @@ class Win1App:
                 "把 .jar 或整个 mods 文件夹拖进本窗口即可批量体检；结论优先看 "
                 "Modrinth 上该项目有没有发布过对应版本，未收录时回落到 jar 内 "
                 "fabric.mod.json / mods.toml / mcmod.info 的声明；勾选 "
-                "[ 联网查 CurseForge 移植 ] 还会去 CF 找该版本的移植构建（蓝色 CF 行）"
+                "[ 联网查 CurseForge 移植 ] 还会去 CF 找该版本的移植构建（蓝色 CF 行）。"
+                "「目标加载器」会单独核对目标版本上到底有哪些加载器发布了构建 —— "
+                "1.20.2 之后 NeoForge 与 Forge 已分家，只有别的加载器的包会被标成 "
+                "[LDR!]（琥珀色），装上去是跑不起来的"
             ),
             bg=C_GRAY,
             fg=C_BLACK,
             font=FONT_SMALL,
             anchor="w",
             justify="left",
-            wraplength=730,
+            wraplength=760,
             bd=1,
             relief="solid",
             padx=4,
             pady=2,
-        ).grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        ).grid(row=4, column=0, sticky="ew", pady=(6, 0))
 
         summary_var = tk.StringVar(value="")
         tk.Label(
@@ -23497,10 +23741,10 @@ class Win1App:
             fg=C_BLACK,
             font=FONT_SMALL,
             anchor="w",
-        ).grid(row=4, column=0, sticky="ew", pady=(6, 2))
+        ).grid(row=5, column=0, sticky="ew", pady=(6, 2))
 
         body = tk.Frame(wrap, bg=C_WHITE, bd=1, relief="solid")
-        body.grid(row=5, column=0, sticky="nsew")
+        body.grid(row=6, column=0, sticky="nsew")
         body.columnconfigure(0, weight=1)
         body.rowconfigure(0, weight=1)
         listing = tk.Text(
@@ -23530,6 +23774,7 @@ class Win1App:
         listing.configure(yscrollcommand=scroll.set)
         listing.tag_configure("ok", foreground="#0A6A2F")
         listing.tag_configure("port", foreground="#0B4F9C")
+        listing.tag_configure("xload", foreground="#8A5A00")
         listing.tag_configure("miss", foreground="#A11B1B")
         listing.tag_configure("unknown", foreground="#555555")
         listing.tag_configure("note", foreground=C_TEAL)
@@ -23775,34 +24020,50 @@ class Win1App:
             target_text = str(target_var.get() or "").strip()
             listing.configure(state="normal")
             listing.delete("1.0", tk.END)
-            hits = [row for row in rows if row.get("ok") is True]
+            hits = [
+                row
+                for row in rows
+                if row.get("ok") is True and row.get("loader_ok") is not False
+            ]
             misses = [row for row in rows if row.get("ok") is False]
             unknown = [row for row in rows if row.get("ok") is None]
             ports = [row for row in rows if row.get("cf")]
+            loader_bad_rows = [row for row in rows if audit_loader_mismatch(row)]
             if only_ok.get():
                 shown = [row for row in rows if row.get("ok") is True or row.get("cf")]
             else:
                 shown = rows
-            shown = sorted(
-                shown,
-                key=lambda row: (
-                    0 if row.get("ok") is True else (1 if row.get("cf") else 2),
-                    str(row.get("title") or "").lower(),
-                ),
-            )
             if not rows:
                 listing.insert(
                     "end",
                     "（还没有投递 jar：拖进来，或点 [ 扫描当前 mods ]）\n",
                     "unknown",
                 )
+
+            def tier(row):
+                if row.get("ok") is True and row.get("loader_ok") is not False:
+                    return 0
+                if row.get("cf"):
+                    return 1
+                if row.get("ok") is True:
+                    return 2
+                if row.get("ok") is False:
+                    return 3
+                return 4
+
+            shown = sorted(
+                shown, key=lambda row: (tier(row), str(row.get("title") or "").lower())
+            )
             for row in shown:
                 verdict = row.get("ok")
                 port = row.get("cf") or {}
-                if verdict is True:
+                loader_bad = audit_loader_mismatch(row)
+                if verdict is True and not loader_bad:
                     tag, mark = "ok", "[ OK ]"
                 elif port:
                     tag, mark = "port", "[ CF ]"
+                elif loader_bad:
+                    tag, mark = "xload", "[LDR!]"
                 elif verdict is False:
                     tag, mark = "miss", "[MISS]"
                 else:
@@ -23813,11 +24074,35 @@ class Win1App:
                 )
                 loader = (row.get("loader") or "?").upper()[:10]
                 source = row.get("source") or ""
-                if verdict is True:
+                available = loader_builds_text(row.get("loader_builds"))
+                wanted_label = loader_label(row.get("loader_target")).upper()
+                if port:
+                    detail = "CurseForge 移植版：{0}  ({1})".format(
+                        shorten_text(port.get("filename"), 34),
+                        port.get("type") or "release",
+                    )
+                elif verdict is True and loader_bad:
+                    if available:
+                        detail = "{0} 没有 {1} 构建 // 现有 {2}".format(
+                            wanted_label, target_text, available
+                        )
+                    else:
+                        detail = "{0} 没有 {1} 构建 // jar 声明是 {2}".format(
+                            wanted_label,
+                            target_text,
+                            (row.get("loader") or "?").upper(),
+                        )
+                elif verdict is True:
                     if source == "modrinth":
                         detail = "有 {0} 构建 // 最新 {1}".format(
                             target_text, row.get("best") or "?"
                         )
+                        if row.get("best_loader"):
+                            detail = "有 {0} {1} 构建 // 最新 {2}".format(
+                                target_text,
+                                wanted_label,
+                                row.get("best") or "?",
+                            )
                         if row.get("best") and local and row["best"] != local:
                             detail += "  (可升级)"
                     elif source == "local":
@@ -23826,11 +24111,8 @@ class Win1App:
                         )
                     else:
                         detail = "文件名推断支持 {0}".format(target_text)
-                elif port:
-                    detail = "CurseForge 移植版：{0}  ({1})".format(
-                        shorten_text(port.get("filename"), 34),
-                        port.get("type") or "release",
-                    )
+                    if available and available.upper() != wanted_label:
+                        detail += "  [{0}]".format(available)
                 elif verdict is False:
                     if source == "modrinth":
                         detail = "无 {0} 构建 // 最高只到 {1}".format(
@@ -23842,6 +24124,8 @@ class Win1App:
                         )
                     if row.get("cf_project"):
                         detail += " // CF 无该版本"
+                    if available:
+                        detail += "  [{0}]".format(available)
                 else:
                     detail = "未收录 Modrinth 且 jar 内无版本信息"
                 listing.insert(
@@ -23854,10 +24138,12 @@ class Win1App:
             listing.configure(state="disabled")
             listing.see("1.0")
             summary_var.set(
-                "目标 MC {0} // 命中 {1} / 共 {2} // 排除 {3} // 未知 {4}{5}".format(
+                "目标 MC {0} // 加载器 {1} // 命中 {2} / 共 {3} // 加载器不符 {4} // 排除 {5} // 未知 {6}{7}".format(
                     target_text or "?",
+                    loader_label(loader_var.get()).upper(),
                     len(hits),
                     len(rows),
+                    len(loader_bad_rows),
                     len(misses),
                     len(unknown),
                     "  // CF 移植 {0}".format(len(ports)) if ports else "",
@@ -23917,6 +24203,7 @@ class Win1App:
                 row
                 for row in state["rows"]
                 if row.get("ok") is True
+                and row.get("loader_ok") is not False
                 and row.get("best_files")
                 and str(row.get("best") or "")
                 != str(row.get("installed_version") or "")
@@ -24167,23 +24454,43 @@ class Win1App:
                 if rows:
                     state["rows"] = rows
                 render()
-                hits = len([row for row in state["rows"] if row.get("ok") is True])
+                hits = len(
+                    [
+                        row
+                        for row in state["rows"]
+                        if row.get("ok") is True and row.get("loader_ok") is not False
+                    ]
+                )
+                ldr_bad = len(
+                    [row for row in state["rows"] if audit_loader_mismatch(row)]
+                )
                 if error:
                     set_status("体检失败：{0}".format(str(error)[:140]))
                     return
                 ports = cf_port_rows()
                 set_status(
-                    "体检完成 // 命中 {0} / 共 {1}{2}".format(
+                    "体检完成 // 命中 {0} / 共 {1}{2}{3}".format(
                         hits,
                         len(state["rows"]),
+                        " // 加载器不符 {0}".format(ldr_bad) if ldr_bad else "",
                         " // CF 移植 {0}".format(len(ports)) if ports else "",
                     )
                 )
                 self.say(
-                    "模组版本体检完成 // 目标 {0} // 命中 {1} / {2}".format(
-                        target, hits, len(state["rows"])
+                    "模组版本体检完成 // 目标 {0} / {1} // 命中 {2} / {3}".format(
+                        target,
+                        loader_label(loader_var.get()).upper(),
+                        hits,
+                        len(state["rows"]),
                     )
                 )
+                if ldr_bad:
+                    self.say(
+                        "体检发现 {0} 个模组在 {1} 上有构建但没有 {2} 构建"
+                        "（1.20.2 起 NeoForge / Forge 已分家）".format(
+                            ldr_bad, target, loader_label(loader_var.get()).upper()
+                        )
+                    )
                 upgrades = upgradeable_rows()
                 refresh_target_label()
                 if upgrades:
@@ -24218,7 +24525,7 @@ class Win1App:
                         allow_patch,
                         use_net,
                         progress,
-                        loader=(self.mod_loader or ""),
+                        loader=(loader_var.get() or self.mod_loader or ""),
                         check_curseforge=bool(cf_var.get()),
                     )
                 except Exception as exc:  # noqa: BLE001
@@ -24246,6 +24553,7 @@ class Win1App:
             lines = [
                 "AKM Launcher // 模组版本体检",
                 "目标 MC 版本 : {0}".format(target_var.get()),
+                "目标加载器   : {0}".format(loader_label(loader_var.get())),
                 "包含子版本   : {0}".format("是" if patch_var.get() else "否"),
                 "检查时间     : {0}".format(
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -24254,13 +24562,18 @@ class Win1App:
             ]
             for row in sorted(
                 rows,
-                key=lambda item: (item.get("ok") is not True, str(item.get("title"))),
+                key=lambda item: (
+                    item.get("ok") is not True and not item.get("cf"),
+                    str(item.get("title")),
+                ),
             ):
                 verdict = row.get("ok")
-                if verdict is True:
+                if verdict is True and row.get("loader_ok") is not False:
                     mark = "OK  "
                 elif row.get("cf"):
                     mark = "CF  "
+                elif audit_loader_mismatch(row):
+                    mark = "LDR "
                 elif verdict is False:
                     mark = "MISS"
                 else:
@@ -24287,6 +24600,20 @@ class Win1App:
                             row.get("predicate") or row.get("mc_hint") or "-",
                         )
                     )
+                available = loader_builds_text(row.get("loader_builds"))
+                if available:
+                    lines.append("        目标版本可用加载器: {0}".format(available))
+                elif row.get("loader"):
+                    lines.append(
+                        "        本地 jar 加载器: {0}".format(row.get("loader"))
+                    )
+                if audit_loader_mismatch(row):
+                    lines.append(
+                        "        加载器不符: 目标 {0} 无对应构建"
+                        "（1.20.2 起 NeoForge / Forge 已分家）".format(
+                            loader_label(row.get("loader_target")).upper()
+                        )
+                    )
                 if row.get("cf"):
                     port = row["cf"]
                     lines.append(
@@ -24306,10 +24633,20 @@ class Win1App:
             messagebox.showinfo("导出完成", path, parent=win)
 
         def move_incompatible():
-            bad = [row for row in state["rows"] if row.get("ok") is False]
+            version_bad = [row for row in state["rows"] if row.get("ok") is False]
+            loader_bad = [
+                row
+                for row in state["rows"]
+                if row.get("ok") is True
+                and row.get("loader_ok") is False
+                and not row.get("cf")
+            ]
+            bad = version_bad + loader_bad
             if not bad:
                 messagebox.showinfo(
-                    "移出不兼容", "没有可移出的条目（先体检一次）。", parent=win
+                    "移出不兼容",
+                    "没有可移出的条目（先体检一次，或把「目标加载器」调成你要用的那个）。",
+                    parent=win,
                 )
                 return
             target = str(target_var.get() or "target").replace(".", "_")
@@ -24318,9 +24655,16 @@ class Win1App:
             )
             if not messagebox.askyesno(
                 "移出不兼容",
-                "把 {0} 个不支持 MC {1} 的模组移到：\n{2}\n\n"
+                "把 {0} 个模组移到：\n{1}\n\n"
+                "  · 没有 MC {2} 构建：{3} 个\n"
+                "  · 有 {2} 构建但没有 {4} 构建：{5} 个\n\n"
                 "（只是移动到子文件夹，随时可以还原）继续？".format(
-                    len(bad), target_var.get(), folder
+                    len(bad),
+                    folder,
+                    target_var.get(),
+                    len(version_bad),
+                    loader_label(loader_var.get()).upper(),
+                    len(loader_bad),
                 ),
                 parent=win,
             ):
@@ -24352,7 +24696,7 @@ class Win1App:
                 )
             )
         option_row = tk.Frame(wrap, bg=C_WHITE)
-        option_row.grid(row=6, column=0, sticky="ew", pady=(8, 0))
+        option_row.grid(row=7, column=0, sticky="ew", pady=(8, 0))
 
         def toggle_option():
             render()
@@ -24405,11 +24749,11 @@ class Win1App:
             bd=1,
             relief="solid",
         )
-        target_label.grid(row=7, column=0, sticky="ew", pady=(6, 0))
+        target_label.grid(row=8, column=0, sticky="ew", pady=(6, 0))
         refresh_target_label()
 
         button_row = tk.Frame(wrap, bg=C_WHITE)
-        button_row.grid(row=8, column=0, sticky="ew", pady=(6, 0))
+        button_row.grid(row=9, column=0, sticky="ew", pady=(6, 0))
         self._mk_button(
             button_row, "[ 导出报告 ]", export_report, font=FONT_SMALL
         ).pack(side="left", padx=(0, 4))
