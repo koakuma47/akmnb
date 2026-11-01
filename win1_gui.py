@@ -79,7 +79,7 @@ except Exception:  # pragma: no cover - tkinter always ships with CPython on Win
 # ---------------------------------------------------------------------------
 
 APP_NAME = "AKM Launcher"
-APP_VERSION = "G1.5"
+APP_VERSION = "G1.6"
 
 # ---------------------------------------------------------------------------
 # Internationalisation (zh / en / ja / ru / ar)
@@ -2920,15 +2920,27 @@ def _parse_toml_meta(text, meta):
             meta["version"] = str(first.get("version") or "")
             meta["title"] = str(first.get("displayName") or meta["modid"])
             dependencies = data.get("dependencies") or {}
+            requires = []
             if isinstance(dependencies, dict):
                 for entries in dependencies.values():
                     for entry in entries or []:
-                        if (
-                            isinstance(entry, dict)
-                            and str(entry.get("modId") or "").lower() == "minecraft"
-                        ):
+                        if not isinstance(entry, dict):
+                            continue
+                        mod_id = str(entry.get("modId") or "").strip().lower()
+                        if not mod_id:
+                            continue
+                        if mod_id == "minecraft":
                             meta["predicate"] = entry.get("versionRange") or ""
-                            return
+                            continue
+                        if entry.get("mandatory") is False:
+                            continue
+                        if str(entry.get("type") or "required").lower() != "required":
+                            continue
+                        requires.append(mod_id)
+            if requires:
+                meta["requires"] = sorted(set(requires))
+            if meta["predicate"]:
+                return
     match = re.search(r'modId\s*=\s*"([^"]+)"', text)
     if match and not meta["modid"]:
         meta["modid"] = match.group(1)
@@ -2943,6 +2955,23 @@ def _parse_toml_meta(text, meta):
     )
     if match:
         meta["predicate"] = match.group(1)
+    if not meta.get("requires"):
+        # regex 兜底：逐个 [[dependencies.*]] 块里抓 mandatory=true 的 modId
+        requires = []
+        for block in re.split(r"\[\[dependencies\.", text)[1:]:
+            _head, _sep, body = block.partition("\n")
+            mod_match = re.search(r'modId\s*=\s*"([^"]+)"', body)
+            if not mod_match:
+                continue
+            mod_id = mod_match.group(1).strip().lower()
+            if mod_id in ("minecraft", "forge", "neoforge", "javafml"):
+                continue
+            mandatory = re.search(r"mandatory\s*=\s*(\w+)", body)
+            if mandatory and mandatory.group(1).lower() in ("false", "0"):
+                continue
+            requires.append(mod_id)
+        if requires:
+            meta["requires"] = sorted(set(requires))
 
 
 def jar_local_meta(path):
@@ -2956,6 +2985,7 @@ def jar_local_meta(path):
         "version": "",
         "loader": "",
         "predicate": "",
+        "requires": [],
         "mc_hint": jar_mc_hint(name),
         "error": "",
     }
@@ -2973,6 +3003,11 @@ def jar_local_meta(path):
                 depends = data.get("depends") or {}
                 if isinstance(depends, dict):
                     meta["predicate"] = depends.get("minecraft") or ""
+                    meta["requires"] = sorted(
+                        str(key).strip().lower()
+                        for key in depends
+                        if str(key or "").strip()
+                    )
                 if "quilt.mod.json" in names:
                     meta["loader"] = "quilt"
             elif "quilt.mod.json" in names:
@@ -2986,9 +3021,16 @@ def jar_local_meta(path):
                 metadata = loader.get("metadata") or {}
                 meta["title"] = str(metadata.get("name") or meta["modid"])
                 for entry in loader.get("depends") or []:
-                    if isinstance(entry, dict) and str(entry.get("id")) == "minecraft":
+                    if not isinstance(entry, dict):
+                        continue
+                    dep_id = str(entry.get("id") or "").strip().lower()
+                    if dep_id == "minecraft":
                         meta["predicate"] = entry.get("versions") or ""
-                        break
+                    if entry.get("optional"):
+                        continue
+                    if dep_id and dep_id != "minecraft":
+                        meta["requires"].append(dep_id)
+                meta["requires"] = sorted(set(meta["requires"]))
             elif (
                 "META-INF/neoforge.mods.toml" in names
                 or "META-INF/mods.toml" in names
@@ -3205,6 +3247,78 @@ def apply_loader_filter(rows, target_loader, target_mc=""):
     return rows
 
 
+SYSTEM_MOD_IDS = {
+    "minecraft",
+    "forge",
+    "neoforge",
+    "fml",
+    "javafml",
+    "lowcodefml",
+    "fabricloader",
+    "fabric-loader",
+    "quilt_loader",
+    "quilt-loader",
+    "java",
+    "mcp",
+    "mojang",
+    "minecraftforge",
+    "neoforged",
+}
+# Fabric API 是用一整个 jar 提供几十个 fabric-* 模块的
+FABRIC_API_IDS = ("fabric-api", "fabric")
+FABRIC_API_MODULE_PREFIX = "fabric-"
+
+
+def dependency_gaps(rows, present_ids=None):
+    """对照 jar 里声明的依赖，找出「有模组需要、但目录里没有」的前置。
+
+    返回 [{id, required_by: [显示名...], fabric_api: bool}]，按 id 排序。
+    """
+    present = set()
+    for item in present_ids or []:
+        key = str(item or "").strip().lower()
+        if key:
+            present.add(key)
+    for row in rows:
+        for field in ("modid", "slug"):
+            key = str(row.get(field) or "").strip().lower()
+            if key:
+                present.add(key)
+    fabric_api_ok = any(name in present for name in FABRIC_API_IDS)
+    gaps = {}
+    for row in rows:
+        title = str(row.get("title") or row.get("file") or "").strip()
+        for dep in row.get("requires") or []:
+            key = str(dep or "").strip().lower()
+            if not key or key in SYSTEM_MOD_IDS or key in present:
+                continue
+            is_module = key.startswith(FABRIC_API_MODULE_PREFIX)
+            if is_module and fabric_api_ok:
+                continue
+            gap_id = "fabric-api" if is_module else key
+            entry = gaps.setdefault(
+                gap_id,
+                {"id": gap_id, "required_by": [], "fabric_api": gap_id == "fabric-api"},
+            )
+            if title and title not in entry["required_by"]:
+                entry["required_by"].append(title)
+    return sorted(gaps.values(), key=lambda item: item["id"])
+
+
+def modrinth_project_lookup(slug, timeout=15):
+    """GET /v2/project/<slug> -> project dict (空 dict 表示没有)。"""
+    slug = str(slug or "").strip()
+    if not slug:
+        return {}
+    url = "https://api.modrinth.com/v2/project/" + urllib.parse.quote(slug)
+    try:
+        data = with_retry(lambda: http_json(url, timeout=timeout))
+    except Exception:
+        log_debug("project lookup failed for {0}".format(slug))
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def audit_mod_jars(
     paths,
     target,
@@ -3236,67 +3350,86 @@ def audit_mod_jars(
 
     if use_network and hashes:
         digests = list(hashes)
-        found = {}
-        for chunk in _chunks(digests, 100):
-            try:
-                data = modrinth_version_files(chunk)
-            except Exception:
-                log_debug("audit hash lookup failed:\n" + traceback.format_exc())
-                continue
-            if isinstance(data, dict):
-                found.update(data)
-        if progress:
-            progress(1, 3, "哈希匹配 {0}/{1}".format(len(found), len(digests)))
-        # one bulk call -> newest build of each mod for exactly this MC version
-        newest = {}
-        for chunk in _chunks(digests, 100):
-            try:
-                data = modrinth_version_files(chunk, update=True, game_versions=[target])
-            except Exception:
-                log_debug("audit update lookup failed:\n" + traceback.format_exc())
-                continue
-            if isinstance(data, dict):
-                newest.update(data)
-        if progress:
-            progress(2, 4, "找到 {0} 个 {1} 构建".format(len(newest), target))
-        # per-loader matrix: which loaders shipped a build for exactly this MC version
-        matrix = {}
-        for index, name in enumerate(AUDIT_LOADERS, start=1):
-            hits_for_loader = 0
+
+        def bulk_found():
+            data_all = {}
+            for chunk in _chunks(digests, 100):
+                try:
+                    data = modrinth_version_files(chunk)
+                except Exception:
+                    log_debug("audit hash lookup failed:\n" + traceback.format_exc())
+                    continue
+                if isinstance(data, dict):
+                    data_all.update(data)
+            return data_all
+
+        def bulk_update(loaders=None):
+            data_all = {}
             for chunk in _chunks(digests, 100):
                 try:
                     data = modrinth_version_files(
-                        chunk, update=True, loaders=[name], game_versions=[target]
+                        chunk,
+                        update=True,
+                        loaders=loaders,
+                        game_versions=[target],
                     )
                 except Exception:
-                    log_debug("audit loader matrix failed:\n" + traceback.format_exc())
+                    log_debug("audit update lookup failed:\n" + traceback.format_exc())
                     continue
-                if not isinstance(data, dict):
+                if isinstance(data, dict):
+                    data_all.update(data)
+            return data_all
+
+        # 六个 bulk 请求同时发出去：以前是一个接一个，光网络往返就要好几秒
+        jobs = {"found": bulk_found, "newest": bulk_update}
+        for name in AUDIT_LOADERS:
+            jobs["loader:" + name] = (lambda who=name: bulk_update([who]))
+        results = {}
+        with ThreadPoolExecutor(
+            max_workers=min(6, len(jobs)), thread_name_prefix="akm-audit-net"
+        ) as pool:
+            futures = {pool.submit(func): key for key, func in jobs.items()}
+            finished = 0
+            for future in as_completed(futures):
+                key = futures[future]
+                finished += 1
+                try:
+                    results[key] = future.result()
+                except Exception:
+                    results[key] = {}
+                    log_debug("audit bulk job failed: " + key)
+                if progress:
+                    progress(
+                        1,
+                        3,
+                        "联网核对 {0}/{1} // {2}".format(finished, len(jobs), key),
+                    )
+
+        found = results.get("found") or {}
+        newest = results.get("newest") or {}
+        matrix = {}
+        for name in AUDIT_LOADERS:
+            for digest, info in (results.get("loader:" + name) or {}).items():
+                if not isinstance(info, dict):
                     continue
-                for digest, info in data.items():
-                    if not isinstance(info, dict):
-                        continue
-                    matrix.setdefault(digest, {})[name] = {
-                        "version": str(info.get("version_number") or ""),
-                        "id": str(info.get("id") or ""),
-                        "loaders": [
-                            str(item) for item in (info.get("loaders") or [])
-                        ],
-                        "files": [
-                            item
-                            for item in (info.get("files") or [])
-                            if isinstance(item, dict) and item.get("url")
-                        ],
-                    }
-                    hits_for_loader += 1
-            if progress:
-                progress(
-                    2,
-                    4,
-                    "加载器筛查 {0}/{1} // {2} 命中 {3}".format(
-                        index, len(AUDIT_LOADERS), name, hits_for_loader
-                    ),
-                )
+                matrix.setdefault(digest, {})[name] = {
+                    "version": str(info.get("version_number") or ""),
+                    "id": str(info.get("id") or ""),
+                    "loaders": [str(item) for item in (info.get("loaders") or [])],
+                    "files": [
+                        item
+                        for item in (info.get("files") or [])
+                        if isinstance(item, dict) and item.get("url")
+                    ],
+                }
+        if progress:
+            progress(
+                2,
+                3,
+                "哈希 {0} / 新构建 {1} / 加载器矩阵 {2}".format(
+                    len(found), len(newest), len(matrix)
+                ),
+            )
         project_ids = sorted(
             {
                 str(info.get("project_id"))
@@ -3512,7 +3645,7 @@ def disable_file_drop(window):
         pass
 
 
-def install_mod_build(row, target_dir, timeout=120):
+def install_mod_build(row, target_dir, timeout=120, progress=None, monitor=None):
     """Download the stored target-MC build of an audit row and replace the jar."""
     files = [
         item
@@ -3529,13 +3662,35 @@ def install_mod_build(row, target_dir, timeout=120):
         str(primary.get("filename") or os.path.basename(row.get("path") or "mod.jar"))
     )
     destination = os.path.join(target_dir, filename)
-    download_file(str(primary["url"]), destination, timeout=timeout)
     expected = str((primary.get("hashes") or {}).get("sha1") or "").lower()
+    if monitor is not None:
+        monitor.begin(destination, filename, int(primary.get("size") or 0), kind="mod")
+
+    def report(done, total):
+        if monitor is not None:
+            monitor.update(destination, done, total)
+        if progress is not None:
+            progress(filename, done, total)
+
+    try:
+        download_file(
+            str(primary["url"]), destination, progress=report, timeout=timeout
+        )
+    except Exception:
+        if monitor is not None:
+            monitor.finish(destination, "failed")
+        raise
     if expected:
         actual = sha1_file(destination)
         if actual != expected:
             _cleanup(destination)
+            if monitor is not None:
+                monitor.finish(destination, "failed")
             raise LauncherError("SHA1 校验失败")
+    if monitor is not None:
+        monitor.finish(
+            destination, "done", os.path.getsize(destination) if os.path.exists(destination) else 0
+        )
     old_path = str(row.get("path") or "")
     if old_path and os.path.abspath(old_path) != os.path.abspath(destination):
         same_folder = os.path.normcase(
@@ -3546,6 +3701,53 @@ def install_mod_build(row, target_dir, timeout=120):
                 os.remove(old_path)
             except OSError as exc:
                 log_debug("audit replace failed: {0}".format(exc))
+    return destination
+
+
+def install_missing_dependency(gap, mc_version, loader, target_dir, timeout=180, progress=None):
+    """把缺失的前置模组从 Modrinth 补装进目标 mods 目录。
+
+    ``gap`` 来自 :func:`dependency_gaps`；返回装好的文件路径。
+    """
+    mod_id = str(gap.get("id") or "").strip()
+    if not mod_id:
+        raise LauncherError("前置 id 为空")
+    project = modrinth_project_lookup(mod_id)
+    slug = str(project.get("slug") or mod_id)
+    title = str(project.get("title") or slug)
+    loaders = [loader] if str(loader or "").strip() else []
+    versions = []
+    for attempt_loader in (loaders + ["fabric", "forge", "neoforge", "quilt"]):
+        try:
+            versions = modrinth_versions(slug, mc_version, attempt_loader)
+        except Exception:
+            versions = []
+        if versions:
+            break
+    if not versions:
+        raise LauncherError(
+            "{0} 在 Modrinth 上没有 {1}/{2} 的版本".format(title, mc_version, loader or "?")
+        )
+    version = pick_version(versions)
+    files = [
+        item
+        for item in (version.get("files") or [])
+        if isinstance(item, dict)
+        and item.get("url")
+        and str(item.get("filename", "")).lower().endswith(".jar")
+    ]
+    if not files:
+        raise LauncherError("{0} 的该版本没有 .jar".format(title))
+    primary = next((item for item in files if item.get("primary")), files[0])
+    filename = sanitize_filename(str(primary.get("filename") or (slug + ".jar")))
+    ensure_dir(target_dir)
+    destination = os.path.join(target_dir, filename)
+
+    def report(done, total):
+        if progress is not None:
+            progress(filename, done, total)
+
+    download_file(str(primary["url"]), destination, progress=report, timeout=timeout)
     return destination
 
 
@@ -24441,11 +24643,12 @@ class Win1App:
         listing.tag_configure("ok", foreground="#0A6A2F")
         listing.tag_configure("port", foreground="#0B4F9C")
         listing.tag_configure("xload", foreground="#8A5A00")
+        listing.tag_configure("dep", foreground="#7B2D8E")
         listing.tag_configure("miss", foreground="#A11B1B")
         listing.tag_configure("unknown", foreground="#555555")
         listing.tag_configure("note", foreground=C_TEAL)
         listing.configure(state="disabled")
-        state = {"paths": [], "rows": [], "busy": False, "target_dir": ""}
+        state = {"paths": [], "rows": [], "gaps": [], "busy": False, "target_dir": ""}
         only_ok = tk.BooleanVar(value=True)
         cf_var = tk.BooleanVar(value=True)
 
@@ -24801,15 +25004,36 @@ class Win1App:
                     ),
                     tag,
                 )
+            gaps = state.get("gaps") or []
+            if gaps:
+                listing.insert(
+                    "end",
+                    "\n缺前置 // 这些模组被需要、但 mods 里没有（点 [ 补装缺失前置 ] 自动补）\n",
+                    "note",
+                )
+                for gap in gaps:
+                    names = "、".join(gap.get("required_by", [])[:4])
+                    listing.insert(
+                        "end",
+                        "{0} {1:<28} {2:<18} {3:<10} 被 {4} 需要\n".format(
+                            "[DEP!]",
+                            shorten_text(gap.get("id"), 26),
+                            "未安装",
+                            "ANY",
+                            shorten_text(names, 42) or "?",
+                        ),
+                        "dep",
+                    )
             listing.configure(state="disabled")
             listing.see("1.0")
             summary_var.set(
-                "目标 MC {0} // 加载器 {1} // 命中 {2} / 共 {3} // 加载器不符 {4} // 排除 {5} // 未知 {6}{7}".format(
+                "目标 MC {0} // 加载器 {1} // 命中 {2} / 共 {3} // 加载器不符 {4} // 缺前置 {5} // 排除 {6} // 未知 {7}{8}".format(
                     target_text or "?",
                     loader_label(loader_var.get()).upper(),
                     len(hits),
                     len(rows),
                     len(loader_bad_rows),
+                    len(gaps),
                     len(misses),
                     len(unknown),
                     "  // CF 移植 {0}".format(len(ports)) if ports else "",
@@ -24907,6 +25131,34 @@ class Win1App:
             state["busy"] = True
             mods_dir = current_target_dir()
             set_status("正在安装 0/{0} ...".format(len(upgrades)))
+            monitor = DOWNLOAD_MONITOR
+            try:
+                monitor.reset("模组更新 // {0} 个".format(len(upgrades)))
+            except Exception:
+                pass
+            file_progress = {}
+
+            def progress_cb(name, done, total):
+                file_progress[name] = (done, total)
+                if total:
+                    pct = int(done * 100 / total)
+                    self.post(
+                        set_status,
+                        "正在下载 {0} // {1} {2}% ({3}/{4})".format(
+                            name,
+                            os.path.basename(name)[:40],
+                            pct,
+                            format_bytes(done),
+                            format_bytes(total),
+                        ),
+                    )
+                else:
+                    self.post(
+                        set_status,
+                        "正在下载 {0} // {1}".format(
+                            name, format_bytes(done)
+                        ),
+                    )
 
             def worker():
                 done = 0
@@ -24916,7 +25168,15 @@ class Win1App:
 
                 def one(row):
                     try:
-                        return install_mod_build(row, mods_dir), ""
+                        return (
+                            install_mod_build(
+                                row,
+                                mods_dir,
+                                progress=progress_cb,
+                                monitor=monitor,
+                            ),
+                            "",
+                        )
                     except Exception as exc:  # noqa: BLE001
                         return None, "{0}: {1}".format(
                             row.get("file"), str(exc)[:80]
@@ -24981,6 +25241,127 @@ class Win1App:
                 )
                 return
             offer_install(upgrades)
+
+        def install_gaps():
+            gaps = list(state.get("gaps") or [])
+            if not gaps:
+                messagebox.showinfo(
+                    "补装前置",
+                    "没有检测到缺失的前置模组。\n"
+                    "（先体检一次；拖进来的 jar 会一起参与依赖检查）",
+                    parent=win,
+                )
+                return
+            if state["busy"]:
+                return
+            target_mc = str(target_var.get() or "").strip()
+            loader = loader_var.get() or self.mod_loader or "fabric"
+            mods_dir = current_target_dir()
+            preview = "\n".join(
+                "  · {0}{1}".format(
+                    gap["id"],
+                    "（被 {0} 需要）".format(
+                        "、".join(gap.get("required_by", [])[:3])
+                    )
+                    if gap.get("required_by")
+                    else "",
+                )
+                for gap in gaps[:10]
+            )
+            if not messagebox.askyesno(
+                "补装缺失前置",
+                "把下面 {0} 个前置从 Modrinth 下载到：\n{1}\n\n{2}\n\n"
+                "目标 {3} / {4}，装完会自动重新体检。".format(
+                    len(gaps),
+                    mods_dir,
+                    preview,
+                    target_mc,
+                    loader_label(loader).upper(),
+                ),
+                parent=win,
+            ):
+                return
+            state["busy"] = True
+            self._update_controls()
+            set_status("正在补装前置 0/{0} ...".format(len(gaps)))
+            monitor = DOWNLOAD_MONITOR
+            try:
+                monitor.reset("补装前置 // {0} 个".format(len(gaps)))
+            except Exception:
+                pass
+
+            def progress_cb(name, done, total):
+                if not total:
+                    return
+                self.post(
+                    set_status,
+                    "补装中 // {0} {1}% ({2}/{3})".format(
+                        shorten_text(name, 34),
+                        int(done * 100 / total),
+                        format_bytes(done),
+                        format_bytes(total),
+                    ),
+                )
+
+            def one(gap):
+                try:
+                    path = install_missing_dependency(
+                        gap, target_mc, loader, mods_dir, progress=progress_cb
+                    )
+                    return path, ""
+                except Exception as exc:  # noqa: BLE001
+                    return None, "{0}: {1}".format(gap["id"], str(exc)[:90])
+
+            def finish_gaps(done, failed):
+                state["busy"] = False
+                self._update_controls()
+                if done:
+                    state["paths"] = [
+                        path for path in state["paths"] if os.path.isfile(path)
+                    ] + [path for path in done if os.path.isfile(path)]
+                message = "前置补装完成 // 成功 {0} / 失败 {1}".format(
+                    len(done), len(failed)
+                )
+                set_status(message + ("" if not failed else " // " + failed[0]))
+                self.say("模组体检 // " + message)
+                if failed:
+                    messagebox.showwarning(
+                        "补装前置结果",
+                        message + "\n\n" + "\n".join(failed[:5]),
+                        parent=win,
+                    )
+                if done:
+                    start()
+
+            def worker():
+                done = []
+                failed = []
+                tick = {"n": 0}
+                with ThreadPoolExecutor(
+                    max_workers=min(4, len(gaps)),
+                    thread_name_prefix="akm-dep",
+                ) as pool:
+                    futures = {pool.submit(one, gap): gap for gap in gaps}
+                    for future in as_completed(futures):
+                        gap = futures[future]
+                        tick["n"] += 1
+                        self.post(
+                            set_status,
+                            "补装 {0}/{1} // {2}".format(
+                                tick["n"], len(gaps), gap["id"]
+                            ),
+                        )
+                        try:
+                            path, error = future.result()
+                        except Exception as exc:  # noqa: BLE001
+                            path, error = None, str(exc)[:90]
+                        if path:
+                            done.append(path)
+                        else:
+                            failed.append(error or gap["id"])
+                self.post(finish_gaps, done, failed)
+
+            threading.Thread(target=worker, daemon=True).start()
 
         def offer_cf_ports(ports, auto=False):
             if not ports or state["busy"]:
@@ -25080,6 +25461,7 @@ class Win1App:
         def refresh_action_labels():
             upgrades = len(upgradeable_rows())
             ports = len(cf_port_rows())
+            gaps = len(state.get("gaps") or [])
             try:
                 btn_update_all.configure(
                     text="[ 一键更新全部{0} ]".format(
@@ -25089,6 +25471,11 @@ class Win1App:
                 btn_cf_ports.configure(
                     text="[ 下移植版{0} ]".format(
                         " ({0})".format(ports) if ports else ""
+                    )
+                )
+                btn_gaps.configure(
+                    text="[ 补装缺失前置{0} ]".format(
+                        " ({0})".format(gaps) if gaps else ""
                     )
                 )
             except Exception:
@@ -25119,6 +25506,7 @@ class Win1App:
                 state["busy"] = False
                 if rows:
                     state["rows"] = rows
+                state["gaps"] = dependency_gaps(state["rows"])
                 render()
                 hits = len(
                     [
@@ -25130,15 +25518,17 @@ class Win1App:
                 ldr_bad = len(
                     [row for row in state["rows"] if audit_loader_mismatch(row)]
                 )
+                gaps = state["gaps"]
                 if error:
                     set_status("体检失败：{0}".format(str(error)[:140]))
                     return
                 ports = cf_port_rows()
                 set_status(
-                    "体检完成 // 命中 {0} / 共 {1}{2}{3}".format(
+                    "体检完成 // 命中 {0} / 共 {1}{2}{3}{4}".format(
                         hits,
                         len(state["rows"]),
                         " // 加载器不符 {0}".format(ldr_bad) if ldr_bad else "",
+                        " // 缺前置 {0}".format(len(gaps)) if gaps else "",
                         " // CF 移植 {0}".format(len(ports)) if ports else "",
                     )
                 )
@@ -25155,6 +25545,37 @@ class Win1App:
                         "体检发现 {0} 个模组在 {1} 上有构建但没有 {2} 构建"
                         "（1.20.2 起 NeoForge / Forge 已分家）".format(
                             ldr_bad, target, loader_label(loader_var.get()).upper()
+                        )
+                    )
+                if gaps:
+                    self.say(
+                        "体检发现缺少 {0} 个前置模组：{1}".format(
+                            len(gaps),
+                            "、".join(item["id"] for item in gaps[:6]),
+                        )
+                    )
+                    lines = []
+                    for gap in gaps[:10]:
+                        names = "、".join(gap.get("required_by", [])[:3])
+                        lines.append(
+                            "  · {0}{1}".format(
+                                gap["id"],
+                                "（被 {0} 需要）".format(names) if names else "",
+                            )
+                        )
+                    if len(gaps) > 10:
+                        lines.append("  · 还有 {0} 个 ...".format(len(gaps) - 10))
+                    self.post(
+                        lambda text="\n".join(lines), count=len(gaps): messagebox.showwarning(
+                            "缺少前置模组",
+                            "体检发现 {0} 个模组需要、但 mods 里没有的前置：\n\n{1}\n\n"
+                            "缺前置时游戏会直接崩在加载阶段。\n"
+                            "点体检窗口里的 [ 补装缺失前置 ] 可以自动从 Modrinth 补上。\n\n"
+                            "（依赖是按这次体检的 jar 算的；只拖了几个 jar 时，"
+                            "建议改成 [ 扫描当前 mods ] 把整个目录扫一遍更准）".format(
+                                count, text
+                            ),
+                            parent=win,
                         )
                     )
                 upgrades = upgradeable_rows()
@@ -25183,6 +25604,10 @@ class Win1App:
                 # 先问要装到哪个版本文件夹，再问装不装
                 win.after(260, lambda: choose_target_dir(after_target))
 
+            # Tk 的变量只能在主线程读，先把值取出来再交给后台线程
+            loader_now = loader_var.get() or self.mod_loader or ""
+            cf_now = bool(cf_var.get())
+
             def worker():
                 try:
                     rows = audit_mod_jars(
@@ -25191,8 +25616,8 @@ class Win1App:
                         allow_patch,
                         use_net,
                         progress,
-                        loader=(loader_var.get() or self.mod_loader or ""),
-                        check_curseforge=bool(cf_var.get()),
+                        loader=loader_now,
+                        check_curseforge=cf_now,
                     )
                 except Exception as exc:  # noqa: BLE001
                     log_debug("mod audit failed:\n" + traceback.format_exc())
@@ -25395,6 +25820,13 @@ class Win1App:
             font=FONT_SMALL,
         )
         btn_cf_ports.pack(side="left", padx=(2, 0))
+        btn_gaps = self._mk_button(
+            option_row,
+            "[ 补装缺失前置 ]",
+            install_gaps,
+            font=FONT_SMALL,
+        )
+        btn_gaps.pack(side="left", padx=(6, 0))
         self._mk_button(
             option_row,
             "[ 目标文件夹... ]",
