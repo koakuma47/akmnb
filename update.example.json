@@ -1,7 +1,7 @@
 {
-  "version": "G1.12",
-  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.12/AKM_Launcher_vG1.12.zip",
-  "sha256": "AEBFEC5EDFB22769F06B1E553796E659C2E6D397FF3056C1389452A41687AABC",
-  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.12",
-  "notes": "G1.12：不再自动重扫/自动开装，逐行勾选决定更新哪个"
+  "version": "G1.13",
+  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.13/AKM_Launcher_vG1.13.zip",
+  "sha256": "35396894ED947C41A35D892E1185FEC93884249053E397B6C9638F0C917DF4E3",
+  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.13",
+  "notes": "G1.13：模组更新进度条 + 多连接分片下载（快约 1.5 倍）"
 }
