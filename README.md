@@ -1,4 +1,4 @@
-# AKM Launcher (Adaptive Kinetic Minecraft) G1.11
+# AKM Launcher (Adaptive Kinetic Minecraft) G1.12
 
 **免费开源：不收费、无内购、无付费版 —— 任何向你收费的都是盗卖。**
 
@@ -11,22 +11,22 @@
 
 ## 下载
 
-**最新正式版：G1.11**
+**最新正式版：G1.12**
 
-- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vG1.11/AKM_Launcher_vG1.11.zip>
-- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vG1.11>
+- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vG1.12/AKM_Launcher_vG1.12.zip>
+- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vG1.12>
 
 单文件免安装，解压后双击 `AKM_Launcher.exe` 就能用，不需要装 Python。
 下载后想核对完整性，可以和发布页里 `SHA256.txt` 的值比对一下。
 
-> **G1.11：更新完成后会说一声，并把更新好的从列表里清掉；没得更新的模组标红。**
-> 一键更新全部跑完后弹「已更新完成：N 个模组已装到最新版本，并从列表里移除」，
-> 列表只剩还需要处理的；目标 MC 上已经是最新（没有更新）的模组统一显示红色 `[DEAD]`，
-> 汇总栏也多了「无新版本 N」计数。
+> **G1.12：体检不再自动重扫、不再自动下载 —— 更新哪个由你勾选。**
+> 以前下完移植版 / 补完前置 / 体检发现可更新，都会自己再全量识别一遍甚至直接开装，
+> 下载和识别互相打断。现在只有你点 `[ 运行体检 ]`、`[ 扫描当前 mods ]` 或拖入 jar 才会重新识别；
+> 列表每行前面有 `▣ / ▢`，点一下就能勾上/取消，按 `[ 更新选中的 (n/m) ]` 只装你勾的那几个。
 >
-> G1.10：修体检窗口拖不进模组（窗口树全部注册拖放 + G1.9 的按钮引用 bug）。
-> G1.9：体检可中途终止 + 选目录只问一次 + 启动阶段显示（`LAUNCH: JVM/FORGE/MINECRAFT 秒`）。
-> G1.8：修 NeoForge 安装器执行失败（先补原版 `client.jar`）+ 诊断日志落盘。
+> G1.11：更新完成提示 + 已更新行自动移除 + 无新版本标红 `[DEAD]`。
+> G1.10：修体检窗口拖不进模组（整窗注册拖放）。
+> G1.9：体检可中途终止 + 启动阶段显示（`LAUNCH: JVM/FORGE/MINECRAFT 秒`）。
 
 ## 怎么用
 

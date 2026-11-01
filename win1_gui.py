@@ -79,7 +79,7 @@ except Exception:  # pragma: no cover - tkinter always ships with CPython on Win
 # ---------------------------------------------------------------------------
 
 APP_NAME = "AKM Launcher"
-APP_VERSION = "G1.11"
+APP_VERSION = "G1.12"
 
 # ---------------------------------------------------------------------------
 # Internationalisation (zh / en / ja / ru / ar)
@@ -25087,6 +25087,8 @@ class Win1App:
         )
         scroll.grid(row=0, column=1, sticky="ns")
         listing.configure(yscrollcommand=scroll.set)
+        # 点一下行首的方框就切换「要不要更新这个」——绝不自作主张开装
+        listing.bind("<Button-1>", lambda event: on_list_click(event))
         listing.tag_configure("ok", foreground="#0A6A2F")
         listing.tag_configure("port", foreground="#0B4F9C")
         listing.tag_configure("xload", foreground="#8A5A00")
@@ -25102,10 +25104,10 @@ class Win1App:
             "gaps": [],
             "busy": False,
             "target_dir": "",
-            "auto_prompt": True,
             "installed_files": set(),
             "cancel": threading.Event(),
             "target_prompted": False,
+            "line_rows": [],
         }
         only_ok = tk.BooleanVar(value=True)
         cf_var = tk.BooleanVar(value=True)
@@ -25382,6 +25384,7 @@ class Win1App:
             shown = sorted(
                 shown, key=lambda row: (tier(row), str(row.get("title") or "").lower())
             )
+            line_rows = []
             for row in shown:
                 verdict = row.get("ok")
                 port = row.get("cf") or {}
@@ -25464,13 +25467,22 @@ class Win1App:
                         detail += "  [{0}]".format(available)
                 else:
                     detail = "未收录 Modrinth 且 jar 内无版本信息"
+                selectable = (
+                    verdict is True
+                    and bool(row.get("best_files"))
+                    and not audit_no_update(row)
+                    and not loader_bad
+                )
+                box = "▣" if (selectable and row.get("_sel")) else ("▢" if selectable else " ")
+                line_rows.append(row)
                 listing.insert(
                     "end",
-                    "{0} {1:<28} {2:<18} {3:<10} {4}\n".format(
-                        mark, title, local, loader, detail
+                    "{0} {1} {2:<28} {3:<18} {4:<10} {5}\n".format(
+                        box, mark, title, local, loader, detail
                     ),
                     tag,
                 )
+            state["line_rows"] = line_rows
             gaps = state.get("gaps") or []
             if gaps:
                 listing.insert(
@@ -25556,6 +25568,61 @@ class Win1App:
             state["rows"] = []
             render()
             set_status("已清空 // 重新拖入 jar 或点 [ 扫描当前 mods ]")
+        def default_select(upgrades):
+            """Mark the updatable rows as selected (the user can uncheck any)."""
+            ids = {id(row) for row in upgrades}
+            for row in state["rows"]:
+                row["_sel"] = id(row) in ids
+
+        def selected_rows():
+            return [
+                row
+                for row in audit_upgrades(
+                    state["rows"],
+                    current_target_dir(),
+                    state.get("installed_files") or set(),
+                )
+                if row.get("_sel")
+            ]
+
+        def select_all():
+            for row in state["rows"]:
+                if row.get("ok") is True and row.get("best_files") and not audit_no_update(row):
+                    row["_sel"] = True
+            render()
+            refresh_action_labels()
+
+        def select_none():
+            for row in state["rows"]:
+                row["_sel"] = False
+            render()
+            refresh_action_labels()
+
+        def on_list_click(event):
+            """Toggle the checkbox of the row under the cursor."""
+            try:
+                index = listing.index("@{0},{1}".format(event.x, event.y))
+                line = int(str(index).split(".")[0])
+            except Exception:
+                return None
+            rows = state.get("line_rows") or []
+            if 1 <= line <= len(rows):
+                toggle_row(rows[line - 1])
+                return "break"
+            return None
+
+        def toggle_row(row):
+            if row is None:
+                return
+            if not (row.get("ok") is True and row.get("best_files")):
+                return
+            if audit_no_update(row):
+                set_status("这个模组已经没有可更新的版本了")
+                return
+            row["_sel"] = not row.get("_sel")
+            render()
+            refresh_action_labels()
+
         def upgradeable_rows():
             return audit_upgrades(
                 state["rows"],
@@ -25746,17 +25813,29 @@ class Win1App:
         def cf_port_rows():
             return [row for row in state["rows"] if row.get("cf")]
 
-        def update_all():
-            upgrades = upgradeable_rows()
+        def update_selected():
+            upgrades = selected_rows()
             if not upgrades:
-                messagebox.showinfo(
-                    "没有可更新的模组",
-                    "当前结果里没有「在目标版本上有更新构建」的模组。\n"
-                    "先体检一次；没有命中的条目可以看 [ 下移植版 ]。",
-                    parent=win,
-                )
+                if upgradeable_rows():
+                    messagebox.showinfo(
+                        "还没勾选",
+                        "列表里有点选更新的模组，但一个都没勾上。\n"
+                        "在行首点一下 ▢ 变成 ▣，或点 [ 全选 ] 再点 [ 更新选中的 ]。",
+                        parent=win,
+                    )
+                else:
+                    messagebox.showinfo(
+                        "没有可更新的模组",
+                        "当前结果里没有「在目标版本上有更新构建」的模组。\n"
+                        "先体检一次；没有命中的条目可以看 [ 下移植版 ]。",
+                        parent=win,
+                    )
                 return
             offer_install(upgrades)
+
+        def update_all():
+            select_all()
+            update_selected()
 
         def install_gaps():
             gaps = list(state.get("gaps") or [])
@@ -25828,7 +25907,7 @@ class Win1App:
                 except Exception as exc:  # noqa: BLE001
                     return None, "{0}: {1}".format(gap["id"], str(exc)[:90])
 
-            def finish_gaps(done, failed):
+            def finish_gaps(done, failed, done_ids):
                 state["busy"] = False
                 self._update_controls()
                 if done:
@@ -25847,10 +25926,21 @@ class Win1App:
                         parent=win,
                     )
                 if done:
-                    start(auto=False)
+                    # 不再自动重扫（那会打断你正在看的列表）；补好的前置已经写进 mods
+                    state["gaps"] = [
+                        gap for gap in (state.get("gaps") or []) if gap["id"] not in done_ids
+                    ]
+                    render()
+                    refresh_action_labels()
+                    set_status(
+                        "前置已补装 {0} 个 // 要从头核一遍就点 [ 运行体检 ]".format(
+                            len(done)
+                        )
+                    )
 
             def worker():
                 done = []
+                done_ids = set()
                 failed = []
                 tick = {"n": 0}
                 with ThreadPoolExecutor(
@@ -25873,9 +25963,10 @@ class Win1App:
                             path, error = None, str(exc)[:90]
                         if path:
                             done.append(path)
+                            done_ids.add(str(gap.get("id") or "").lower())
                         else:
                             failed.append(error or gap["id"])
-                self.post(finish_gaps, done, failed)
+                self.post(finish_gaps, done, failed, done_ids)
 
             threading.Thread(target=worker, daemon=True).start()
 
@@ -25908,11 +25999,13 @@ class Win1App:
             mods_dir = current_target_dir()
             set_status("正在下载移植版本 0/{0} ...".format(len(ports)))
 
-            def finish_ports(done, failed, installed):
+            def finish_ports(done, failed, installed, installed_rows):
                 state["busy"] = False
                 state["paths"] = [
                     path for path in state["paths"] if os.path.isfile(path)
                 ] + [path for path in installed if os.path.isfile(path)]
+                if installed_rows:
+                    state["rows"] = drop_installed_rows(state["rows"], installed_rows)
                 message = "移植版本完成 // 成功 {0} / 失败 {1}".format(
                     done, len(failed)
                 )
@@ -25928,13 +26021,21 @@ class Win1App:
                         message + "\n\n" + "\n".join(failed[:5]),
                         parent=win,
                     )
-                if installed:
-                    start()
+                if installed_rows:
+                    # 不再自动重扫：下好的移植版直接从列表移除，剩下的保持原样
+                    render()
+                    refresh_action_labels()
+                    set_status(
+                        "移植版本已下载 {0} 个 // 已从列表移除；要复检再点 [ 运行体检 ]".format(
+                            len(installed_rows)
+                        )
+                    )
 
             def worker():
                 done = 0
                 failed = []
                 installed = []
+                installed_rows = []
                 tick = {"done": 0}
 
                 def one(row):
@@ -25976,12 +26077,13 @@ class Win1App:
 
         def refresh_action_labels():
             upgrades = len(upgradeable_rows())
+            picked = len(selected_rows())
             ports = len(cf_port_rows())
             gaps = len(state.get("gaps") or [])
             try:
                 btn_update_all.configure(
-                    text="[ 一键更新全部{0} ]".format(
-                        " ({0})".format(upgrades) if upgrades else ""
+                    text="[ 更新选中的{0} ]".format(
+                        " ({0}/{1})".format(picked, upgrades) if upgrades else ""
                     )
                 )
                 btn_cf_ports.configure(
@@ -25997,13 +26099,12 @@ class Win1App:
             except Exception:
                 pass
 
-        def start(auto=True):
+        def start():
             if state["busy"]:
                 return
             if not state["paths"]:
                 set_status("先拖入 jar，或点 [ 扫描当前 mods ]")
                 return
-            state["auto_prompt"] = bool(auto)
             state["cancel"] = threading.Event()
             try:
                 btn_cancel_audit.configure(state="normal")
@@ -26126,28 +26227,23 @@ class Win1App:
                             )
                         )
                     return
-                if not state.get("auto_prompt", True):
-                    # 装完自动刷新的那一轮不再弹「安装最新版本」，避免反复体检/反复安装
-                    set_status(
-                        "体检完成 // 命中 {0} / 共 {1} // 需要时点 [ 一键更新全部 ]".format(
-                            hits, len(state["rows"])
-                        )
-                        + (" // 缺前置 {0}".format(len(gaps)) if gaps else "")
+                # 绝不再自动开装：勾选哪些、什么时候装，都由你决定
+                default_select(upgrades)
+                render()
+                refresh_action_labels()
+                set_status(
+                    "体检完成 // 命中 {0} / 共 {1} // 可更新 {2} 个（已勾选，点 [ 更新选中的 ] 才会下载）{3}".format(
+                        hits,
+                        len(state["rows"]),
+                        len(upgrades),
+                        " // 缺前置 {0}".format(len(gaps)) if gaps else "",
                     )
-                    return
-
-                def after_target():
-                    if upgrades:
-                        offer_install(upgrades, auto=True)
-                    if ports:
-                        offer_cf_ports(ports, auto=True)
-
-                if state.get("target_prompted"):
-                    # 「装到哪里」这次会话已经问过一次了，直接用记住的目录
-                    after_target()
-                    return
-                # 第一次才问装到哪个版本文件夹，选完不再重复问
-                win.after(260, lambda: choose_target_dir(after_target))
+                )
+                self.say(
+                    "模组体检 // {0} 个模组可更新，已默认勾选；要装哪个由你决定".format(
+                        len(upgrades)
+                    )
+                )
 
             # Tk 的变量只能在主线程读，先把值取出来再交给后台线程
             loader_now = loader_var.get() or self.mod_loader or ""
@@ -26427,9 +26523,16 @@ class Win1App:
             button_row, "[ 导出报告 ]", export_report, font=FONT_SMALL
         ).pack(side="left", padx=(0, 4))
         btn_update_all = self._mk_button(
-            button_row, "[ 一键更新全部 ]", update_all, font=FONT_SMALL
+            button_row, "[ 更新选中的 ]", update_selected, font=FONT_SMALL
         )
         btn_update_all.pack(side="left", padx=4)
+        btn_select_all = self._mk_button(
+            button_row, "[ 全选 ]", select_all, font=FONT_SMALL
+        )
+        btn_select_all.pack(side="left", padx=4)
+        self._mk_button(
+            button_row, "[ 全不选 ]", select_none, font=FONT_SMALL
+        ).pack(side="left", padx=4)
         self._mk_button(
             button_row, "[ 移出不兼容 → ]", move_incompatible, font=FONT_SMALL
         ).pack(side="left", padx=4)
