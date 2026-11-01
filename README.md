@@ -1,4 +1,4 @@
-# AKM Launcher (Adaptive Kinetic Minecraft) G1.8
+# AKM Launcher (Adaptive Kinetic Minecraft) G1.9
 
 **免费开源：不收费、无内购、无付费版 —— 任何向你收费的都是盗卖。**
 
@@ -11,25 +11,24 @@
 
 ## 下载
 
-**最新正式版：G1.8**
+**最新正式版：G1.9**
 
-- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vG1.8/AKM_Launcher_vG1.8.zip>
-- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vG1.8>
+- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vG1.9/AKM_Launcher_vG1.9.zip>
+- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vG1.9>
 
 单文件免安装，解压后双击 `AKM_Launcher.exe` 就能用，不需要装 Python。
 下载后想核对完整性，可以和发布页里 `SHA256.txt` 的值比对一下。
 
-> **G1.8 修复：NeoForge 安装器执行失败。**
-> Forge/NeoForge 安装器要打原版 `client.jar` 的补丁；目标目录里没有原版时它会自己去
-> Mojang 拉，国内网络拉不下来（只留下 0 字节 jar），最后就是「安装器执行失败 (exit 1)」。
-> 现在装加载器之前会先用启动器自己的镜像下载器把原版补齐；Java 版本不够时直接告诉你
-> 缺哪个 Java，而不是丢一个类版本错误；所有诊断写入 `logs\debug.log`，失败时还附上
-> 安装器自己的日志末尾。
+> **G1.9：体检能中途终止了，也不再反复问「装到哪里」，启动时能看到卡在哪一步。**
+> `[ 终止体检 ]` 实测点击后 0.05 秒停下；「装到哪个版本文件夹」这次会话只问一次；
+> 点火后状态栏显示 `LAUNCH: JVM 2s → FORGE 4s → MINECRAFT 11s → RUNNING 00:14`。
+> 关于启动慢：启动器点火 → 拉起进程只要 **0.09 秒**，剩下的 12-14 秒是 Forge + Minecraft
+> 自己的初始化；`TieredStopAtLevel=1` 与 AppCDS 都实测过（前者是噪声、后者反而更慢），
+> 所以没有塞进来骗人。
 >
+> G1.8：修 NeoForge 安装器执行失败（先补原版 `client.jar`）+ 诊断日志落盘。
 > G1.7：修「体检完了还在体检」——装完不再自动重弹，旧 jar 移出体检列表。
-> G1.6：体检联网阶段并发（4 个模组 2.53 秒）+ **缺前置检测**（`[DEP!]` + 弹窗）+
-> `[ 补装缺失前置 ]` 一键补装 + 单文件下载进度。
-> G1.5：启动预热（点火 0.84s → 0.09s）+ 启动加速 JVM 参数。
+> G1.6：体检联网并发 + **缺前置检测**（`[DEP!]` + 弹窗）+ `[ 补装缺失前置 ]`。
 
 ## 怎么用
 

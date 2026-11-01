@@ -51,7 +51,7 @@ import uuid
 import webbrowser
 import zipfile
 import zlib
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from datetime import datetime
 
 try:
@@ -79,7 +79,7 @@ except Exception:  # pragma: no cover - tkinter always ships with CPython on Win
 # ---------------------------------------------------------------------------
 
 APP_NAME = "AKM Launcher"
-APP_VERSION = "G1.8"
+APP_VERSION = "G1.9"
 
 # ---------------------------------------------------------------------------
 # Internationalisation (zh / en / ja / ru / ar)
@@ -3328,12 +3328,15 @@ def audit_mod_jars(
     progress=None,
     loader="",
     check_curseforge=False,
+    cancel=None,
 ):
     """Classify jars: does the mod publish a build for the target MC version?"""
     target = str(target or "").strip()
+    check_cancel(cancel)
     rows = []
     seen = set()
     for path in paths:
+        check_cancel(cancel)
         key = os.path.normcase(os.path.abspath(path))
         if key in seen:
             continue
@@ -3386,25 +3389,41 @@ def audit_mod_jars(
         for name in AUDIT_LOADERS:
             jobs["loader:" + name] = (lambda who=name: bulk_update([who]))
         results = {}
-        with ThreadPoolExecutor(
+        pool = ThreadPoolExecutor(
             max_workers=min(6, len(jobs)), thread_name_prefix="akm-audit-net"
-        ) as pool:
+        )
+        futures = {}
+        try:
             futures = {pool.submit(func): key for key, func in jobs.items()}
             finished = 0
-            for future in as_completed(futures):
-                key = futures[future]
-                finished += 1
-                try:
-                    results[key] = future.result()
-                except Exception:
-                    results[key] = {}
-                    log_debug("audit bulk job failed: " + key)
-                if progress:
-                    progress(
-                        1,
-                        3,
-                        "联网核对 {0}/{1} // {2}".format(finished, len(jobs), key),
-                    )
+            while True:
+                check_cancel(cancel)
+                pending = [item for item in futures if not item.done()]
+                if not pending:
+                    break
+                # 边等边看用户的「终止体检」按钮
+                wait(futures, timeout=0.25)
+                for future in [item for item in futures if item.done()]:
+                    key = futures.pop(future)
+                    finished += 1
+                    try:
+                        results[key] = future.result()
+                    except Exception:
+                        results[key] = {}
+                        log_debug("audit bulk job failed: " + key)
+                    if progress:
+                        progress(
+                            1,
+                            3,
+                            "联网核对 {0}/{1} // {2}".format(finished, len(jobs), key),
+                        )
+            check_cancel(cancel)
+        except OperationCancelled:
+            # 立刻返回，不等还在飞的请求（它们的结果我们不要了）
+            abort_pool(pool, futures)
+            raise
+        else:
+            pool.shutdown(wait=True)
 
         found = results.get("found") or {}
         newest = results.get("newest") or {}
@@ -3442,6 +3461,7 @@ def audit_mod_jars(
         if progress:
             progress(3, 3, "{0} 个项目已核对".format(len(projects)))
         for digest, row in hashes.items():
+            check_cancel(cancel)
             info = found.get(digest)
             info = info if isinstance(info, dict) else {}
             project_id = str(info.get("project_id") or "")
@@ -3490,11 +3510,14 @@ def audit_mod_jars(
             row["ok"] = None
             row["source"] = "unknown"
     apply_loader_filter(rows, loader, target)
+    check_cancel(cancel)
     if use_network and check_curseforge:
         try:
             ports = audit_curseforge_ports(
-                rows, target, loader, allow_patch, progress
+                rows, target, loader, allow_patch, progress, cancel=cancel
             )
+        except OperationCancelled:
+            raise
         except Exception:
             ports = 0
             log_debug("curseforge audit failed:\n" + traceback.format_exc())
@@ -3660,6 +3683,24 @@ def _best_primary_file(row):
 def best_primary_name(row):
     """The .jar filename the row would install (for "already installed" checks)."""
     return str((_best_primary_file(row) or {}).get("filename") or "")
+
+
+def abort_pool(pool, futures=None):
+    """Drop a thread pool without waiting for in-flight requests."""
+    try:
+        for future in futures or []:
+            future.cancel()
+    except Exception:
+        pass
+    try:
+        pool.shutdown(wait=False, cancel_futures=True)
+    except TypeError:
+        try:
+            pool.shutdown(wait=False)
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 def audit_upgrades(rows, target_dir, installed_files=None):
@@ -6811,7 +6852,7 @@ def cf_slug_candidates(row):
 
 
 def audit_curseforge_ports(
-    rows, target, loader="", allow_patch=True, progress=None, limit=40
+    rows, target, loader="", allow_patch=True, progress=None, limit=40, cancel=None
 ):
     """Fill ``row['cf']`` when CurseForge carries a build for the target MC.
 
@@ -6855,28 +6896,41 @@ def audit_curseforge_ports(
         return None, None
 
     workers = min(4, len(pending))
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="akm-cf") as pool:
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="akm-cf")
+    futures = {}
+    try:
         futures = {pool.submit(probe, row): row for row in pending}
-        for future in as_completed(futures):
-            row = futures[future]
-            done[0] += 1
-            if progress:
-                progress(
-                    done[0],
-                    len(pending),
-                    "CurseForge 移植检查 // {0}".format(
-                        shorten_text(row.get("file") or "", 24)
-                    ),
-                )
-            try:
-                project, file_hit = future.result()
-            except Exception:
-                project, file_hit = None, None
-            if project:
-                row["cf_project"] = project
-            if file_hit:
-                row["cf"] = file_hit
-                found += 1
+        while True:
+            check_cancel(cancel)
+            if not [item for item in futures if not item.done()]:
+                break
+            wait(futures, timeout=0.25)
+            for future in [item for item in futures if item.done()]:
+                row = futures.pop(future)
+                done[0] += 1
+                if progress:
+                    progress(
+                        done[0],
+                        len(pending),
+                        "CurseForge 移植检查 // {0}".format(
+                            shorten_text(row.get("file") or "", 24)
+                        ),
+                    )
+                try:
+                    project, file_hit = future.result()
+                except Exception:
+                    project, file_hit = None, None
+                if project:
+                    row["cf_project"] = project
+                if file_hit:
+                    row["cf"] = file_hit
+                    found += 1
+        check_cancel(cancel)
+    except OperationCancelled:
+        abort_pool(pool, futures)
+        raise
+    else:
+        pool.shutdown(wait=True)
     return found
 
 
@@ -11764,6 +11818,32 @@ class Win1App:
         self._set_launch_state("LAUNCH: RUNNING 00:00", "active")
         self._tick_launch()
 
+    _LAUNCH_STAGE_MARKERS = (
+        ("Sound engine started", "MENU"),
+        ("Created:", "MENU"),
+        ("LWJGL Version", "MINECRAFT"),
+        ("Launching target", "MINECRAFT"),
+        ("ModLauncher running", "FORGE"),
+        ("Trying GL version", "WINDOW"),
+    )
+
+    def _launch_stage(self):
+        """Name the phase the game is in, by looking at its own log tail."""
+        path = str(getattr(self, "_last_launch_log", "") or "")
+        if not path:
+            return ""
+        try:
+            size = os.path.getsize(path)
+            with open(path, "rb") as handle:
+                handle.seek(max(0, size - 80000))
+                text = handle.read().decode("utf-8", "replace")
+        except OSError:
+            return ""
+        for marker, label in self._LAUNCH_STAGE_MARKERS:
+            if marker in text:
+                return label
+        return "JVM"
+
     def _tick_launch(self):
         process = self.game_process
         if process is None:
@@ -11774,12 +11854,19 @@ class Win1App:
         except Exception:
             pass
         elapsed = max(0, int(time.time() - self._launch_started_at))
-        self._set_launch_state(
-            "LAUNCH: RUNNING {0:02d}:{1:02d}".format(
-                elapsed // 60, elapsed % 60
-            ),
-            "active",
-        )
+        stage = self._launch_stage()
+        if stage and stage != "MENU":
+            # 还没进主菜单：把「现在卡在哪一步 + 已经用了多少秒」显示出来
+            self._set_launch_state(
+                "LAUNCH: {0} {1}s".format(stage, elapsed), "active"
+            )
+        else:
+            self._set_launch_state(
+                "LAUNCH: RUNNING {0:02d}:{1:02d}".format(
+                    elapsed // 60, elapsed % 60
+                ),
+                "active",
+            )
         try:
             self._launch_ticker_id = self.root.after(1000, self._tick_launch)
         except Exception:
@@ -23060,8 +23147,47 @@ class Win1App:
                     version_id, len(command)
                 )
             )
+            # 顺手把 classpath 里的 jar 读一遍：点火的 JVM 直接从系统文件缓存读，
+            # 机械盘上这一步能省 1-2 秒（SSD 上基本无感，但也没有坏处）
+            self._warm_classpath_files(command)
         except Exception:
             log_debug("launch prewarm failed:\n" + traceback.format_exc())
+
+    def _warm_classpath_files(self, command, budget_mb=600):
+        """Read launch jars in the background so the JVM does not wait on the disk."""
+        try:
+            paths = self._launch_jar_paths(command)
+        except Exception:
+            return []
+        if not paths:
+            return []
+        limit = int(budget_mb) * 1024 * 1024
+        state = {"read": 0}
+
+        def run():
+            for path in paths:
+                if getattr(self, "game_process", None) is not None:
+                    return
+                if state["read"] >= limit:
+                    return
+                try:
+                    with open(path, "rb") as handle:
+                        while True:
+                            chunk = handle.read(1 << 20)
+                            if not chunk:
+                                break
+                            state["read"] += len(chunk)
+                            if getattr(self, "game_process", None) is not None:
+                                return
+                            if state["read"] >= limit:
+                                return
+                except OSError:
+                    continue
+
+        threading.Thread(
+            target=run, name="akm-warm-files", daemon=True
+        ).start()
+        return paths
 
     def _start_game_process(self, mll, version_id, profile):
         window = self.config.get("window") or {}
@@ -24771,6 +24897,19 @@ class Win1App:
             padx=6,
             pady=1,
         ).pack(side="left", padx=4)
+        btn_cancel_audit = self._mk_button(
+            action_row,
+            "[ 终止体检 ]",
+            cancel_audit,
+            font=FONT_SMALL,
+            padx=6,
+            pady=1,
+        )
+        btn_cancel_audit.pack(side="left", padx=4)
+        try:
+            btn_cancel_audit.configure(state="disabled")
+        except Exception:
+            pass
         self._mk_button(
             action_row, "[ 清空 ]", lambda: clear_all(), font=FONT_SMALL, padx=6, pady=1
         ).pack(side="left", padx=4)
@@ -24861,6 +25000,8 @@ class Win1App:
             "target_dir": "",
             "auto_prompt": True,
             "installed_files": set(),
+            "cancel": threading.Event(),
+            "target_prompted": False,
         }
         only_ok = tk.BooleanVar(value=True)
         cf_var = tk.BooleanVar(value=True)
@@ -25060,6 +25201,7 @@ class Win1App:
                     )
                     return
                 state["target_dir"] = path3
+                state["target_prompted"] = True
                 refresh_target_label()
                 set_status("安装目录 // {0}".format(path3))
                 self.say("模组体检 // 安装目录切换到 {0}".format(path3))
@@ -25700,6 +25842,11 @@ class Win1App:
                 set_status("先拖入 jar，或点 [ 扫描当前 mods ]")
                 return
             state["auto_prompt"] = bool(auto)
+            state["cancel"] = threading.Event()
+            try:
+                btn_cancel_audit.configure(state="normal")
+            except Exception:
+                pass
             target = str(target_var.get() or "").strip()
             if not _mc_tuple(target):
                 set_status("目标版本看不懂：{0}（例：1.21 / 1.21.1）".format(target))
@@ -25717,6 +25864,10 @@ class Win1App:
 
             def finish(rows, error):
                 state["busy"] = False
+                try:
+                    btn_cancel_audit.configure(state="disabled", text="[ 终止体检 ]")
+                except Exception:
+                    pass
                 if rows:
                     state["rows"] = rows
                 state["gaps"] = dependency_gaps(state["rows"])
@@ -25823,7 +25974,11 @@ class Win1App:
                     if ports:
                         offer_cf_ports(ports, auto=True)
 
-                # 先问要装到哪个版本文件夹，再问装不装
+                if state.get("target_prompted"):
+                    # 「装到哪里」这次会话已经问过一次了，直接用记住的目录
+                    after_target()
+                    return
+                # 第一次才问装到哪个版本文件夹，选完不再重复问
                 win.after(260, lambda: choose_target_dir(after_target))
 
             # Tk 的变量只能在主线程读，先把值取出来再交给后台线程
@@ -25840,7 +25995,11 @@ class Win1App:
                         progress,
                         loader=loader_now,
                         check_curseforge=cf_now,
+                        cancel=state.get("cancel"),
                     )
+                except OperationCancelled:
+                    self.post(finish_cancelled)
+                    return
                 except Exception as exc:  # noqa: BLE001
                     log_debug("mod audit failed:\n" + traceback.format_exc())
                     self.post(finish, [], str(exc))
@@ -25848,6 +26007,28 @@ class Win1App:
                 self.post(finish, rows, "")
 
             threading.Thread(target=worker, daemon=True).start()
+        def finish_cancelled():
+            state["busy"] = False
+            try:
+                btn_cancel_audit.configure(state="disabled", text="[ 终止体检 ]")
+            except Exception:
+                pass
+            self._update_controls()
+            set_status("体检已终止 // 结果保留上一轮，需要时重新点 [ 运行体检 ]")
+            self.say("模组体检 // 已按你的要求终止（没装任何东西）")
+
+        def cancel_audit():
+            event = state.get("cancel")
+            if not state["busy"] or event is None:
+                set_status("当前没有在跑的体检")
+                return
+            event.set()
+            set_status("正在终止体检 // 联网请求会在这一轮返回后停下")
+            try:
+                btn_cancel_audit.configure(state="disabled", text="[ 终止中... ]")
+            except Exception:
+                pass
+
         def export_report():
             rows = state["rows"]
             if not rows:
