@@ -79,7 +79,7 @@ except Exception:  # pragma: no cover - tkinter always ships with CPython on Win
 # ---------------------------------------------------------------------------
 
 APP_NAME = "AKM Launcher"
-APP_VERSION = "G1.10"
+APP_VERSION = "G1.11"
 
 # ---------------------------------------------------------------------------
 # Internationalisation (zh / en / ja / ru / ar)
@@ -3786,6 +3786,24 @@ def abort_pool(pool, futures=None):
             pass
     except Exception:
         pass
+
+
+def drop_installed_rows(rows, installed_rows):
+    """Audit rows minus the ones that were just updated (identity based)."""
+    done_ids = {id(item) for item in (installed_rows or [])}
+    if not done_ids:
+        return list(rows or [])
+    return [item for item in (rows or []) if id(item) not in done_ids]
+
+
+def audit_no_update(row):
+    """True when nothing newer exists for the target: newest build == installed."""
+    if row.get("ok") is not True or row.get("loader_ok") is False:
+        return False
+    best = str(row.get("best") or "").strip()
+    if not best:
+        return False
+    return best == str(row.get("installed_version") or "").strip()
 
 
 def audit_upgrades(rows, target_dir, installed_files=None):
@@ -25073,6 +25091,7 @@ class Win1App:
         listing.tag_configure("port", foreground="#0B4F9C")
         listing.tag_configure("xload", foreground="#8A5A00")
         listing.tag_configure("dep", foreground="#7B2D8E")
+        listing.tag_configure("dead", foreground="#B00020")
         listing.tag_configure("miss", foreground="#A11B1B")
         listing.tag_configure("unknown", foreground="#555555")
         listing.tag_configure("note", foreground=C_TEAL)
@@ -25368,7 +25387,11 @@ class Win1App:
                 port = row.get("cf") or {}
                 loader_bad = audit_loader_mismatch(row)
                 if verdict is True and not loader_bad:
-                    tag, mark = "ok", "[ OK ]"
+                    if audit_no_update(row):
+                        # 已经是最新 / 项目停更 -> 红色，提醒这个没有后续更新了
+                        tag, mark = "dead", "[DEAD]"
+                    else:
+                        tag, mark = "ok", "[ OK ]"
                 elif port:
                     tag, mark = "port", "[ CF ]"
                 elif loader_bad:
@@ -25414,6 +25437,10 @@ class Win1App:
                             )
                         if row.get("best") and local and row["best"] != local:
                             detail += "  (可升级)"
+                        elif audit_no_update(row):
+                            detail = "无新版本 // 已是最新或项目停更（{0} 最高 {1}）".format(
+                                target_text, row.get("max_mc") or target_text
+                            )
                     elif source == "local":
                         detail = "本地声明支持：{0}".format(
                             row.get("predicate") or "?"
@@ -25467,13 +25494,14 @@ class Win1App:
             listing.configure(state="disabled")
             listing.see("1.0")
             summary_var.set(
-                "目标 MC {0} // 加载器 {1} // 命中 {2} / 共 {3} // 加载器不符 {4} // 缺前置 {5} // 排除 {6} // 未知 {7}{8}".format(
+                "目标 MC {0} // 加载器 {1} // 命中 {2} / 共 {3} // 加载器不符 {4} // 缺前置 {5} // 无新版本 {6} // 排除 {7} // 未知 {8}{9}".format(
                     target_text or "?",
                     loader_label(loader_var.get()).upper(),
                     len(hits),
                     len(rows),
                     len(loader_bad_rows),
                     len(gaps),
+                    len([row for row in rows if audit_no_update(row)]),
                     len(misses),
                     len(unknown),
                     "  // CF 移植 {0}".format(len(ports)) if ports else "",
@@ -25600,6 +25628,7 @@ class Win1App:
                 done = 0
                 failed = []
                 installed = []
+                installed_rows = []
                 tick = {"done": 0}
 
                 def one(row):
@@ -25638,31 +25667,79 @@ class Win1App:
                             destination, error = None, str(exc)[:80]
                         if destination:
                             installed.append(destination)
+                            installed_rows.append(row)
                             done += 1
                         else:
                             failed.append(error or str(row.get("file")))
-                self.post(finish_install, list(upgrades), done, failed, installed)
+                self.post(
+                    finish_install,
+                    list(upgrades),
+                    installed_rows,
+                    done,
+                    failed,
+                    installed,
+                )
 
-            def finish_install(replaced, done, failed, installed):
+            def finish_install(replaced, installed_rows, done, failed, installed):
                 state["busy"] = False
                 done_files = state.setdefault("installed_files", set())
                 for path in installed:
                     if path and os.path.isfile(path):
                         done_files.add(os.path.normcase(os.path.abspath(path)))
                 state["paths"] = prune_audit_paths(state["paths"], replaced, installed)
+                # 更新好的行直接从列表里移掉，省得和旧版本混在一起看花眼
+                if installed_rows:
+                    state["rows"] = drop_installed_rows(state["rows"], installed_rows)
+                remaining = len(upgradeable_rows())
+                state["gaps"] = dependency_gaps(state["rows"])
                 message = "安装完成 // 成功 {0} / 失败 {1}".format(done, len(failed))
                 set_status(message + ("" if not failed else " // " + failed[0]))
                 self.say(
                     "模组体检安装 // 成功 {0} / 失败 {1}".format(done, len(failed))
                 )
+                if done and not failed:
+                    self.say(
+                        "模组体检 // 已更新完成，{0} 个模组已从列表移除".format(done)
+                    )
+                    set_status(
+                        "已更新完成 // {0} 个模组已是最新并从列表移除{1}".format(
+                            done,
+                            " // 还有 {0} 个待处理".format(remaining)
+                            if remaining
+                            else "",
+                        )
+                    )
+                    render()
+                    refresh_action_labels()
+                    messagebox.showinfo(
+                        "已更新完成",
+                        "已更新完成：{0} 个模组已装到最新版本，并从列表里移除。\n"
+                        "{1}".format(
+                            done,
+                            "还有 {0} 个模组需要处理（红色 [DEAD] 是已经没有新版本的）。".format(
+                                remaining
+                            )
+                            if remaining
+                            else "列表里剩下的都是已经没有新版本的模组。",
+                        ),
+                        parent=win,
+                    )
+                    return
                 if failed:
                     messagebox.showwarning(
                         "安装结果",
                         message + "\n\n" + "\n".join(failed[:5]),
                         parent=win,
                     )
-                # 装完刷新结果，但不要再自动弹「安装最新版本」
-                start(auto=False)
+                render()
+                refresh_action_labels()
+                if done and failed:
+                    # 装一部分成功时同样把成功的移掉，剩下的保持可点
+                    set_status(
+                        "已更新 {0} 个 // {1} 个失败，可在列表里重试".format(
+                            done, len(failed)
+                        )
+                    )
 
             threading.Thread(target=worker, daemon=True).start()
 
@@ -26042,6 +26119,12 @@ class Win1App:
                         )
                     )
                 if not upgrades and not ports:
+                    if not gaps:
+                        set_status(
+                            "体检完成 // 命中 {0} / 共 {1} // 全部已是最新，没有可更新的模组".format(
+                                hits, len(state["rows"])
+                            )
+                        )
                     return
                 if not state.get("auto_prompt", True):
                     # 装完自动刷新的那一轮不再弹「安装最新版本」，避免反复体检/反复安装
