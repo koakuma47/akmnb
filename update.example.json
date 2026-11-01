@@ -1,7 +1,7 @@
 {
-  "version": "G1.5",
-  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.5/AKM_Launcher_vG1.5.zip",
-  "sha256": "8499D33E0A8733F9BC499E771CFE9F2EBD904B24420C1206B9E4F5B35F79CB08",
-  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.5",
-  "notes": "G1.5：启动预热（点火 0.84s→0.09s）+ 启动加速 JVM 参数 + 安装完成后自动收起下载详情窗口"
+  "version": "G1.6",
+  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.6/AKM_Launcher_vG1.6.zip",
+  "sha256": "DEC7DE7D2903892E5C3B3F3E37AA2FCFB717CE87AB9305CA5F0864A211FA2143",
+  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.6",
+  "notes": "G1.6：模组体检提速 + 缺前置检测/一键补装 + 更新模组的下载进度"
 }
