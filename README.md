@@ -1,4 +1,4 @@
-# AKM Launcher (Adaptive Kinetic Minecraft) G1.13
+# AKM Launcher (Adaptive Kinetic Minecraft) G1.14
 
 **免费开源：不收费、无内购、无付费版 —— 任何向你收费的都是盗卖。**
 
@@ -11,22 +11,23 @@
 
 ## 下载
 
-**最新正式版：G1.13**
+**最新正式版：G1.14**
 
-- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vG1.13/AKM_Launcher_vG1.13.zip>
-- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vG1.13>
+- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vG1.14/AKM_Launcher_vG1.14.zip>
+- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vG1.14>
 
 单文件免安装，解压后双击 `AKM_Launcher.exe` 就能用，不需要装 Python。
 下载后想核对完整性，可以和发布页里 `SHA256.txt` 的值比对一下。
 
-> **G1.13：模组更新有进度条了，下载也快了一截。**
-> 更新时显示 `已更新 3/8 // 成功 2 // 失败 1 // 未完成 5` + 复古方块进度条，装完停在最终结果；
-> 每个 jar 改成 4 条 Range 分片下载（实测 Modrinth CDN 单流 34 KB/s → 分片 51 KB/s），
-> 文件级并发 4 → 6，多个模组同时下。
+> **G1.14 修复：体检窗口的进度条压住了选项行。**
+> G1.13 的进度条和「只看命中 / 联网查 CurseForge 移植 / `[ 下移植版 ]` / `[ 补装缺失前置 ]` /
+> `[ 目标文件夹... ]`」抢了同一个 grid 行，整行被盖住看不见也点不到。现在各占一行，
+> 底部按钮也不再被裁切。
 >
+> G1.13：模组更新进度条（`已更新 3/8 // 成功 2 // 失败 1 // 未完成 5`）+ 4 条 Range 分片下载
+> （实测单流 34 KB/s → 51 KB/s），文件并发 4 → 6。
 > G1.12：不再自动重扫/自动开装，逐行勾选决定更新哪个。
 > G1.11：更新完成提示 + 已更新行自动移除 + 无新版本标红 `[DEAD]`。
-> G1.10：修体检窗口拖不进模组（整窗注册拖放）。
 
 ## 怎么用
 

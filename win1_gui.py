@@ -79,7 +79,7 @@ except Exception:  # pragma: no cover - tkinter always ships with CPython on Win
 # ---------------------------------------------------------------------------
 
 APP_NAME = "AKM Launcher"
-APP_VERSION = "G1.13"
+APP_VERSION = "G1.14"
 
 # ---------------------------------------------------------------------------
 # Internationalisation (zh / en / ja / ru / ar)
@@ -24881,7 +24881,7 @@ class Win1App:
         win.transient(self.root)
         win.resizable(True, True)
         try:
-            win.minsize(820, 620)
+            win.minsize(820, 680)
         except Exception:
             pass
 
@@ -26554,7 +26554,7 @@ class Win1App:
         ).pack(side="left", padx=(6, 0))
 
         progress_row = tk.Frame(wrap, bg=C_GRAY, bd=1, relief="solid")
-        progress_row.grid(row=7, column=0, sticky="ew", pady=(6, 0))
+        progress_row.grid(row=8, column=0, sticky="ew", pady=(6, 0))
         progress_text_var = tk.StringVar(
             value="更新进度 // 勾选模组后点 [ 更新选中的 ]"
         )
@@ -26584,6 +26584,21 @@ class Win1App:
                 if total <= 0:
                     progress_text_var.set("更新进度 // 勾选模组后点 [ 更新选中的 ]")
                     progress_bar.delete("all")
+                    width = int(progress_bar.winfo_width() or 280) - 4
+                    cells = 28
+                    if width < cells * 2:
+                        width = cells * 2
+                    cell_w = width / cells
+                    for index in range(cells):
+                        x0 = 2 + index * cell_w
+                        progress_bar.create_rectangle(
+                            x0,
+                            2,
+                            x0 + cell_w - 1,
+                            13,
+                            outline="#B0B0B0",
+                            fill=C_WHITE,
+                        )
                     return
                 left = max(0, total - done)
                 text = "已更新 {0}/{1} // 成功 {2} // 失败 {3} // 未完成 {4}".format(
@@ -26627,11 +26642,11 @@ class Win1App:
             bd=1,
             relief="solid",
         )
-        target_label.grid(row=8, column=0, sticky="ew", pady=(6, 0))
+        target_label.grid(row=9, column=0, sticky="ew", pady=(6, 0))
         refresh_target_label()
 
         button_row = tk.Frame(wrap, bg=C_WHITE)
-        button_row.grid(row=9, column=0, sticky="ew", pady=(6, 0))
+        button_row.grid(row=10, column=0, sticky="ew", pady=(6, 0))
         self._mk_button(
             button_row, "[ 导出报告 ]", export_report, font=FONT_SMALL
         ).pack(side="left", padx=(0, 4))
