@@ -1,4 +1,4 @@
-# AKM Launcher (Adaptive Kinetic Minecraft) G1.7
+# AKM Launcher (Adaptive Kinetic Minecraft) G1.8
 
 **免费开源：不收费、无内购、无付费版 —— 任何向你收费的都是盗卖。**
 
@@ -11,23 +11,25 @@
 
 ## 下载
 
-**最新正式版：G1.7**
+**最新正式版：G1.8**
 
-- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vG1.7/AKM_Launcher_vG1.7.zip>
-- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vG1.7>
+- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vG1.8/AKM_Launcher_vG1.8.zip>
+- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vG1.8>
 
 单文件免安装，解压后双击 `AKM_Launcher.exe` 就能用，不需要装 Python。
 下载后想核对完整性，可以和发布页里 `SHA256.txt` 的值比对一下。
 
-> **G1.7 修复：装完模组后「体检 → 选目录 → 安装」无限重复。**
-> 原因是装完会自动重新体检、又重新弹「安装最新版本」；装到别的版本目录时旧 jar 还在，
-> 于是又被判成可升级，永远停不下来。现在装完只刷新一次结果不再自动弹窗，被替换的旧
-> jar 会从体检列表移除，刚装好的构建也不会第二次报「可升级」。
+> **G1.8 修复：NeoForge 安装器执行失败。**
+> Forge/NeoForge 安装器要打原版 `client.jar` 的补丁；目标目录里没有原版时它会自己去
+> Mojang 拉，国内网络拉不下来（只留下 0 字节 jar），最后就是「安装器执行失败 (exit 1)」。
+> 现在装加载器之前会先用启动器自己的镜像下载器把原版补齐；Java 版本不够时直接告诉你
+> 缺哪个 Java，而不是丢一个类版本错误；所有诊断写入 `logs\debug.log`，失败时还附上
+> 安装器自己的日志末尾。
 >
-> G1.6：体检联网阶段改成并发（4 个模组 2.53 秒），新增**缺前置检测**（`[DEP!]` 行 +
-> 弹窗告诉你缺什么、被谁需要）和 `[ 补装缺失前置 ]` 一键补装；更新模组时显示单文件进度。
-> G1.5：启动预热（点火 0.84s → 0.09s）+ 启动加速 JVM 参数 + 装完自动收起下载详情窗口。
-> G1.4：修「点火但游戏起不来」（Forge 补丁产物缺失自动重装）与「终止启动后按钮卡死」。
+> G1.7：修「体检完了还在体检」——装完不再自动重弹，旧 jar 移出体检列表。
+> G1.6：体检联网阶段并发（4 个模组 2.53 秒）+ **缺前置检测**（`[DEP!]` + 弹窗）+
+> `[ 补装缺失前置 ]` 一键补装 + 单文件下载进度。
+> G1.5：启动预热（点火 0.84s → 0.09s）+ 启动加速 JVM 参数。
 
 ## 怎么用
 

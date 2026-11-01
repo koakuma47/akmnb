@@ -79,7 +79,7 @@ except Exception:  # pragma: no cover - tkinter always ships with CPython on Win
 # ---------------------------------------------------------------------------
 
 APP_NAME = "AKM Launcher"
-APP_VERSION = "G1.7"
+APP_VERSION = "G1.8"
 
 # ---------------------------------------------------------------------------
 # Internationalisation (zh / en / ja / ru / ar)
@@ -876,6 +876,7 @@ CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 AUTH_PATH = os.path.join(BASE_DIR, "auth.json")
 ALIAS_PATH = os.path.join(BASE_DIR, "mod_alias.json")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
+DEBUG_LOG_PATH = os.path.join(LOG_DIR, "debug.log")
 APP_ICON_NAME = "akm_icon.ico"
 
 
@@ -5259,8 +5260,26 @@ class HttpError(LauncherError):
 
 
 def log_debug(message):
+    text = str(message)
     try:
-        print("[AKM] " + str(message))
+        print("[AKM] " + text)
+    except Exception:
+        pass
+    # 打包后的 EXE 没有控制台，写一份到 logs\debug.log，出问题能查
+    try:
+        ensure_dir(LOG_DIR)
+        if (
+            os.path.isfile(DEBUG_LOG_PATH)
+            and os.path.getsize(DEBUG_LOG_PATH) > 2 * 1024 * 1024
+        ):
+            try:
+                os.replace(DEBUG_LOG_PATH, DEBUG_LOG_PATH + ".1")
+            except OSError:
+                pass
+        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as handle:
+            handle.write(
+                "[{0}] {1}\n".format(time.strftime("%Y-%m-%d %H:%M:%S"), text)
+            )
     except Exception:
         pass
 
@@ -7349,6 +7368,34 @@ def neoforge_mirror_loader_versions(mc_version, timeout=JAVA_RUNTIME_TIMEOUT):
     return sort_versions_desc(versions)
 
 
+def _read_text_tail(path, limit=1200):
+    """Last ``limit`` characters of a text file ("" when unreadable)."""
+    try:
+        if not os.path.isfile(path):
+            return ""
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read()[-int(limit) :]
+    except OSError:
+        return ""
+
+
+def vanilla_client_ready(mc_dir, mc_version):
+    """True when <game>/versions/<mc>/ has a usable json + client jar."""
+    version = str(mc_version or "").strip()
+    if not version:
+        return False
+    base = os.path.join(mc_dir, "versions", version)
+    json_path = os.path.join(base, version + ".json")
+    jar_path = os.path.join(base, version + ".jar")
+    try:
+        if not os.path.isfile(json_path) or os.path.getsize(json_path) < 2:
+            return False
+        # 0 字节 / 断线残留的 jar 会让 Forge/NeoForge 安装器直接失败
+        return os.path.isfile(jar_path) and os.path.getsize(jar_path) > 64 * 1024
+    except OSError:
+        return False
+
+
 def installer_library_entries(installer_path):
     """Read the library list embedded in a Forge/NeoForge installer jar."""
     entries = []
@@ -7410,8 +7457,19 @@ def preseed_installer_libraries(
     for entry in entries:
         target = os.path.join(libraries_dir, entry["path"].replace("/", os.sep))
         if os.path.isfile(target) and os.path.getsize(target) > 0:
-            skipped += 1
-            continue
+            expected = entry["sha1"]
+            if expected:
+                try:
+                    if sha1_file(target) == expected:
+                        skipped += 1
+                        continue
+                except OSError:
+                    pass
+                # 之前中断留下的坏文件会让安装器直接失败，删掉重下
+                _cleanup(target)
+            else:
+                skipped += 1
+                continue
         todo.append((entry, target))
     fetched = 0
     started = time.time()
@@ -16122,6 +16180,51 @@ class Win1App:
             log_debug("loader install failed:\n" + traceback.format_exc())
             self.post(self._loader_failed, str(exc))
 
+    def _ensure_vanilla_client(
+        self, minecraft_version, cancel=None, progress=None, monitor=None
+    ):
+        """Make sure the vanilla json + client.jar exist before a loader installer.
+
+        Forge/NeoForge installers patch the vanilla client jar; when it is missing
+        they download it from Mojang themselves, which usually dies on CN networks
+        and ends as "安装器执行失败 (exit 1)" with a 0-byte <mc>.jar.  We fill it in
+        with the launcher's mirror-aware downloader first.
+        """
+        mc = str(minecraft_version or "").strip()
+        if not mc:
+            return True
+        if vanilla_client_ready(self.mc_dir, mc):
+            return True
+        if progress:
+            progress(
+                "loader",
+                0,
+                1,
+                "原版 {0} 缺 client.jar // 先用镜像补全".format(mc),
+            )
+        source = str(self.config.get("download_source") or "auto")
+        try:
+            install_vanilla_game(
+                mc,
+                self.mc_dir,
+                source=source,
+                progress=progress,
+                cancel=cancel,
+                monitor=monitor,
+            )
+        except OperationCancelled:
+            raise
+        except Exception:
+            log_debug("vanilla prefill failed:\n" + traceback.format_exc())
+        if vanilla_client_ready(self.mc_dir, mc):
+            if progress:
+                progress("loader", 1, 1, "原版 {0} 已就绪 // 继续装加载器".format(mc))
+            return True
+        raise LauncherError(
+            "安装器需要原版 {0} 的 client.jar，但这个目录里没有，自动补全也没成功。\n"
+            "请先在 [ 原版下载 ] 里装好 {0}，或用 [ 原版 + 加载器 ] 一键安装。".format(mc)
+        )
+
     def _install_loader_sync(
         self,
         loader_id,
@@ -16165,6 +16268,11 @@ class Win1App:
                 cancel=cancel,
                 progress=report,
                 monitor=monitor,
+            )
+        # Forge / Quilt 的安装器同样要打原版 client.jar 的补丁，先确保原版在位
+        if loader_id in ("forge", "quilt"):
+            self._ensure_vanilla_client(
+                minecraft_version, cancel=cancel, progress=report, monitor=monitor
             )
         # Forge (and some Quilt builds) also refuse to run without this file.
         ensure_launcher_profiles(self.mc_dir, minecraft_version)
@@ -16249,11 +16357,24 @@ class Win1App:
         java_config = str(self.config.get("java") or "").strip()
         java_exec = find_java_executable(self.mc_dir, java_config, required)
         java_actual = java_major_version(java_exec) if java_exec else 0
+        if java_actual < required:
+            bundled = java_runtime_executable(self.mc_dir, required)
+            if bundled and java_major_version(bundled) >= required:
+                java_exec = bundled
+                java_actual = java_major_version(bundled)
         if not java_exec:
             raise LauncherError(
                 "安装 NeoForge {0} 需要 Java {1}，当前没有可用的 Java。\n"
                 "请先在 [游戏] -> [Java 运行时管理...] 下载 Java {1}。".format(
                     version, required
+                )
+            )
+        if java_actual < required:
+            # 用太老的 Java 跑安装器只会得到 UnsupportedClassVersionError（exit 1）
+            raise LauncherError(
+                "安装 NeoForge {0} 需要 Java {1}，当前只能用 Java {2}：\n{3}\n\n"
+                "请到 [游戏] -> [Java 运行时管理...] 装 Java {1} 后再试。".format(
+                    version, required, java_actual or "?", java_exec
                 )
             )
         tempdir = tempfile.mkdtemp(prefix="akm-neoforge-")
@@ -16304,6 +16425,11 @@ class Win1App:
                 raise
             except Exception:
                 log_debug("neoforge preseed failed:\n" + traceback.format_exc())
+            # 安装器要打原版 client.jar 的补丁；缺了它会自己去 Mojang 拉，
+            # 国内网络基本拉不下来（留下 0 字节 jar）-> "安装器执行失败"。
+            self._ensure_vanilla_client(
+                minecraft_version, cancel=cancel, progress=report, monitor=monitor
+            )
             check_cancel(cancel)
             flags = 0x08000000 if os.name == "nt" else 0
             result = subprocess.run(
@@ -16356,6 +16482,14 @@ class Win1App:
                     hint = "把下面的安装器日志发我即可继续定位。"
                 log_path = self._keep_installer_log(
                     tempdir, "neoforge-{0}".format(version)
+                )
+                file_tail = _read_text_tail(os.path.join(tempdir, "installer.log"), 1200)
+                if file_tail:
+                    tail = file_tail
+                log_debug(
+                    "neoforge installer failed (exit {0}):\n{1}".format(
+                        result.returncode, text[-4000:]
+                    )
                 )
                 raise LauncherError(
                     "NeoForge 安装器执行失败 (exit {0})。\n{1}\n\n{2}{3}".format(
