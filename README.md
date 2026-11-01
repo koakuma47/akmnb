@@ -1,4 +1,4 @@
-# AKM Launcher (Adaptive Kinetic Minecraft) G1.14
+# AKM Launcher (Adaptive Kinetic Minecraft) G1.15
 
 **免费开源：不收费、无内购、无付费版 —— 任何向你收费的都是盗卖。**
 
@@ -11,23 +11,23 @@
 
 ## 下载
 
-**最新正式版：G1.14**
+**最新正式版：G1.15**
 
-- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vG1.14/AKM_Launcher_vG1.14.zip>
-- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vG1.14>
+- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vG1.15/AKM_Launcher_vG1.15.zip>
+- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vG1.15>
 
 单文件免安装，解压后双击 `AKM_Launcher.exe` 就能用，不需要装 Python。
 下载后想核对完整性，可以和发布页里 `SHA256.txt` 的值比对一下。
 
-> **G1.14 修复：体检窗口的进度条压住了选项行。**
-> G1.13 的进度条和「只看命中 / 联网查 CurseForge 移植 / `[ 下移植版 ]` / `[ 补装缺失前置 ]` /
-> `[ 目标文件夹... ]`」抢了同一个 grid 行，整行被盖住看不见也点不到。现在各占一行，
-> 底部按钮也不再被裁切。
+> **G1.15：用 76 个真实 1.20 Forge 模组（355 MB）跑通了「装 1.21.1 NeoForge → 体检 → 更新」全链路。**
+> NeoForge 21.1.265 安装 34.9 秒；76 个模组体检 6.5-7.3 秒（可更新 35 / 无新版本 3 / 无目标构建 26 /
+> 加载器不符 9）；真实下载 3 个（最大 14.2 MB）SHA1 全部通过，复检后自动转为「无新版本」。
+> 期间修掉 4 个实测问题：多加载器 jar 被误判成 Fabric、JarJar 内置依赖被当成缺前置、
+> 依赖检查不看目标加载器、CurseForge 探测默认开着拖慢体检。
 >
-> G1.13：模组更新进度条（`已更新 3/8 // 成功 2 // 失败 1 // 未完成 5`）+ 4 条 Range 分片下载
-> （实测单流 34 KB/s → 51 KB/s），文件并发 4 → 6。
+> G1.14：修体检窗口进度条压住选项行。
+> G1.13：模组更新进度条 + 4 条 Range 分片下载（实测 34 KB/s → 51 KB/s）。
 > G1.12：不再自动重扫/自动开装，逐行勾选决定更新哪个。
-> G1.11：更新完成提示 + 已更新行自动移除 + 无新版本标红 `[DEAD]`。
 
 ## 怎么用
 

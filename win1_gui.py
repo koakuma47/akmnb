@@ -28,6 +28,7 @@ import binascii
 import ctypes
 import hashlib
 import http.client
+import io
 import json
 import glob
 import os
@@ -79,7 +80,7 @@ except Exception:  # pragma: no cover - tkinter always ships with CPython on Win
 # ---------------------------------------------------------------------------
 
 APP_NAME = "AKM Launcher"
-APP_VERSION = "G1.14"
+APP_VERSION = "G1.15"
 
 # ---------------------------------------------------------------------------
 # Internationalisation (zh / en / ja / ru / ar)
@@ -2978,6 +2979,146 @@ def _parse_toml_meta(text, meta):
             meta["requires"] = sorted(set(requires))
 
 
+FORGE_FAMILY = ("neoforge", "forge")
+FABRIC_FAMILY = ("fabric", "quilt")
+LOADER_FAMILIES = {
+    "neoforge": FORGE_FAMILY,
+    "forge": FORGE_FAMILY,
+    "fabric": FABRIC_FAMILY,
+    "quilt": FABRIC_FAMILY,
+}
+
+
+def loader_family(name):
+    """'neoforge' -> ('neoforge', 'forge')；空字符串表示不限。"""
+    key = str(name or "").strip().lower()
+    return LOADER_FAMILIES.get(key, (key,) if key else ())
+
+
+def _read_fabric_meta(bundle, names):
+    if "fabric.mod.json" not in names:
+        return None
+    try:
+        data = json.loads(bundle.read("fabric.mod.json").decode("utf-8", "replace"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    depends = data.get("depends") or {}
+    requires = []
+    predicate = ""
+    if isinstance(depends, dict):
+        predicate = str(depends.get("minecraft") or "")
+        requires = sorted(
+            str(key).strip().lower() for key in depends if str(key or "").strip()
+        )
+    return {
+        "loader": "fabric",
+        "modid": str(data.get("id") or ""),
+        "version": str(data.get("version") or ""),
+        "title": str(data.get("name") or data.get("id") or ""),
+        "predicate": predicate,
+        "requires": requires,
+    }
+
+
+def _read_quilt_meta(bundle, names):
+    if "quilt.mod.json" not in names:
+        return None
+    try:
+        data = json.loads(bundle.read("quilt.mod.json").decode("utf-8", "replace"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    loader = data.get("quilt_loader") or {}
+    metadata = loader.get("metadata") or {}
+    requires = []
+    predicate = ""
+    for entry in loader.get("depends") or []:
+        if not isinstance(entry, dict):
+            continue
+        dep_id = str(entry.get("id") or "").strip().lower()
+        if dep_id == "minecraft":
+            predicate = entry.get("versions") or ""
+        if entry.get("optional"):
+            continue
+        if dep_id and dep_id != "minecraft":
+            requires.append(dep_id)
+    return {
+        "loader": "quilt",
+        "modid": str(loader.get("id") or ""),
+        "version": str(loader.get("version") or ""),
+        "title": str(metadata.get("name") or loader.get("id") or ""),
+        "predicate": predicate,
+        "requires": sorted(set(requires)),
+    }
+
+
+def _read_forge_meta(bundle, names):
+    if "META-INF/neoforge.mods.toml" in names:
+        entry = "META-INF/neoforge.mods.toml"
+    elif "META-INF/mods.toml" in names:
+        entry = "META-INF/mods.toml"
+    else:
+        return None
+    try:
+        text = bundle.read(entry).decode("utf-8", "replace")
+    except Exception:
+        return None
+    temp = {"modid": "", "version": "", "title": "", "predicate": "", "requires": []}
+    _parse_toml_meta(text, temp)
+    return {
+        "loader": "neoforge" if entry.endswith("neoforge.mods.toml") else "forge",
+        "modid": temp.get("modid") or "",
+        "version": temp.get("version") or "",
+        "title": temp.get("title") or "",
+        "predicate": temp.get("predicate") or "",
+        "requires": list(temp.get("requires") or []),
+    }
+
+
+def _nested_mod_ids(bundle, names):
+    """Mod ids of jars embedded in this jar (Forge/NeoForge JarJar + Fabric jars)."""
+    ids = set()
+    for entry in names:
+        lower = entry.lower()
+        if not lower.endswith(".jar"):
+            continue
+        if "jarjar" not in lower and not lower.startswith("meta-inf/jars/"):
+            continue
+        try:
+            payload = bundle.read(entry)
+        except Exception:
+            continue
+        try:
+            with zipfile.ZipFile(io.BytesIO(payload)) as nested:
+                inner = set(nested.namelist())
+                if "fabric.mod.json" in inner:
+                    try:
+                        data = json.loads(
+                            nested.read("fabric.mod.json").decode("utf-8", "replace")
+                        )
+                        if isinstance(data, dict) and data.get("id"):
+                            ids.add(str(data["id"]).strip().lower())
+                    except Exception:
+                        pass
+                for toml_name in ("META-INF/neoforge.mods.toml", "META-INF/mods.toml"):
+                    if toml_name in inner:
+                        try:
+                            text = nested.read(toml_name).decode("utf-8", "replace")
+                        except Exception:
+                            break
+                        match = re.search(r'modId\s*=\s*"([^"]+)"', text)
+                        if match:
+                            ids.add(match.group(1).strip().lower())
+                        break
+        except Exception:
+            continue
+    ids.discard("")
+    return sorted(ids)
+
+
 def jar_local_meta(path):
     """Read the mod loader metadata inside a jar (no network needed)."""
     name = os.path.basename(path)
@@ -2990,65 +3131,35 @@ def jar_local_meta(path):
         "loader": "",
         "predicate": "",
         "requires": [],
+        "provides": [],
+        "loaders": [],
         "mc_hint": jar_mc_hint(name),
         "error": "",
     }
     try:
         with zipfile.ZipFile(path) as bundle:
             names = set(bundle.namelist())
-            if "fabric.mod.json" in names:
-                data = json.loads(
-                    bundle.read("fabric.mod.json").decode("utf-8", "replace")
-                )
-                meta["loader"] = "fabric"
-                meta["modid"] = str(data.get("id") or "")
-                meta["version"] = str(data.get("version") or "")
-                meta["title"] = str(data.get("name") or data.get("id") or "")
-                depends = data.get("depends") or {}
-                if isinstance(depends, dict):
-                    meta["predicate"] = depends.get("minecraft") or ""
-                    meta["requires"] = sorted(
-                        str(key).strip().lower()
-                        for key in depends
-                        if str(key or "").strip()
-                    )
-                if "quilt.mod.json" in names:
-                    meta["loader"] = "quilt"
-            elif "quilt.mod.json" in names:
-                data = json.loads(
-                    bundle.read("quilt.mod.json").decode("utf-8", "replace")
-                )
-                loader = data.get("quilt_loader") or {}
-                meta["loader"] = "quilt"
-                meta["modid"] = str(loader.get("id") or "")
-                meta["version"] = str(loader.get("version") or "")
-                metadata = loader.get("metadata") or {}
-                meta["title"] = str(metadata.get("name") or meta["modid"])
-                for entry in loader.get("depends") or []:
-                    if not isinstance(entry, dict):
-                        continue
-                    dep_id = str(entry.get("id") or "").strip().lower()
-                    if dep_id == "minecraft":
-                        meta["predicate"] = entry.get("versions") or ""
-                    if entry.get("optional"):
-                        continue
-                    if dep_id and dep_id != "minecraft":
-                        meta["requires"].append(dep_id)
-                meta["requires"] = sorted(set(meta["requires"]))
-            elif (
-                "META-INF/neoforge.mods.toml" in names
-                or "META-INF/mods.toml" in names
-            ):
-                entry = (
-                    "META-INF/neoforge.mods.toml"
-                    if "META-INF/neoforge.mods.toml" in names
-                    else "META-INF/mods.toml"
-                )
-                text = bundle.read(entry).decode("utf-8", "replace")
-                meta["loader"] = (
-                    "neoforge" if entry.endswith("neoforge.mods.toml") else "forge"
-                )
-                _parse_toml_meta(text, meta)
+            parsed = {}
+            for reader in (_read_fabric_meta, _read_quilt_meta, _read_forge_meta):
+                info = reader(bundle, names)
+                if info:
+                    parsed[info["loader"]] = info
+            # 同一个 jar 里既有 fabric.mod.json 又有 mods.toml 时，Forge/NeoForge
+            # 整合包里它就是一个 Forge 模组，按 Forge 家族的元数据算
+            chosen = ""
+            for candidate in ("neoforge", "forge", "quilt", "fabric"):
+                if candidate in parsed:
+                    chosen = candidate
+                    break
+            if chosen:
+                info = parsed[chosen]
+                meta["loader"] = info["loader"]
+                meta["modid"] = info["modid"] or meta["modid"]
+                meta["version"] = info["version"] or meta["version"]
+                meta["title"] = info["title"] or meta["title"]
+                meta["predicate"] = info["predicate"] or meta["predicate"]
+                meta["requires"] = list(info.get("requires") or [])
+                meta["loaders"] = sorted(parsed)
             elif "mcmod.info" in names:
                 data = json.loads(
                     bundle.read("mcmod.info").decode("utf-8", "replace")
@@ -3058,6 +3169,7 @@ def jar_local_meta(path):
                 if isinstance(data, list) and data:
                     first = data[0] if isinstance(data[0], dict) else {}
                     meta["loader"] = "forge"
+                    meta["loaders"] = ["forge"]
                     meta["modid"] = str(first.get("modid") or "")
                     meta["version"] = str(first.get("version") or "")
                     meta["title"] = str(first.get("name") or meta["modid"])
@@ -3072,6 +3184,10 @@ def jar_local_meta(path):
                 match = re.search(r"Implementation-Version:\s*(\S+)", manifest or "")
                 if match:
                     meta["version"] = match.group(1)
+            # JarJar / 内置 jar：这些依赖其实已经在这个 jar 里了，别报「缺前置」
+            embedded = _nested_mod_ids(bundle, names)
+            if embedded:
+                meta["provides"] = embedded
     except zipfile.BadZipFile:
         meta["error"] = "不是有效的 jar"
     except Exception as exc:  # noqa: BLE001
@@ -3226,9 +3342,18 @@ def apply_loader_filter(rows, target_loader, target_mc=""):
                 row["loader_ok"] = None
         else:
             # 没联网数据时，用 jar 自己声明的加载器兜底判断
-            row["loader_ok"] = loader_matches(
-                wanted, row.get("loader"), target_mc
-            )
+            declared = [
+                str(name).strip().lower()
+                for name in (row.get("loaders") or [row.get("loader")])
+                if str(name or "").strip()
+            ]
+            results = [loader_matches(wanted, name, target_mc) for name in declared]
+            if any(item is True for item in results):
+                row["loader_ok"] = True
+            elif any(item is False for item in results):
+                row["loader_ok"] = False
+            else:
+                row["loader_ok"] = None
         pick_name, pick_info = pick_loader_build(builds, wanted, target_mc)
         row["best_loader"] = pick_name or ""
         if pick_info:
@@ -3273,10 +3398,13 @@ FABRIC_API_IDS = ("fabric-api", "fabric")
 FABRIC_API_MODULE_PREFIX = "fabric-"
 
 
-def dependency_gaps(rows, present_ids=None):
+def dependency_gaps(rows, target_loader="", present_ids=None):
     """对照 jar 里声明的依赖，找出「有模组需要、但目录里没有」的前置。
 
     返回 [{id, required_by: [显示名...], fabric_api: bool}]，按 id 排序。
+
+    ``target_loader`` 用来跳过整个用不上的 jar（例如 NeoForge 整合包里的
+    Fabric 专用模组），``row["provides"]`` 是 JarJar 内置的依赖，算「已存在」。
     """
     present = set()
     for item in present_ids or []:
@@ -3288,9 +3416,23 @@ def dependency_gaps(rows, present_ids=None):
             key = str(row.get(field) or "").strip().lower()
             if key:
                 present.add(key)
+        for item in row.get("provides") or []:
+            key = str(item or "").strip().lower()
+            if key:
+                present.add(key)
+    family = loader_family(target_loader)
     fabric_api_ok = any(name in present for name in FABRIC_API_IDS)
     gaps = {}
     for row in rows:
+        if family:
+            row_loaders = [
+                str(name).strip().lower()
+                for name in (row.get("loaders") or [row.get("loader")])
+                if str(name or "").strip()
+            ]
+            if row_loaders and not any(name in family for name in row_loaders):
+                # 这个 jar 不是目标加载器能用的，它的依赖不影响游戏
+                continue
         title = str(row.get("title") or row.get("file") or "").strip()
         for dep in row.get("requires") or []:
             key = str(dep or "").strip().lower()
@@ -25155,7 +25297,9 @@ class Win1App:
             "line_rows": [],
         }
         only_ok = tk.BooleanVar(value=True)
-        cf_var = tk.BooleanVar(value=True)
+        # CurseForge 探测是逐个 slug 猜的，76 个模组时能多花十几秒；
+        # 默认关掉，需要找「原版没有但 CF 有移植」时再勾
+        cf_var = tk.BooleanVar(value=False)
 
         def set_status(text):
             try:
