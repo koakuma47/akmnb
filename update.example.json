@@ -1,7 +1,7 @@
 {
-  "version": "G1.8",
-  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.8/AKM_Launcher_vG1.8.zip",
-  "sha256": "E2B2F46821C80277DD6514AEFAFC7F6F385B5C12C8034492262DA2BC0459C54F",
-  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.8",
-  "notes": "G1.8：修 NeoForge 安装器执行失败（先补原版 client.jar）+ 诊断日志落盘"
+  "version": "G1.9",
+  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.9/AKM_Launcher_vG1.9.zip",
+  "sha256": "44E4F20316686E94F5DE89679F0A2D1F180599B72B321B37000632FD7DC164BB",
+  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.9",
+  "notes": "G1.9：体检可终止 + 选目录只问一次 + 启动阶段显示"
 }
