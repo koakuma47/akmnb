@@ -1,4 +1,4 @@
-# AKM Launcher (Adaptive Kinetic Minecraft) G1.12
+# AKM Launcher (Adaptive Kinetic Minecraft) G1.13
 
 **免费开源：不收费、无内购、无付费版 —— 任何向你收费的都是盗卖。**
 
@@ -11,22 +11,22 @@
 
 ## 下载
 
-**最新正式版：G1.12**
+**最新正式版：G1.13**
 
-- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vG1.12/AKM_Launcher_vG1.12.zip>
-- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vG1.12>
+- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vG1.13/AKM_Launcher_vG1.13.zip>
+- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vG1.13>
 
 单文件免安装，解压后双击 `AKM_Launcher.exe` 就能用，不需要装 Python。
 下载后想核对完整性，可以和发布页里 `SHA256.txt` 的值比对一下。
 
-> **G1.12：体检不再自动重扫、不再自动下载 —— 更新哪个由你勾选。**
-> 以前下完移植版 / 补完前置 / 体检发现可更新，都会自己再全量识别一遍甚至直接开装，
-> 下载和识别互相打断。现在只有你点 `[ 运行体检 ]`、`[ 扫描当前 mods ]` 或拖入 jar 才会重新识别；
-> 列表每行前面有 `▣ / ▢`，点一下就能勾上/取消，按 `[ 更新选中的 (n/m) ]` 只装你勾的那几个。
+> **G1.13：模组更新有进度条了，下载也快了一截。**
+> 更新时显示 `已更新 3/8 // 成功 2 // 失败 1 // 未完成 5` + 复古方块进度条，装完停在最终结果；
+> 每个 jar 改成 4 条 Range 分片下载（实测 Modrinth CDN 单流 34 KB/s → 分片 51 KB/s），
+> 文件级并发 4 → 6，多个模组同时下。
 >
+> G1.12：不再自动重扫/自动开装，逐行勾选决定更新哪个。
 > G1.11：更新完成提示 + 已更新行自动移除 + 无新版本标红 `[DEAD]`。
 > G1.10：修体检窗口拖不进模组（整窗注册拖放）。
-> G1.9：体检可中途终止 + 启动阶段显示（`LAUNCH: JVM/FORGE/MINECRAFT 秒`）。
 
 ## 怎么用
 

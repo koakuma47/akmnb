@@ -79,7 +79,7 @@ except Exception:  # pragma: no cover - tkinter always ships with CPython on Win
 # ---------------------------------------------------------------------------
 
 APP_NAME = "AKM Launcher"
-APP_VERSION = "G1.12"
+APP_VERSION = "G1.13"
 
 # ---------------------------------------------------------------------------
 # Internationalisation (zh / en / ja / ru / ar)
@@ -1300,6 +1300,9 @@ CLIENT_TIMEOUT = 90
 # over several range connections: one socket is capped around 0.2-0.4 MB/s while
 # 12-16 parallel ranges reach the link speed (~1.3 MB/s measured).
 PARALLEL_MIN_BYTES = 4 * 1024 * 1024
+# 模组 jar 一般只有几百 KB ~ 几 MB，实测 4 个分片就能把单连接的速度拉高 1.5 倍左右
+MOD_PARALLEL_MIN_BYTES = 200 * 1024
+MOD_PARALLEL_WORKERS = 4
 PARALLEL_WORKERS = 32
 PARALLEL_CHUNK_MIN = 1024 * 1024
 # 启动加速：初始堆直接给到上限（最多 8G），少掉加载期的多次扩堆 / GC；
@@ -3879,34 +3882,31 @@ def install_mod_build(row, target_dir, timeout=120, progress=None, monitor=None)
     )
     destination = os.path.join(target_dir, filename)
     expected = str((primary.get("hashes") or {}).get("sha1") or "").lower()
-    if monitor is not None:
-        monitor.begin(destination, filename, int(primary.get("size") or 0), kind="mod")
+    expected_size = int(primary.get("size") or 0)
 
     def report(done, total):
-        if monitor is not None:
-            monitor.update(destination, done, total)
         if progress is not None:
             progress(filename, done, total)
 
-    try:
-        download_file(
-            str(primary["url"]), destination, progress=report, timeout=timeout
-        )
-    except Exception:
-        if monitor is not None:
-            monitor.finish(destination, "failed")
-        raise
-    if expected:
-        actual = sha1_file(destination)
-        if actual != expected:
-            _cleanup(destination)
-            if monitor is not None:
-                monitor.finish(destination, "failed")
-            raise LauncherError("SHA1 校验失败")
-    if monitor is not None:
-        monitor.finish(
-            destination, "done", os.path.getsize(destination) if os.path.exists(destination) else 0
-        )
+    # 走启动器统一的下载器：多连接分片（>4MB 的文件）、镜像/重试、
+    # SHA1 校验、以及「下载详情」窗口的进度都由它负责，比单流下载快得多
+    download_to_dest(
+        [("modrinth", str(primary["url"]))],
+        destination,
+        sha1=expected,
+        size=expected_size,
+        progress=report,
+        timeout=max(int(timeout or 120), 60),
+        parallel=True,
+        workers=MOD_PARALLEL_WORKERS,
+        min_parallel_bytes=MOD_PARALLEL_MIN_BYTES,
+        monitor=monitor,
+        label=filename,
+    )
+    if expected and sha1_file(destination) != expected:
+        # download_to_dest 已经校验过一次，这里再兜一层
+        _cleanup(destination)
+        raise LauncherError("SHA1 校验失败")
     old_path = str(row.get("path") or "")
     if old_path and os.path.abspath(old_path) != os.path.abspath(destination):
         same_folder = os.path.normcase(
@@ -3963,7 +3963,18 @@ def install_missing_dependency(gap, mc_version, loader, target_dir, timeout=180,
         if progress is not None:
             progress(filename, done, total)
 
-    download_file(str(primary["url"]), destination, progress=report, timeout=timeout)
+    download_to_dest(
+        [("modrinth", str(primary["url"]))],
+        destination,
+        sha1=str((primary.get("hashes") or {}).get("sha1") or ""),
+        size=int(primary.get("size") or 0),
+        progress=report,
+        timeout=max(int(timeout or 180), 60),
+        parallel=True,
+        workers=MOD_PARALLEL_WORKERS,
+        min_parallel_bytes=MOD_PARALLEL_MIN_BYTES,
+        label=filename,
+    )
     return destination
 
 
@@ -6780,7 +6791,18 @@ def fetch_mod_jar(project, mc_version, loader, mods_dir, say=None):
         else:
             say("下载 {0} :: {1} KiB".format(filename, done // 1024))
 
-    download_file(primary["url"], dest, progress=_progress)
+    download_to_dest(
+        [("modrinth", str(primary["url"]))],
+        dest,
+        sha1=str((primary.get("hashes") or {}).get("sha1") or ""),
+        size=int(primary.get("size") or 0),
+        progress=_progress,
+        timeout=180,
+        parallel=True,
+        workers=MOD_PARALLEL_WORKERS,
+        min_parallel_bytes=MOD_PARALLEL_MIN_BYTES,
+        label=filename,
+    )
     return {
         "status": "ok",
         "filename": filename,
@@ -7047,7 +7069,15 @@ def download_cf_port(port, target_dir, timeout=180):
         str(port.get("filename") or "curseforge-mod.jar")
     )
     destination = os.path.join(target_dir, filename)
-    download_file(url, destination, timeout=timeout)
+    download_to_dest(
+        [("curseforge", url)],
+        destination,
+        timeout=max(int(timeout or 180), 60),
+        parallel=True,
+        workers=MOD_PARALLEL_WORKERS,
+        min_parallel_bytes=MOD_PARALLEL_MIN_BYTES,
+        label=filename,
+    )
     expected = int(port.get("size") or 0)
     if expected:
         try:
@@ -8453,6 +8483,7 @@ def parallel_download(
     label="",
     workers=None,
     chunk=None,
+    min_bytes=None,
 ):
     """Fetch one big file over several range connections.
 
@@ -8466,7 +8497,8 @@ def parallel_download(
     pairs = [(tag, url) for tag, url in (url_pairs or []) if url]
     if not pairs:
         raise _ParallelUnsupported("no url")
-    if expected_size and expected_size < PARALLEL_MIN_BYTES:
+    floor = int(min_bytes or PARALLEL_MIN_BYTES)
+    if expected_size and expected_size < floor:
         raise _ParallelUnsupported("small file")
 
     probes = []
@@ -8481,7 +8513,7 @@ def parallel_download(
             if status in (200, 206) and total > 0
         ]
         expected_size = max(sizes) if sizes else 0
-    if expected_size < PARALLEL_MIN_BYTES:
+    if expected_size < floor:
         raise _ParallelUnsupported("small file")
 
     resolved = []
@@ -8650,6 +8682,7 @@ def download_to_dest(
     label="",
     parallel=False,
     workers=None,
+    min_parallel_bytes=None,
 ):
     """Download one file with mirror/official fallback and optional SHA1.
 
@@ -8688,7 +8721,8 @@ def download_to_dest(
         usable = [item for item in pairs if not health.blocked(item[0])]
         if usable:
             pairs = usable
-    if parallel and pairs and (expected_size == 0 or expected_size >= PARALLEL_MIN_BYTES):
+    floor_bytes = int(min_parallel_bytes or PARALLEL_MIN_BYTES)
+    if parallel and pairs and (expected_size == 0 or expected_size >= floor_bytes):
         try:
             return parallel_download(
                 pairs,
@@ -8702,6 +8736,7 @@ def download_to_dest(
                 monitor=monitor,
                 label=display,
                 workers=workers,
+                min_bytes=floor_bytes,
             )
         except OperationCancelled:
             if monitor is not None:
@@ -24775,7 +24810,17 @@ class Win1App:
                     )
                     dest = os.path.join(mods_dir, filename)
                     try:
-                        download_file(str(primary["url"]), dest, timeout=90)
+                        download_to_dest(
+                            [("modrinth", str(primary["url"]))],
+                            dest,
+                            sha1=str((primary.get("hashes") or {}).get("sha1") or ""),
+                            size=int(primary.get("size") or 0),
+                            timeout=180,
+                            parallel=True,
+                            workers=MOD_PARALLEL_WORKERS,
+                            min_parallel_bytes=MOD_PARALLEL_MIN_BYTES,
+                            label=filename,
+                        )
                         if os.path.abspath(dest) != os.path.abspath(row["path"]):
                             try:
                                 os.remove(row["path"])
@@ -25662,6 +25707,7 @@ class Win1App:
             state["busy"] = True
             mods_dir = current_target_dir()
             set_status("正在安装 0/{0} ...".format(len(upgrades)))
+            self.post(draw_install_progress, 0, len(upgrades), 0, 0)
             monitor = DOWNLOAD_MONITOR
             try:
                 monitor.reset("模组更新 // {0} 个".format(len(upgrades)))
@@ -25715,19 +25761,13 @@ class Win1App:
                         )
 
                 with ThreadPoolExecutor(
-                    max_workers=min(4, len(upgrades)),
+                    max_workers=min(6, len(upgrades)),
                     thread_name_prefix="akm-audit-up",
                 ) as pool:
                     futures = {pool.submit(one, row): row for row in upgrades}
                     for future in as_completed(futures):
                         row = futures[future]
                         tick["done"] += 1
-                        self.post(
-                            set_status,
-                            "正在安装 {0}/{1} // {2}".format(
-                                tick["done"], len(upgrades), row.get("file")
-                            ),
-                        )
                         try:
                             destination, error = future.result()
                         except Exception as exc:  # noqa: BLE001
@@ -25738,6 +25778,14 @@ class Win1App:
                             done += 1
                         else:
                             failed.append(error or str(row.get("file")))
+                        self.post(
+                            draw_install_progress,
+                            done + len(failed),
+                            len(upgrades),
+                            done,
+                            len(failed),
+                            row.get("file") or "",
+                        )
                 self.post(
                     finish_install,
                     list(upgrades),
@@ -25759,6 +25807,9 @@ class Win1App:
                     state["rows"] = drop_installed_rows(state["rows"], installed_rows)
                 remaining = len(upgradeable_rows())
                 state["gaps"] = dependency_gaps(state["rows"])
+                self.post(
+                    draw_install_progress, done + len(failed), len(replaced), done, len(failed)
+                )
                 message = "安装完成 // 成功 {0} / 失败 {1}".format(done, len(failed))
                 set_status(message + ("" if not failed else " // " + failed[0]))
                 self.say(
@@ -26106,6 +26157,7 @@ class Win1App:
                 set_status("先拖入 jar，或点 [ 扫描当前 mods ]")
                 return
             state["cancel"] = threading.Event()
+            self.post(draw_install_progress, 0, 0, 0, 0)
             try:
                 btn_cancel_audit.configure(state="normal")
             except Exception:
@@ -26500,6 +26552,67 @@ class Win1App:
             lambda: choose_target_dir(None),
             font=FONT_SMALL,
         ).pack(side="left", padx=(6, 0))
+
+        progress_row = tk.Frame(wrap, bg=C_GRAY, bd=1, relief="solid")
+        progress_row.grid(row=7, column=0, sticky="ew", pady=(6, 0))
+        progress_text_var = tk.StringVar(
+            value="更新进度 // 勾选模组后点 [ 更新选中的 ]"
+        )
+        progress_bar = tk.Canvas(
+            progress_row,
+            width=280,
+            height=16,
+            bg=C_WHITE,
+            bd=0,
+            highlightthickness=0,
+        )
+        progress_bar.pack(side="left", padx=(6, 8), pady=3)
+        tk.Label(
+            progress_row,
+            textvariable=progress_text_var,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+        ).pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        def draw_install_progress(done, total, ok, fail, current=""):
+            """Retro block bar + counters: 已完成 / 成功 / 失败 / 未完成."""
+            try:
+                done = max(0, int(done))
+                total = max(0, int(total))
+                if total <= 0:
+                    progress_text_var.set("更新进度 // 勾选模组后点 [ 更新选中的 ]")
+                    progress_bar.delete("all")
+                    return
+                left = max(0, total - done)
+                text = "已更新 {0}/{1} // 成功 {2} // 失败 {3} // 未完成 {4}".format(
+                    done, total, max(0, int(ok)), max(0, int(fail)), left
+                )
+                if current:
+                    text += " // 正在下载 {0}".format(shorten_text(current, 26))
+                progress_text_var.set(text)
+                progress_bar.delete("all")
+                width = int(progress_bar.winfo_width() or 280) - 4
+                cells = 28
+                if width < cells * 2:
+                    width = cells * 2
+                cell_w = width / cells
+                lit = int(round(cells * done / total)) if total else 0
+                for index in range(cells):
+                    x0 = 2 + index * cell_w
+                    x1 = x0 + cell_w - 1
+                    filled = index < lit
+                    progress_bar.create_rectangle(
+                        x0,
+                        2,
+                        x1,
+                        13,
+                        outline=C_BLACK if filled else "#B0B0B0",
+                        fill=C_TEAL if filled else C_WHITE,
+                    )
+            except Exception:
+                pass
 
         target_label = tk.Label(
             wrap,
