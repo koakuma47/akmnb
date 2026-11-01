@@ -1,7 +1,7 @@
 {
-  "version": "G1.11",
-  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.11/AKM_Launcher_vG1.11.zip",
-  "sha256": "ACEABE80F3780E00F33C47DD3E5BC23BD946A006BEA56D06D951EA67B9F63738",
-  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.11",
-  "notes": "G1.11：更新完成提示 + 已更新行自动移除 + 无新版本标红"
+  "version": "G1.12",
+  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.12/AKM_Launcher_vG1.12.zip",
+  "sha256": "AEBFEC5EDFB22769F06B1E553796E659C2E6D397FF3056C1389452A41687AABC",
+  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.12",
+  "notes": "G1.12：不再自动重扫/自动开装，逐行勾选决定更新哪个"
 }
