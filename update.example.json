@@ -1,7 +1,7 @@
 {
-  "version": "G1.10",
-  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.10/AKM_Launcher_vG1.10.zip",
-  "sha256": "2ACF4D30D1833158C9F830CC55AC39D5762E6624122C0F59B177AF96C00648D7",
-  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.10",
-  "notes": "G1.10：修体检窗口拖不进模组（G1.9 的问题）"
+  "version": "G1.11",
+  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.11/AKM_Launcher_vG1.11.zip",
+  "sha256": "ACEABE80F3780E00F33C47DD3E5BC23BD946A006BEA56D06D951EA67B9F63738",
+  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.11",
+  "notes": "G1.11：更新完成提示 + 已更新行自动移除 + 无新版本标红"
 }
