@@ -1,7 +1,7 @@
 {
-  "version": "G1.6",
-  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.6/AKM_Launcher_vG1.6.zip",
-  "sha256": "DEC7DE7D2903892E5C3B3F3E37AA2FCFB717CE87AB9305CA5F0864A211FA2143",
-  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.6",
-  "notes": "G1.6：模组体检提速 + 缺前置检测/一键补装 + 更新模组的下载进度"
+  "version": "G1.7",
+  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.7/AKM_Launcher_vG1.7.zip",
+  "sha256": "F8CD7BCA50DA28D384A34DD177B297E5795298402C13A2B4FC3EA8EF53ED4C3C",
+  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.7",
+  "notes": "G1.7：修「体检完了还在体检」——装完不再自动重弹，旧 jar 移出体检列表"
 }
