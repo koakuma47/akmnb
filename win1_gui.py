@@ -79,7 +79,7 @@ except Exception:  # pragma: no cover - tkinter always ships with CPython on Win
 # ---------------------------------------------------------------------------
 
 APP_NAME = "AKM Launcher"
-APP_VERSION = "G1.9"
+APP_VERSION = "G1.10"
 
 # ---------------------------------------------------------------------------
 # Internationalisation (zh / en / ja / ru / ar)
@@ -3540,23 +3540,75 @@ _LRESULT = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.
 _WNDPROC_TYPE = ctypes.WINFUNCTYPE(
     _LRESULT, ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_size_t
 )
-_DROP_STATES = {}
+_DROP_STATES = {}  # hwnd -> {"old": old proc, "proc": wndproc, "owner": frame hwnd}
+_DROP_PATHS = {}  # frame hwnd -> [paths]  (shared by the whole window tree)
+_DROP_OWNERS = {}  # frame hwnd -> callback
 
 
-def enable_file_drop(window, callback):
-    """Let the user drop files/folders from Explorer onto a Toplevel.
-
-    Tk has no native drop support, so the top level window procedure is
-    subclassed and WM_DROPFILES is handled here. Everything is wrapped so a
-    failure simply means "drag and drop unavailable" (the dialogs still work).
-    """
-    if os.name != "nt":
-        return False
+def _enum_window_handles(frame):
+    """frame + every descendant HWND (Tk gives each widget its own child window)."""
+    handles = [frame]
     try:
-        handle = int(window.wm_frame(), 16)
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        enum_proc_type = ctypes.WINFUNCTYPE(
+            ctypes.c_bool, ctypes.c_void_p, ctypes.c_size_t
+        )
+        found = []
+
+        def collect(hwnd, _lparam):
+            found.append(int(hwnd))
+            return True
+
+        user32.EnumChildWindows(ctypes.c_void_p(frame), enum_proc_type(collect), 0)
+        handles.extend(found)
     except Exception:
-        return False
-    if not handle:
+        pass
+    return handles
+
+
+def _drop_handler(shell32, user32, owner, state):
+    def handler(hwnd, message, wparam, lparam):
+        if message == _WM_DROPFILES:
+            try:
+                count = int(
+                    shell32.DragQueryFileW(
+                        ctypes.c_void_p(wparam), 0xFFFFFFFF, None, 0
+                    )
+                )
+                paths = []
+                for index in range(max(0, count)):
+                    buffer = ctypes.create_unicode_buffer(2048)
+                    length = shell32.DragQueryFileW(
+                        ctypes.c_void_p(wparam), index, buffer, 2048
+                    )
+                    if length:
+                        paths.append(buffer.value)
+                shell32.DragFinish(ctypes.c_void_p(wparam))
+                if paths:
+                    # never touch Tk inside a window procedure: the dialog polls
+                    # this list with after() instead
+                    _DROP_PATHS.setdefault(owner, []).extend(paths)
+                    log_debug(
+                        "drop received // {0} path(s) // first={1}".format(
+                            len(paths), os.path.basename(paths[0])
+                        )
+                    )
+            except Exception:
+                pass
+            return 0
+        try:
+            return user32.CallWindowProcW(
+                state.get("old"), ctypes.c_void_p(hwnd), message, wparam, lparam
+            )
+        except Exception:
+            return 0
+
+    return handler
+
+
+def _drop_attach(hwnd, owner):
+    """Make one HWND a drop target (DragAcceptFiles + WM_DROPFILES hook)."""
+    if not hwnd or hwnd in _DROP_STATES:
         return False
     try:
         shell32 = ctypes.WinDLL("shell32", use_last_error=True)
@@ -3583,50 +3635,65 @@ def enable_file_drop(window, callback):
             ctypes.c_int,
             _WNDPROC_TYPE,
         ]
-        state = {"old": None, "proc": None, "callback": callback, "hwnd": handle, "paths": []}
-
-        def handler(hwnd, message, wparam, lparam):
-            if message == _WM_DROPFILES:
-                try:
-                    count = int(
-                        shell32.DragQueryFileW(
-                            ctypes.c_void_p(wparam), 0xFFFFFFFF, None, 0
-                        )
-                    )
-                    paths = []
-                    for index in range(max(0, count)):
-                        buffer = ctypes.create_unicode_buffer(1024)
-                        length = shell32.DragQueryFileW(
-                            ctypes.c_void_p(wparam), index, buffer, 1024
-                        )
-                        if length:
-                            paths.append(buffer.value)
-                    shell32.DragFinish(ctypes.c_void_p(wparam))
-                    if paths:
-                        # never touch Tk from inside the window procedure: the
-                        # dialog polls this list with after() instead.
-                        state["paths"].extend(paths)
-                except Exception:
-                    pass
-                return 0
-            try:
-                return user32.CallWindowProcW(
-                    state["old"], hwnd, message, wparam, lparam
-                )
-            except Exception:
-                return 0
-
-        proc = _WNDPROC_TYPE(handler)
+        state = {"old": None, "proc": None, "owner": owner}
+        proc = _WNDPROC_TYPE(_drop_handler(shell32, user32, owner, state))
         state["proc"] = proc
         state["old"] = user32.SetWindowLongPtrW(
-            ctypes.c_void_p(handle), _GWLP_WNDPROC, proc
+            ctypes.c_void_p(hwnd), _GWLP_WNDPROC, proc
         )
-        shell32.DragAcceptFiles(ctypes.c_void_p(handle), True)
-        _DROP_STATES[handle] = state
+        shell32.DragAcceptFiles(ctypes.c_void_p(hwnd), True)
+        _DROP_STATES[hwnd] = state
         return True
     except Exception:
-        log_debug("file drop unavailable:\n" + traceback.format_exc())
+        log_debug("drop attach failed for 0x{0:X}".format(int(hwnd or 0)))
         return False
+
+
+def enable_file_drop(window, callback):
+    """Let the user drop files/folders from Explorer onto a Toplevel.
+
+    Windows sends WM_DROPFILES to the window *under the cursor*, and every Tk
+    widget is its own child HWND, so registering only the top level frame (the
+    old behaviour) meant drops landing anywhere inside the window were lost.
+    Here the frame and all of its descendants are registered.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        handle = int(window.wm_frame(), 16)
+    except Exception:
+        return False
+    if not handle:
+        return False
+    try:
+        window.update_idletasks()
+        window.update()
+    except Exception:
+        pass
+    attached = 0
+    for hwnd in _enum_window_handles(handle):
+        if _drop_attach(hwnd, handle):
+            attached += 1
+    if not attached:
+        return False
+    _DROP_PATHS.setdefault(handle, [])
+    _DROP_OWNERS[handle] = callback
+    return True
+
+
+def refresh_file_drop(window):
+    """Register widgets created after enable_file_drop() (buttons, rows...)."""
+    try:
+        handle = int(window.wm_frame(), 16)
+    except Exception:
+        return False
+    if handle not in _DROP_OWNERS:
+        return False
+    added = 0
+    for hwnd in _enum_window_handles(handle):
+        if _drop_attach(hwnd, handle):
+            added += 1
+    return bool(added)
 
 
 def take_dropped_paths(window):
@@ -3635,17 +3702,15 @@ def take_dropped_paths(window):
         handle = int(window.wm_frame(), 16)
     except Exception:
         return []
-    state = _DROP_STATES.get(handle)
-    if not state:
-        return []
-    paths = list(state.get("paths") or [])
-    state["paths"] = []
+    paths = list(_DROP_PATHS.get(handle) or [])
+    if paths:
+        _DROP_PATHS[handle] = []
     return paths
 
 
 def drop_registered(window):
     try:
-        return int(window.wm_frame(), 16) in _DROP_STATES
+        return int(window.wm_frame(), 16) in _DROP_OWNERS
     except Exception:
         return False
 
@@ -3655,16 +3720,36 @@ def disable_file_drop(window):
         handle = int(window.wm_frame(), 16)
     except Exception:
         return
-    state = _DROP_STATES.pop(handle, None)
-    if not state:
-        return
+    _DROP_OWNERS.pop(handle, None)
+    _DROP_PATHS.pop(handle, None)
     try:
         user32 = ctypes.WinDLL("user32", use_last_error=True)
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
         user32.SetWindowLongPtrW.restype = ctypes.c_void_p
-        user32.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int, _WNDPROC_TYPE]
-        user32.SetWindowLongPtrW(
-            ctypes.c_void_p(handle), _GWLP_WNDPROC, state["old"]
-        )
+        user32.SetWindowLongPtrW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            _WNDPROC_TYPE,
+        ]
+        targets = [
+            hwnd
+            for hwnd, state in list(_DROP_STATES.items())
+            if state.get("owner") == handle
+        ]
+        for hwnd in targets:
+            state = _DROP_STATES.pop(hwnd, None)
+            if not state:
+                continue
+            try:
+                shell32.DragAcceptFiles(ctypes.c_void_p(hwnd), False)
+            except Exception:
+                pass
+            try:
+                user32.SetWindowLongPtrW(
+                    ctypes.c_void_p(hwnd), _GWLP_WNDPROC, state["old"]
+                )
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -24900,7 +24985,7 @@ class Win1App:
         btn_cancel_audit = self._mk_button(
             action_row,
             "[ 终止体检 ]",
-            cancel_audit,
+            lambda: cancel_audit(),
             font=FONT_SMALL,
             padx=6,
             pady=1,
@@ -26280,6 +26365,8 @@ class Win1App:
         def on_drop(items):
             add_paths(items, run=True)
 
+        poll_tick = {"n": 0}
+
         def poll_drop():
             try:
                 dropped_paths = take_dropped_paths(win)
@@ -26287,6 +26374,13 @@ class Win1App:
                 dropped_paths = []
             if dropped_paths:
                 on_drop(dropped_paths)
+            # 窗口里后来新建的控件（按钮 / 结果行）也要成为投放目标
+            poll_tick["n"] += 1
+            if poll_tick["n"] % 10 == 0:
+                try:
+                    refresh_file_drop(win)
+                except Exception:
+                    pass
             try:
                 win.after(200, poll_drop)
             except Exception:

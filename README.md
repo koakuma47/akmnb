@@ -1,4 +1,4 @@
-# AKM Launcher (Adaptive Kinetic Minecraft) G1.9
+# AKM Launcher (Adaptive Kinetic Minecraft) G1.10
 
 **免费开源：不收费、无内购、无付费版 —— 任何向你收费的都是盗卖。**
 
@@ -11,24 +11,23 @@
 
 ## 下载
 
-**最新正式版：G1.9**
+**最新正式版：G1.10**
 
-- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vG1.9/AKM_Launcher_vG1.9.zip>
-- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vG1.9>
+- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vG1.10/AKM_Launcher_vG1.10.zip>
+- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vG1.10>
 
 单文件免安装，解压后双击 `AKM_Launcher.exe` 就能用，不需要装 Python。
 下载后想核对完整性，可以和发布页里 `SHA256.txt` 的值比对一下。
 
-> **G1.9：体检能中途终止了，也不再反复问「装到哪里」，启动时能看到卡在哪一步。**
-> `[ 终止体检 ]` 实测点击后 0.05 秒停下；「装到哪个版本文件夹」这次会话只问一次；
-> 点火后状态栏显示 `LAUNCH: JVM 2s → FORGE 4s → MINECRAFT 11s → RUNNING 00:14`。
-> 关于启动慢：启动器点火 → 拉起进程只要 **0.09 秒**，剩下的 12-14 秒是 Forge + Minecraft
-> 自己的初始化；`TieredStopAtLevel=1` 与 AppCDS 都实测过（前者是噪声、后者反而更慢），
-> 所以没有塞进来骗人。
+> **G1.10 紧急修复：体检窗口拖不进模组。**
+> 两个原因：① G1.9 加 `[ 终止体检 ]` 时按钮引用了还没定义的函数，体检窗口一打开就抛异常，
+> 窗口只画了一半、拖放根本没注册；② 拖放一直只挂在窗口外框上，而 Windows 是把
+> `WM_DROPFILES` 发给光标下的那个子窗口（体检窗口有 45 个），所以拖到内容区收不到。
+> 现在窗口完整构建，整个窗口树（外框 + 全部子控件）都注册拖放，新建控件每 2 秒补注册。
 >
+> G1.9：体检可中途终止 + 选目录只问一次 + 启动阶段显示（`LAUNCH: JVM/FORGE/MINECRAFT 秒`）。
 > G1.8：修 NeoForge 安装器执行失败（先补原版 `client.jar`）+ 诊断日志落盘。
 > G1.7：修「体检完了还在体检」——装完不再自动重弹，旧 jar 移出体检列表。
-> G1.6：体检联网并发 + **缺前置检测**（`[DEP!]` + 弹窗）+ `[ 补装缺失前置 ]`。
 
 ## 怎么用
 
