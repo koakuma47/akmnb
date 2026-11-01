@@ -1,7 +1,7 @@
 {
-  "version": "G1.14",
-  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.14/AKM_Launcher_vG1.14.zip",
-  "sha256": "1BA094A6727D8898DF8DA25D6376AC2A66ED5F18024CD32F56E36111EFF38CCC",
-  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.14",
-  "notes": "G1.14：修体检窗口进度条压住选项行"
+  "version": "G1.15",
+  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.15/AKM_Launcher_vG1.15.zip",
+  "sha256": "003AC5FA34D97AD58A51922E18D6ACD2400659895D6CEFAF8E1BF22A625D65FB",
+  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.15",
+  "notes": "G1.15：真实 76 模组跑通体检/更新 + 修多加载器与 JarJar 依赖误报"
 }
