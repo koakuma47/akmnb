@@ -79,7 +79,7 @@ except Exception:  # pragma: no cover - tkinter always ships with CPython on Win
 # ---------------------------------------------------------------------------
 
 APP_NAME = "AKM Launcher"
-APP_VERSION = "G1.6"
+APP_VERSION = "G1.7"
 
 # ---------------------------------------------------------------------------
 # Internationalisation (zh / en / ja / ru / ar)
@@ -3643,6 +3643,77 @@ def disable_file_drop(window):
         )
     except Exception:
         pass
+
+
+def _best_primary_file(row):
+    files = [
+        item
+        for item in (row.get("best_files") or [])
+        if isinstance(item, dict) and item.get("url")
+    ]
+    return next(
+        (item for item in files if item.get("primary")), files[0] if files else None
+    )
+
+
+def best_primary_name(row):
+    """The .jar filename the row would install (for "already installed" checks)."""
+    return str((_best_primary_file(row) or {}).get("filename") or "")
+
+
+def audit_upgrades(rows, target_dir, installed_files=None):
+    """Rows that still need a download: right loader, has a build, not installed yet.
+
+    ``installed_files`` holds normcased paths we just wrote in this session, so the
+    same build is never offered twice (that used to make 体检 → 安装 → 体检 loop).
+    """
+    done_files = installed_files or set()
+    out = []
+    for row in rows:
+        if not (
+            row.get("ok") is True
+            and row.get("loader_ok") is not False
+            and row.get("best_files")
+        ):
+            continue
+        if str(row.get("best") or "") == str(row.get("installed_version") or ""):
+            continue
+        name = best_primary_name(row)
+        if name and target_dir:
+            key = os.path.normcase(os.path.abspath(os.path.join(target_dir, name)))
+            if key in done_files:
+                continue
+        out.append(row)
+    return out
+
+
+def prune_audit_paths(paths, replaced_rows, installed):
+    """Rebuild the audit file list after an install.
+
+    Replaced jars leave the list even when they still exist on disk (installing into
+    another version folder keeps them, and auditing them again re-offers the same
+    upgrade forever).
+    """
+    replaced = {
+        os.path.normcase(os.path.abspath(str(row.get("path") or "")))
+        for row in replaced_rows or []
+        if row.get("path")
+    }
+    keep = []
+    seen = set()
+    for path in list(paths or []) + [
+        path for path in (installed or []) if path and os.path.isfile(path)
+    ]:
+        if not path:
+            continue
+        key = os.path.normcase(os.path.abspath(path))
+        if key in replaced or key in seen:
+            continue
+        if not os.path.isfile(path):
+            continue
+        seen.add(key)
+        keep.append(path)
+    return keep
 
 
 def install_mod_build(row, target_dir, timeout=120, progress=None, monitor=None):
@@ -24648,7 +24719,15 @@ class Win1App:
         listing.tag_configure("unknown", foreground="#555555")
         listing.tag_configure("note", foreground=C_TEAL)
         listing.configure(state="disabled")
-        state = {"paths": [], "rows": [], "gaps": [], "busy": False, "target_dir": ""}
+        state = {
+            "paths": [],
+            "rows": [],
+            "gaps": [],
+            "busy": False,
+            "target_dir": "",
+            "auto_prompt": True,
+            "installed_files": set(),
+        }
         only_ok = tk.BooleanVar(value=True)
         cf_var = tk.BooleanVar(value=True)
 
@@ -25089,15 +25168,11 @@ class Win1App:
             render()
             set_status("已清空 // 重新拖入 jar 或点 [ 扫描当前 mods ]")
         def upgradeable_rows():
-            return [
-                row
-                for row in state["rows"]
-                if row.get("ok") is True
-                and row.get("loader_ok") is not False
-                and row.get("best_files")
-                and str(row.get("best") or "")
-                != str(row.get("installed_version") or "")
-            ]
+            return audit_upgrades(
+                state["rows"],
+                current_target_dir(),
+                state.get("installed_files") or set(),
+            )
 
         def offer_install(upgrades, auto=False):
             if not upgrades or state["busy"]:
@@ -25205,13 +25280,15 @@ class Win1App:
                             done += 1
                         else:
                             failed.append(error or str(row.get("file")))
-                self.post(finish_install, done, failed, installed)
+                self.post(finish_install, list(upgrades), done, failed, installed)
 
-            def finish_install(done, failed, installed):
+            def finish_install(replaced, done, failed, installed):
                 state["busy"] = False
-                state["paths"] = [
-                    path for path in state["paths"] if os.path.isfile(path)
-                ] + [path for path in installed if os.path.isfile(path)]
+                done_files = state.setdefault("installed_files", set())
+                for path in installed:
+                    if path and os.path.isfile(path):
+                        done_files.add(os.path.normcase(os.path.abspath(path)))
+                state["paths"] = prune_audit_paths(state["paths"], replaced, installed)
                 message = "安装完成 // 成功 {0} / 失败 {1}".format(done, len(failed))
                 set_status(message + ("" if not failed else " // " + failed[0]))
                 self.say(
@@ -25223,7 +25300,8 @@ class Win1App:
                         message + "\n\n" + "\n".join(failed[:5]),
                         parent=win,
                     )
-                start()
+                # 装完刷新结果，但不要再自动弹「安装最新版本」
+                start(auto=False)
 
             threading.Thread(target=worker, daemon=True).start()
 
@@ -25331,7 +25409,7 @@ class Win1App:
                         parent=win,
                     )
                 if done:
-                    start()
+                    start(auto=False)
 
             def worker():
                 done = []
@@ -25481,12 +25559,13 @@ class Win1App:
             except Exception:
                 pass
 
-        def start():
+        def start(auto=True):
             if state["busy"]:
                 return
             if not state["paths"]:
                 set_status("先拖入 jar，或点 [ 扫描当前 mods ]")
                 return
+            state["auto_prompt"] = bool(auto)
             target = str(target_var.get() or "").strip()
             if not _mc_tuple(target):
                 set_status("目标版本看不懂：{0}（例：1.21 / 1.21.1）".format(target))
@@ -25593,6 +25672,15 @@ class Win1App:
                         )
                     )
                 if not upgrades and not ports:
+                    return
+                if not state.get("auto_prompt", True):
+                    # 装完自动刷新的那一轮不再弹「安装最新版本」，避免反复体检/反复安装
+                    set_status(
+                        "体检完成 // 命中 {0} / 共 {1} // 需要时点 [ 一键更新全部 ]".format(
+                            hits, len(state["rows"])
+                        )
+                        + (" // 缺前置 {0}".format(len(gaps)) if gaps else "")
+                    )
                     return
 
                 def after_target():

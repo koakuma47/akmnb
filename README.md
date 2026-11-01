@@ -1,4 +1,4 @@
-# AKM Launcher (Adaptive Kinetic Minecraft) G1.6
+# AKM Launcher (Adaptive Kinetic Minecraft) G1.7
 
 **免费开源：不收费、无内购、无付费版 —— 任何向你收费的都是盗卖。**
 
@@ -11,24 +11,23 @@
 
 ## 下载
 
-**最新正式版：G1.6**
+**最新正式版：G1.7**
 
-- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vG1.6/AKM_Launcher_vG1.6.zip>
-- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vG1.6>
+- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vG1.7/AKM_Launcher_vG1.7.zip>
+- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vG1.7>
 
 单文件免安装，解压后双击 `AKM_Launcher.exe` 就能用，不需要装 Python。
 下载后想核对完整性，可以和发布页里 `SHA256.txt` 的值比对一下。
 
-> **G1.6 更新：模组体检快了一倍多，而且会告诉你缺了哪个前置。**
-> 6 个 Modrinth 批量查询改成并发，4 个模组的完整体检 2.53 秒；体检会读每个 jar
-> 声明的依赖，跟 mods 里实际有的 modid 对一遍，缺的标成紫色 `[DEP!]` 并弹窗列出
-> 「缺什么、被谁需要」（`fabric-*` 会归并成 `fabric-api`），窗口里新增
-> `[ 补装缺失前置 ]` 一键从 Modrinth 补齐，装完自动复检 —— 不用再等进游戏崩了才发现。
-> 更新模组时状态栏和「下载详情」窗口也会显示每个文件的百分比和速度。
+> **G1.7 修复：装完模组后「体检 → 选目录 → 安装」无限重复。**
+> 原因是装完会自动重新体检、又重新弹「安装最新版本」；装到别的版本目录时旧 jar 还在，
+> 于是又被判成可升级，永远停不下来。现在装完只刷新一次结果不再自动弹窗，被替换的旧
+> jar 会从体检列表移除，刚装好的构建也不会第二次报「可升级」。
 >
+> G1.6：体检联网阶段改成并发（4 个模组 2.53 秒），新增**缺前置检测**（`[DEP!]` 行 +
+> 弹窗告诉你缺什么、被谁需要）和 `[ 补装缺失前置 ]` 一键补装；更新模组时显示单文件进度。
 > G1.5：启动预热（点火 0.84s → 0.09s）+ 启动加速 JVM 参数 + 装完自动收起下载详情窗口。
 > G1.4：修「点火但游戏起不来」（Forge 补丁产物缺失自动重装）与「终止启动后按钮卡死」。
-> G1.3：大文件多连接分段下载，client.jar 提速 3 倍。
 
 ## 怎么用
 
