@@ -1,7 +1,7 @@
 {
-  "version": "G1.7",
-  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.7/AKM_Launcher_vG1.7.zip",
-  "sha256": "F8CD7BCA50DA28D384A34DD177B297E5795298402C13A2B4FC3EA8EF53ED4C3C",
-  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.7",
-  "notes": "G1.7：修「体检完了还在体检」——装完不再自动重弹，旧 jar 移出体检列表"
+  "version": "G1.8",
+  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.8/AKM_Launcher_vG1.8.zip",
+  "sha256": "E2B2F46821C80277DD6514AEFAFC7F6F385B5C12C8034492262DA2BC0459C54F",
+  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.8",
+  "notes": "G1.8：修 NeoForge 安装器执行失败（先补原版 client.jar）+ 诊断日志落盘"
 }
