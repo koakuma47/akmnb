@@ -1,7 +1,7 @@
 {
-  "version": "G1.13",
-  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.13/AKM_Launcher_vG1.13.zip",
-  "sha256": "35396894ED947C41A35D892E1185FEC93884249053E397B6C9638F0C917DF4E3",
-  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.13",
-  "notes": "G1.13：模组更新进度条 + 多连接分片下载（快约 1.5 倍）"
+  "version": "G1.14",
+  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.14/AKM_Launcher_vG1.14.zip",
+  "sha256": "1BA094A6727D8898DF8DA25D6376AC2A66ED5F18024CD32F56E36111EFF38CCC",
+  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.14",
+  "notes": "G1.14：修体检窗口进度条压住选项行"
 }
