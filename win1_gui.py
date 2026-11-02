@@ -80,7 +80,7 @@ except Exception:  # pragma: no cover - tkinter always ships with CPython on Win
 # ---------------------------------------------------------------------------
 
 APP_NAME = "AKM Launcher"
-APP_VERSION = "G1.17.1"
+APP_VERSION = "G1.18"
 
 # ---------------------------------------------------------------------------
 # Internationalisation (zh / en / ja / ru / ar)
@@ -3427,6 +3427,7 @@ def dependency_gaps(rows, target_loader="", present_ids=None):
     family = loader_family(target_loader)
     fabric_api_ok = any(name in present for name in FABRIC_API_IDS)
     gaps = {}
+    bridge_loader = str(target_loader or "").strip().lower()
     for row in rows:
         if family:
             row_loaders = [
@@ -3435,7 +3436,46 @@ def dependency_gaps(rows, target_loader="", present_ids=None):
                 if str(name or "").strip()
             ]
             if row_loaders and not any(name in family for name in row_loaders):
-                # 这个 jar 不是目标加载器能用的，它的依赖不影响游戏
+                # 目标加载器跑不了这个 jar —— Forge / NeoForge 上还能靠
+                # Sinytra Connector（信雅互联）桥接 Fabric 模组
+                if (
+                    bridge_loader in BRIDGE_LOADERS
+                    and any(name in ("fabric", "quilt") for name in row_loaders)
+                    and BRIDGE_CONNECTOR not in present
+                ):
+                    title = str(row.get("title") or row.get("file") or "").strip()
+                    entry = gaps.setdefault(
+                        BRIDGE_CONNECTOR,
+                        {
+                            "id": BRIDGE_CONNECTOR,
+                            "required_by": [],
+                            "fabric_api": False,
+                            "bridge": True,
+                            "label": BRIDGE_LABELS[BRIDGE_CONNECTOR],
+                        },
+                    )
+                    if title and title not in entry["required_by"]:
+                        entry["required_by"].append(title)
+                    needs_api = any(
+                        str(dep or "").strip().lower().startswith(
+                            FABRIC_API_MODULE_PREFIX
+                        )
+                        or str(dep or "").strip().lower() in FABRIC_API_IDS
+                        for dep in row.get("requires") or []
+                    )
+                    if needs_api and not fabric_api_ok:
+                        api_entry = gaps.setdefault(
+                            "fabric-api",
+                            {
+                                "id": "fabric-api",
+                                "required_by": [],
+                                "fabric_api": True,
+                                "bridge": True,
+                                "label": BRIDGE_LABELS[BRIDGE_FABRIC_API],
+                            },
+                        )
+                        if title and title not in api_entry["required_by"]:
+                            api_entry["required_by"].append(title)
                 continue
         title = str(row.get("title") or row.get("file") or "").strip()
         for dep in row.get("requires") or []:
@@ -4066,20 +4106,61 @@ def install_mod_build(row, target_dir, timeout=120, progress=None, monitor=None)
     return destination
 
 
-def install_missing_dependency(gap, mc_version, loader, target_dir, timeout=180, progress=None):
-    """把缺失的前置模组从 Modrinth 补装进目标 mods 目录。
+BRIDGE_LOADERS = ("forge", "neoforge")
+BRIDGE_CONNECTOR = "connector"
+BRIDGE_FABRIC_API = "forgified-fabric-api"
+BRIDGE_LABELS = {
+    BRIDGE_CONNECTOR: "Sinytra Connector（信雅互联）",
+    BRIDGE_FABRIC_API: "Forgified Fabric API",
+}
 
-    ``gap`` 来自 :func:`dependency_gaps`；返回装好的文件路径。
+
+def bridge_projects_for(mod_id, loader):
+    """Fabric 依赖在 Forge / NeoForge 上要装哪些 Modrinth 项目。
+
+    Forge 家族没有 Fabric API，跑 Fabric 模组必须靠
+    Sinytra Connector（信雅互联）+ Forgified Fabric API；
+    返回 [] 表示不是桥接场景，按原 id 装即可。
     """
-    mod_id = str(gap.get("id") or "").strip()
-    if not mod_id:
-        raise LauncherError("前置 id 为空")
-    project = modrinth_project_lookup(mod_id)
-    slug = str(project.get("slug") or mod_id)
+    loader = str(loader or "").strip().lower()
+    if loader not in BRIDGE_LOADERS:
+        return []
+    key = str(mod_id or "").strip().lower()
+    if not key:
+        return []
+    if key in ("connector", "sinytra-connector", "sinytra_connector", "sinytra"):
+        return [BRIDGE_CONNECTOR]
+    if key == "fabric" or key in FABRIC_API_IDS or key.startswith(
+        FABRIC_API_MODULE_PREFIX
+    ):
+        return [BRIDGE_CONNECTOR, BRIDGE_FABRIC_API]
+    return []
+
+
+def install_modrinth_project(
+    project_id,
+    mc_version,
+    loader,
+    target_dir,
+    timeout=180,
+    progress=None,
+    strict_loader=False,
+):
+    """按「目标 MC + 加载器」把 Modrinth 上某个项目的最新合适构建装进 target_dir。
+
+    ``strict_loader`` 为真时不会退回别的加载器（桥接件必须严格对应
+    forge / neoforge，否则会把 NeoForge 的 jar 塞进 Forge 实例）。
+    """
+    project_id = str(project_id or "").strip()
+    if not project_id:
+        raise LauncherError("项目 id 为空")
+    project = modrinth_project_lookup(project_id)
+    slug = str(project.get("slug") or project_id)
     title = str(project.get("title") or slug)
     loaders = [loader] if str(loader or "").strip() else []
+    attempts = loaders if strict_loader else loaders + ["fabric", "forge", "neoforge", "quilt"]
     versions = []
-    for attempt_loader in (loaders + ["fabric", "forge", "neoforge", "quilt"]):
+    for attempt_loader in attempts:
         try:
             versions = modrinth_versions(slug, mc_version, attempt_loader)
         except Exception:
@@ -4088,7 +4169,9 @@ def install_missing_dependency(gap, mc_version, loader, target_dir, timeout=180,
             break
     if not versions:
         raise LauncherError(
-            "{0} 在 Modrinth 上没有 {1}/{2} 的版本".format(title, mc_version, loader or "?")
+            "{0} 在 Modrinth 上没有 {1}/{2} 的版本".format(
+                title, mc_version, loader or "?"
+            )
         )
     version = pick_version(versions)
     files = [
@@ -4101,7 +4184,9 @@ def install_missing_dependency(gap, mc_version, loader, target_dir, timeout=180,
     if not files:
         raise LauncherError("{0} 的该版本没有 .jar".format(title))
     primary = next((item for item in files if item.get("primary")), files[0])
-    filename = sanitize_filename(str(primary.get("filename") or (slug + ".jar")))
+    filename = sanitize_filename(
+        str(primary.get("filename") or (slug + ".jar"))
+    )
     ensure_dir(target_dir)
     destination = os.path.join(target_dir, filename)
 
@@ -4122,6 +4207,46 @@ def install_missing_dependency(gap, mc_version, loader, target_dir, timeout=180,
         label=filename,
     )
     return destination
+
+
+def install_missing_dependency(
+    gap, mc_version, loader, target_dir, timeout=180, progress=None
+):
+    """把缺失的前置从 Modrinth 补装进目标 mods 目录，返回装好的文件路径列表。
+
+    Forge / NeoForge 上缺的是 Fabric 依赖时会自动换成桥接组合：
+    Sinytra Connector（信雅互联）+ Forgified Fabric API。
+    """
+    mod_id = str(gap.get("id") or "").strip()
+    if not mod_id:
+        raise LauncherError("前置 id 为空")
+    targets = bridge_projects_for(mod_id, loader) or [mod_id]
+    strict = bool(bridge_projects_for(mod_id, loader))
+    installed = []
+    errors = []
+    for project in targets:
+        try:
+            installed.append(
+                install_modrinth_project(
+                    project,
+                    mc_version,
+                    loader,
+                    target_dir,
+                    timeout,
+                    progress,
+                    strict_loader=strict,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors.append("{0}: {1}".format(project, exc))
+            if project == BRIDGE_CONNECTOR:
+                # 没有 Connector 就谈不上跑 Fabric 模组
+                break
+    if not installed:
+        raise LauncherError("；".join(errors) or "下载失败")
+    if errors:
+        log_debug("dependency install partial: " + "；".join(errors))
+    return installed
 
 
 # ---------------------------------------------------------------------------
@@ -26864,8 +26989,9 @@ class Win1App:
             loader = loader_var.get() or self.mod_loader or "fabric"
             mods_dir = current_target_dir()
             preview = "\n".join(
-                "  · {0}{1}".format(
-                    gap["id"],
+                "  · {0}{1}{2}".format(
+                    gap.get("label") or gap["id"],
+                    "（桥接）" if gap.get("bridge") else "",
                     "（被 {0} 需要）".format(
                         "、".join(gap.get("required_by", [])[:3])
                     )
@@ -26911,12 +27037,12 @@ class Win1App:
 
             def one(gap):
                 try:
-                    path = install_missing_dependency(
+                    paths = install_missing_dependency(
                         gap, target_mc, loader, mods_dir, progress=progress_cb
                     )
-                    return path, ""
+                    return list(paths or []), ""
                 except Exception as exc:  # noqa: BLE001
-                    return None, "{0}: {1}".format(gap["id"], str(exc)[:90])
+                    return [], "{0}: {1}".format(gap["id"], str(exc)[:90])
 
             def finish_gaps(done, failed, done_ids):
                 state["busy"] = False
@@ -26971,11 +27097,11 @@ class Win1App:
                             ),
                         )
                         try:
-                            path, error = future.result()
+                            paths, error = future.result()
                         except Exception as exc:  # noqa: BLE001
-                            path, error = None, str(exc)[:90]
-                        if path:
-                            done.append(path)
+                            paths, error = [], str(exc)[:90]
+                        if paths:
+                            done.extend(paths)
                             done_ids.add(str(gap.get("id") or "").lower())
                         else:
                             failed.append(error or gap["id"])
@@ -27211,7 +27337,7 @@ class Win1App:
                         if cancel.is_set():
                             break
                         try:
-                            path = install_missing_dependency(
+                            paths = install_missing_dependency(
                                 {
                                     "id": gap["id"],
                                     "required_by": gap.get("required_by") or [],
@@ -27220,7 +27346,7 @@ class Win1App:
                                 loader,
                                 mods_dir,
                             )
-                            record["installed"].append(path)
+                            record["installed"].extend(paths or [])
                         except Exception as exc:  # noqa: BLE001
                             record["failed"].append(
                                 "{0}: {1}".format(gap["id"], str(exc)[:70])

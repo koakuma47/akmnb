@@ -1,4 +1,4 @@
-# AKM Launcher (Adaptive Kinetic Minecraft) G1.17.1
+# AKM Launcher (Adaptive Kinetic Minecraft) G1.18
 
 **免费开源：不收费、无内购、无付费版 —— 任何向你收费的都是盗卖。**
 
@@ -11,21 +11,21 @@
 
 ## 下载
 
-**最新正式版：G1.17.1**
+**最新正式版：G1.18**
 
-- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vG1.17.1/AKM_Launcher_vG1.17.1.zip>
-- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vG1.17.1>
+- 直接下载：<https://github.com/koakuma47/akmnb/releases/download/vG1.18/AKM_Launcher_vG1.18.zip>
+- 发布页（历史版本 + SHA256 校验文件）：<https://github.com/koakuma47/akmnb/releases/tag/vG1.18>
 
 单文件免安装，解压后双击 `AKM_Launcher.exe` 就能用，不需要装 Python。
 下载后想核对完整性，可以和发布页里 `SHA256.txt` 的值比对一下。
 
-> **G1.17.1：修「体检装完没自动试跑、反而提示没有游戏」。**
-> 原因是挑试跑版本时要求「体检目标 MC + 加载器」和已装版本完全一致 ——
-> 体检 1.21.1/NeoForge、实装 1.20.1/Forge 就一个都匹配不上，直接报「没有游戏」，
-> 试跑没跑起来自然也就解析不到缺哪些模组。现在改成「当前选中的版本优先，
-> 否则按同 MC + 同加载器 / 同 MC / 同加载器 / 任意 打分挑」，并在提示里给出
-> 游戏目录与已装版本列表；试跑失败时弹窗直接附日志关键行。
+> **G1.18：Forge / NeoForge 上跑 Fabric 模组，自动补装「信雅互联」。**
+> Modrinth 的 `fabric-api` 只有 fabric 构建，以前按 forge/neoforge 去查必然查不到，
+> 于是什么都不装、Fabric 模组全废。现在缺 fabric-api 时自动换成
+> **Sinytra Connector（信雅互联）+ Forgified Fabric API**，先装 Connector 再装 API、都过 SHA1；
+> 体检遇到 fabric/quilt 专用 jar 也不再默默跳过，会报 `connector` 桥接缺口并在补装框里写明。
 >
+> G1.17.1：修「体检装完没自动试跑、反而提示没有游戏」（试跑版本挑选放宽 + 日志关键行）。
 > G1.17：体检装完自动试跑，进主菜单算过；缺前置自动从 Modrinth 补装并复跑（最多两轮）。
 > G1.16：新增「快速启动专用线路」，点火准备压到 0.81 秒；闪退会说人话（坏 jar / Java 版本 / 内存）。
 > G1.15：用 76 个真实 1.20 Forge 模组（355 MB）跑通了「装 1.21.1 NeoForge → 体检 → 更新」全链路。
