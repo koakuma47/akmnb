@@ -80,7 +80,7 @@ except Exception:  # pragma: no cover - tkinter always ships with CPython on Win
 # ---------------------------------------------------------------------------
 
 APP_NAME = "AKM Launcher"
-APP_VERSION = "G1.15"
+APP_VERSION = "G1.16"
 
 # ---------------------------------------------------------------------------
 # Internationalisation (zh / en / ja / ru / ar)
@@ -1366,6 +1366,8 @@ DEFAULT_CONFIG = {
     "download_source": "mirror",
     "download_detail": True,
     "jvm_fast_start": True,
+    "fast_launch": True,
+    "fast_launch_cds": False,
     "language": "zh",
     "theme": dict(DEFAULT_THEME),
     "ui_style": "vector",
@@ -11724,6 +11726,7 @@ class Win1App:
         self.mc_dir = resolve_path(self.config.get("minecraft_dir"))
         self.mods_dir = os.path.join(self.mc_dir, "mods")
         ensure_dir(self.mods_dir)
+        self._load_java_version_cache()
 
         self.current_hits = []
         self._search_state = {}
@@ -12166,10 +12169,19 @@ class Win1App:
             self._set_launch_state(
                 "LAUNCH: CRASH {0}".format(code), "error"
             )
+            hint = self._quick_crash_hint()
+            if hint:
+                self._suspect_bad_jars = "坏 jar" in hint
+                self.say(hint)
+                self._append_launch_perf(
+                    "crash hint // " + hint.replace("\n", " ")
+                )
             messagebox.showwarning(
                 "游戏异常退出",
-                "Minecraft 退出码: {0}\n\n日志:\n{1}".format(
-                    code, self._last_launch_log or "(未生成日志)"
+                "Minecraft 退出码: {0}\n\n{1}日志:\n{2}".format(
+                    code,
+                    hint + "\n\n" if hint else "",
+                    self._last_launch_log or "(未生成日志)",
                 ),
                 parent=self.root,
             )
@@ -12187,6 +12199,67 @@ class Win1App:
             )
         else:
             self.say("游戏进程结束 exit={0}".format(code))
+
+    def _quick_crash_hint(self):
+        """闪退时从日志尾巴里挑出最常见的原因（坏 jar / Java 版本不符 / 内存不足）。"""
+        path = str(getattr(self, "_last_launch_log", "") or "")
+        if not path or not os.path.isfile(path):
+            return ""
+        try:
+            size = os.path.getsize(path)
+            with open(path, "rb") as handle:
+                handle.seek(max(0, size - 200000))
+                text = handle.read().decode("utf-8", "replace")
+        except OSError:
+            return ""
+        if "zip END header not found" in text or "zip file is empty" in text:
+            jars = self._bad_zip_jars()
+            if jars:
+                return (
+                    "疑似坏 jar（下载中断 / 只下到一半）：{0}\n"
+                    "换成完整文件后即可正常启动。".format("、".join(jars[:4]))
+                )
+            return "疑似坏 jar：模组或库文件不完整（下载中断），建议重新下载对应 jar。"
+        if "UnsupportedClassVersionError" in text:
+            match = re.search(r"class file version (\d+)", text)
+            return (
+                "Java 版本不匹配：日志出现 UnsupportedClassVersionError{0}，"
+                "请在设置里改用更高版本的 Java。".format(
+                    "（class file version {0}）".format(match.group(1)) if match else ""
+                )
+            )
+        if "OutOfMemoryError" in text:
+            return "内存不足：日志出现 OutOfMemoryError，请把 -Xmx 调大后再点火。"
+        return ""
+
+    def _bad_zip_jars(self, dirs=None):
+        """找出 mods 目录里打不开的 jar（只读中央目录，几十个 jar 也就几毫秒）。"""
+        import zipfile
+
+        roots = list(dirs or [])
+        if not roots:
+            roots = [self.effective_mods_dir(), self.mods_dir]
+        bad = []
+        seen = set()
+        for root in roots:
+            if not root or root in seen:
+                continue
+            seen.add(root)
+            try:
+                names = os.listdir(root)
+            except OSError:
+                continue
+            for name in names:
+                if not name.lower().endswith(".jar"):
+                    continue
+                try:
+                    with zipfile.ZipFile(os.path.join(root, name)) as archive:
+                        archive.infolist()
+                except Exception:
+                    bad.append(name)
+                    if len(bad) >= 4:
+                        return bad
+        return bad
 
     def _poll_ui(self):
         if getattr(self, "_closing", False):
@@ -19834,6 +19907,14 @@ class Win1App:
         expires_at = float(self.auth.get("expires_at") or 0)
         if expires_at and time.time() < expires_at - 120:
             return
+        if (
+            self._fast_launch_enabled()
+            and expires_at
+            and time.time() < expires_at - 30
+        ):
+            # 快速启动线路：还剩半分钟以上的令牌不主动刷新，避免启动被网络拖住
+            self.say("快速启动线路 // 令牌仍在有效期，跳过刷新（不联网）")
+            return
         if not (
             str(self.auth.get("refresh_token") or "").strip()
             or str(self.auth.get("ms_refresh_token") or "").strip()
@@ -19843,7 +19924,10 @@ class Win1App:
                     "Minecraft Access Token 已过期，请重新使用令牌式登录。"
                 )
             return
-        self.say("正版令牌临近过期，点火前自动刷新 ...")
+        if self._fast_launch_enabled():
+            self.say("快速启动线路 // 令牌已过期，联网刷新中（网络慢时会多等一会儿）")
+        else:
+            self.say("正版令牌临近过期，点火前自动刷新 ...")
         self._refresh_core()
 
 
@@ -22888,12 +22972,16 @@ class Win1App:
             raise OperationCancelled("启动已终止")
 
     def _ignite_worker(self):
+        self._perf_t0 = time.time()
+        self._perf_last = self._perf_t0
+        self._perf_stages = []
         try:
             self._check_launch_cancel()
             self.post(self._set_launch_state, "LAUNCH: AUTH", "active")
             if self.is_ms_mode:
                 self._ensure_fresh_token()
             profile = self._current_profile()
+            self._mark_launch_stage("授权")
             try:
                 import minecraft_launcher_lib as mll
             except Exception:
@@ -22914,6 +23002,7 @@ class Win1App:
                 return
             self._check_launch_cancel()
             version_id = self._ensure_game_files(mll)
+            self._mark_launch_stage("核心校验")
             self._check_launch_cancel()
             self._start_game_process(mll, version_id, profile)
         except OperationCancelled:
@@ -23303,7 +23392,245 @@ class Win1App:
             "no",
         )
 
-    def _memory_jvm_arguments(self, memory=None):
+    def _fast_launch_enabled(self):
+        """快速启动专用线路：跳过启动前的文件校验 / 网络刷新，直连拉起。"""
+        return str(self.config.get("fast_launch", True)).lower() not in (
+            "0",
+            "false",
+            "no",
+        )
+
+    def _load_java_version_cache(self):
+        """把上次探测到的 Java 版本号读回来，免得每次启动都再跑一遍 java -version。"""
+        cached = self.config.get("java_versions")
+        if not isinstance(cached, dict):
+            return
+        for path, entry in cached.items():
+            try:
+                key = str(path)
+                if key in _JAVA_MAJOR_CACHE:
+                    continue
+                if not os.path.isfile(key):
+                    continue
+                info = entry if isinstance(entry, dict) else {"major": int(entry)}
+                size = int(info.get("size") or 0)
+                if size and size != os.path.getsize(key):
+                    continue
+                _JAVA_MAJOR_CACHE[key] = int(info.get("major") or 0)
+            except Exception:
+                continue
+
+    def _save_java_version_cache(self):
+        try:
+            data = {}
+            for path, major in list(_JAVA_MAJOR_CACHE.items())[:24]:
+                if not os.path.isfile(path):
+                    continue
+                try:
+                    data[path] = {"major": int(major), "size": os.path.getsize(path)}
+                except OSError:
+                    continue
+            if self.config.get("java_versions") != data:
+                self.config["java_versions"] = data
+                self._save_config()
+        except Exception:
+            pass
+
+    def _cds_enabled(self):
+        """AppCDS 类数据共享：第二次起大量类直接从归档映射，跳过解析。"""
+        return str(self.config.get("fast_launch_cds", False)).lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+
+    def _cds_blocked(self):
+        """Java 17/21 的动态归档在 classpath 含空格时会直接终止 JVM，必须提前拦住。"""
+        path = str(getattr(self, "mc_dir", "") or "")
+        if " " in path:
+            return "游戏目录路径包含空格（{0}），Java 的 CDS 归档不支持".format(path)
+        return ""
+
+    def _mods_fingerprint(self):
+        """mods 目录的轻量指纹（数量 + 最新修改时间），模组一变就换归档名。"""
+        try:
+            mods_dir = os.path.join(self.ensure_isolation_dirs(), "mods")
+        except Exception:
+            mods_dir = os.path.join(self.mc_dir, "mods")
+        count = 0
+        newest = 0
+        try:
+            with os.scandir(mods_dir) as entries:
+                for entry in entries:
+                    if not entry.name.lower().endswith(".jar"):
+                        continue
+                    count += 1
+                    try:
+                        newest = max(newest, int(entry.stat().st_mtime))
+                    except OSError:
+                        continue
+        except OSError:
+            return "0"
+        return "{0}x{1}".format(count, newest)
+
+    def _cds_jvm_arguments(self, java_path=""):
+        """AppCDS：先按 Java 生成 base 归档，再在 base 上动态归档游戏类。
+
+        Java 17 要求动态归档挂在 base 归档上（Mojang 运行时不自带 base），
+        所以第一次先在后台跑 ``java -Xshare:dump`` 造一个 12 MB 左右的 base，
+        之后每次点火：没有 app 归档 -> 生成（正常退出时写入），有 -> 直接映射。
+        """
+        if not self._cds_enabled():
+            return []
+        blocked = self._cds_blocked()
+        if blocked:
+            if not getattr(self, "_cds_blocked_logged", False):
+                self._cds_blocked_logged = True
+                log_debug("cds skipped // " + blocked)
+                self.say("AppCDS 已自动跳过: {0}".format(blocked))
+            return []
+        base_dir = os.path.join(self.mc_dir, "akm-cds")
+        try:
+            ensure_dir(base_dir)
+        except Exception:
+            return []
+        java_key = ""
+        if java_path:
+            try:
+                java_key = "{0}-{1}".format(
+                    os.path.basename(os.path.dirname(os.path.dirname(java_path))),
+                    os.path.getsize(java_path),
+                )
+            except OSError:
+                java_key = os.path.basename(java_path)
+        java_key = re.sub(r"[^A-Za-z0-9._-]+", "_", java_key)[:40] or "default"
+        base = os.path.join(base_dir, "base-{0}.jsa".format(java_key))
+        version_id = str(self.config.get("launch_version") or "").strip() or "default"
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", version_id)[:48] or "default"
+        archive = os.path.join(
+            base_dir, "app-{0}-{1}.jsa".format(safe, self._mods_fingerprint())
+        )
+        if not os.path.isfile(base):
+            # base 归档还没有：后台造，别让点火等它
+            self._schedule_cds_base_dump(base, java_path)
+            return []
+        if os.path.isfile(archive):
+            self._prune_cds_archives(base_dir, "app-" + safe, keep=archive)
+            return [
+                "-XX:SharedArchiveFile=" + archive,
+                "-Xshare:auto",
+                "-Xlog:cds=warning",
+            ]
+        self._prune_cds_archives(base_dir, "app-" + safe, keep="")
+        return [
+            "-XX:SharedArchiveFile=" + base,
+            "-XX:ArchiveClassesAtExit=" + archive,
+            "-Xshare:auto",
+            "-Xlog:cds=warning",
+        ]
+
+    def _schedule_cds_base_dump(self, base, java_path):
+        """后台执行 ``java -Xshare:dump``（一次性，约 2-4 秒）。"""
+        java = str(java_path or "").strip()
+        if not java or not os.path.isfile(java):
+            return
+        if getattr(self, "_cds_dump_running", False):
+            return
+        self._cds_dump_running = True
+
+        def run():
+            try:
+                os.makedirs(os.path.dirname(base), exist_ok=True)
+                flags = 0x08000000 if os.name == "nt" else 0
+                subprocess.run(
+                    [java, "-Xshare:dump", "-XX:SharedArchiveFile=" + base],
+                    capture_output=True,
+                    timeout=180,
+                    creationflags=flags,
+                )
+                if os.path.isfile(base):
+                    log_debug("cds base ready // {0}".format(base))
+                else:
+                    log_debug("cds base dump produced nothing // " + java)
+            except Exception:
+                log_debug("cds base dump failed:\n" + traceback.format_exc())
+            finally:
+                self._cds_dump_running = False
+                self._launch_prewarm = None
+                self.post(self._schedule_launch_prewarm, 400)
+
+        threading.Thread(target=run, name="akm-cds-base", daemon=True).start()
+
+    def _prune_cds_archives(self, base, safe, keep=""):
+        """同一版本最多留 2 个归档，避免模组反复变动把磁盘塞满。"""
+        try:
+            names = [
+                item
+                for item in os.listdir(base)
+                if item.startswith(safe + "-") and item.endswith(".jsa")
+            ]
+        except OSError:
+            return
+        if keep:
+            names = [item for item in names if os.path.join(base, item) != keep]
+        names.sort(
+            key=lambda item: os.path.getmtime(os.path.join(base, item)), reverse=True
+        )
+        for stale in names[1:]:
+            try:
+                os.remove(os.path.join(base, stale))
+            except OSError:
+                pass
+
+    def _append_launch_perf(self, text):
+        """启动耗时档案：慢在哪一段将来一眼能看出来。"""
+        try:
+            ensure_dir(LOG_DIR)
+            path = os.path.join(LOG_DIR, "launch-perf.log")
+            with open(path, "a", encoding="utf-8", errors="replace") as handle:
+                handle.write(
+                    "[{0}] {1}\n".format(time.strftime("%Y-%m-%d %H:%M:%S"), text)
+                )
+        except Exception:
+            pass
+
+    def _mark_launch_stage(self, name):
+        """记录点火阶段耗时；单段超过 5 秒就单独留痕。"""
+        now = time.time()
+        last = getattr(self, "_perf_last", None) or now
+        self._perf_last = now
+        stages = getattr(self, "_perf_stages", None)
+        if stages is None:
+            stages = []
+            self._perf_stages = stages
+        delta = max(0.0, now - last)
+        stages.append((name, delta))
+        total = now - (getattr(self, "_perf_t0", None) or now)
+        log_debug("[PERF] {0} +{1:.2f}s (total {2:.2f}s)".format(name, delta, total))
+        if delta >= 5.0:
+            self._append_launch_perf(
+                "slow stage {0}: {1:.1f}s // {2}".format(
+                    name, delta, self.config.get("launch_version") or "-"
+                )
+            )
+        return delta
+
+    def _launch_perf_summary(self):
+        stages = list(getattr(self, "_perf_stages", None) or [])
+        if not stages:
+            return ""
+        total = sum(delta for _name, delta in stages)
+        slow = sorted(stages, key=lambda item: item[1], reverse=True)[:2]
+        detail = " / ".join(
+            "{0} {1:.2f}s".format(name, delta) for name, delta in slow if delta >= 0.05
+        )
+        text = "启动准备 {0:.2f}s".format(total)
+        if detail:
+            text += "（{0}）".format(detail)
+        return text
+
+    def _memory_jvm_arguments(self, memory=None, java_path=""):
         """-Xms/-Xmx for the launch command (clamped to the real RAM)."""
         if memory is None:
             memory = normalize_memory_config(
@@ -23319,7 +23646,7 @@ class Win1App:
         return [
             "-Xms{0}M".format(min_mb),
             "-Xmx{0}M".format(max_mb),
-        ] + flags + self._extra_jvm_arguments()
+        ] + flags + self._cds_jvm_arguments(java_path) + self._extra_jvm_arguments()
 
     # -- 启动预热：点火的准备工作提前在后台算好 ------------------------------
 
@@ -23392,7 +23719,6 @@ class Win1App:
             memory = normalize_memory_config(
                 self.config.get("memory"), total_ram_mb()
             )
-            jvm_arguments = self._memory_jvm_arguments(memory)
             java_component, java_required = self._version_java_requirement(version_id)
             java_path = str(self.config.get("java") or "").strip()
             java_executable = find_java_executable(
@@ -23400,6 +23726,7 @@ class Win1App:
             )
             if not java_executable:
                 return
+            jvm_arguments = self._memory_jvm_arguments(memory, java_executable)
             options = {
                 "username": profile["name"],
                 "uuid": profile["uuid"],
@@ -23421,6 +23748,9 @@ class Win1App:
                     version_id, options, java_executable, profile
                 ),
                 "command": list(command),
+                "java": java_executable,
+                "java_required": int(java_required or 0),
+                "java_major": int(java_major_version(java_executable) or 0),
             }
             log_debug(
                 "launch prewarm ready // {0} // {1} args".format(
@@ -23470,6 +23800,14 @@ class Win1App:
         return paths
 
     def _start_game_process(self, mll, version_id, profile):
+        fast_lane = self._fast_launch_enabled()
+        now = time.time()
+        if not getattr(self, "_perf_t0", None) or now - self._perf_t0 > 600:
+            self._perf_t0 = now
+            self._perf_stages = []
+        elif getattr(self, "_perf_stages", None) is None:
+            self._perf_stages = []
+        self._perf_last = now
         window = self.config.get("window") or {}
         try:
             width = str(int(window.get("width") or 854))
@@ -23479,16 +23817,31 @@ class Win1App:
         memory = normalize_memory_config(
             self.config.get("memory"), total_ram_mb()
         )
-        jvm_arguments = self._memory_jvm_arguments(memory)
         extra_args = self._extra_jvm_arguments()
         self._running_version_id = str(version_id or "")
-        self.say(
-            "内存分配: -Xms{0}M / -Xmx{1}M{2}".format(
-                memory["min_mb"],
-                memory["max_mb"],
-                " // 自定义参数 {0} 项".format(len(extra_args)) if extra_args else "",
-            )
+
+        java_component, java_required = self._version_java_requirement(version_id)
+        java_path = str(self.config.get("java") or "").strip()
+        warm_cache = getattr(self, "_launch_prewarm", None) or {}
+        warm_java = str(warm_cache.get("java") or "")
+        reuse_warm_java = bool(
+            fast_lane
+            and warm_java
+            and not java_path
+            and os.path.isfile(warm_java)
+            and int(warm_cache.get("java_required") or 0) == int(java_required or 0)
         )
+        if reuse_warm_java:
+            java_executable = warm_java
+        else:
+            java_executable = find_java_executable(
+                self.mc_dir, java_path, 0 if java_path else java_required
+            )
+        java_actual = (
+            java_major_version(java_executable) if java_executable else 0
+        )
+        self._mark_launch_stage("Java 探测")
+        self.post(self._save_java_version_cache)
 
         game_directory = self.ensure_isolation_dirs()
         if os.path.normcase(os.path.abspath(game_directory)) != os.path.normcase(
@@ -23497,6 +23850,29 @@ class Win1App:
             self.say(
                 "版本隔离: 游戏目录 -> {0}".format(game_directory)
             )
+        self._mark_launch_stage("版本隔离目录")
+
+        jvm_arguments = self._memory_jvm_arguments(memory, java_executable)
+        self.say(
+            "内存分配: {0} / {1}{2}".format(
+                jvm_arguments[0] if jvm_arguments else "-Xms?",
+                jvm_arguments[1] if len(jvm_arguments) > 1 else "-Xmx?",
+                " // 自定义参数 {0} 项".format(len(extra_args)) if extra_args else "",
+            )
+        )
+        cds_shared = any(
+            str(item).startswith("-XX:SharedArchiveFile=") for item in jvm_arguments
+        )
+        cds_dump = any(
+            str(item).startswith("-XX:ArchiveClassesAtExit=") for item in jvm_arguments
+        )
+        if cds_shared and cds_dump:
+            self.say("快速启动线路 // 本次退出后生成 AppCDS 归档（下次点火更快）")
+        elif cds_shared:
+            self.say("快速启动线路 // AppCDS 类归档已挂载")
+        elif self._cds_enabled():
+            self.say("快速启动线路 // 后台正在生成 AppCDS base 归档，本次先不加参数")
+        self._mark_launch_stage("JVM 参数")
         options = {
             "username": profile["name"],
             "uuid": profile["uuid"],
@@ -23509,14 +23885,6 @@ class Win1App:
             "resolutionHeight": height,
             "jvmArguments": jvm_arguments,
         }
-        java_component, java_required = self._version_java_requirement(version_id)
-        java_path = str(self.config.get("java") or "").strip()
-        java_executable = find_java_executable(
-            self.mc_dir, java_path, 0 if java_path else java_required
-        )
-        java_actual = (
-            java_major_version(java_executable) if java_executable else 0
-        )
         if java_path:
             if not java_executable:
                 raise LauncherError(
@@ -23587,12 +23955,15 @@ class Win1App:
 
         self.post(self._set_launch_state, "LAUNCH: BUILD CMD", "active")
         warm_key = self._launch_warm_key(version_id, options, java_executable, profile)
+        warm_hit = {"value": False}
 
         def build_command():
             cached = getattr(self, "_launch_prewarm", None) or {}
             if cached.get("key") == warm_key and cached.get("command"):
+                warm_hit["value"] = True
                 self.say("启动命令命中预热缓存 // 跳过重新组装")
                 return list(cached["command"])
+            warm_hit["value"] = False
             return mll.command.get_minecraft_command(
                 version_id, self.mc_dir, options
             )
@@ -23615,10 +23986,16 @@ class Win1App:
                 ) from None
         if not command:
             raise LauncherError("启动命令为空，无法点火")
+        self._mark_launch_stage("组装命令")
 
-        missing_entry = self._missing_classpath_entry(command) or self._loader_missing_files(
-            version_id
-        )
+        if fast_lane and warm_hit["value"]:
+            self.say("快速启动线路 // 预热缓存有效，跳过启动文件扫描")
+            missing_entry = ""
+        else:
+            missing_entry = self._missing_classpath_entry(
+                command
+            ) or self._loader_missing_files(version_id)
+        self._mark_launch_stage("文件校验")
         if missing_entry:
             self.say("启动文件缺失，尝试修复: {0}".format(missing_entry))
             self.post(self._set_launch_state, "LAUNCH: REPAIR", "active")
@@ -23647,6 +24024,17 @@ class Win1App:
                     )
                 )
 
+        if not fast_lane and getattr(self, "_suspect_bad_jars", False):
+            bad_jars = self._bad_zip_jars()
+            if bad_jars:
+                raise LauncherError(
+                    "检测到打不开的模组 jar（上次闪退就是它们）：\n{0}\n\n"
+                    "请删除这些文件，或用 [ 模组体检 ] 重新下载完整版本后再点火。".format(
+                        "\n".join(bad_jars)
+                    )
+                )
+            self._suspect_bad_jars = False
+
         ensure_dir(LOG_DIR)
         log_path = os.path.join(
             LOG_DIR,
@@ -23662,6 +24050,7 @@ class Win1App:
 
         self.post(self._set_launch_state, "LAUNCH: STARTING", "active")
         self._check_launch_cancel()
+        self._mark_launch_stage("写日志")
         creation_flags = 0x08000000 if os.name == "nt" else 0
         try:
             process = subprocess.Popen(
@@ -23688,6 +24077,21 @@ class Win1App:
             except Exception:
                 pass
             raise LauncherError("启动进程失败: {0}".format(exc)) from None
+
+        self._mark_launch_stage("拉起进程")
+        summary = self._launch_perf_summary()
+        if summary:
+            self.say("[PERF] " + summary)
+            self._append_launch_perf(
+                "{0} // {1} // {2}".format(
+                    self.config.get("launch_version") or version_id,
+                    "FAST" if fast_lane else "NORMAL",
+                    " | ".join(
+                        "{0} {1:.2f}s".format(name, delta)
+                        for name, delta in (getattr(self, "_perf_stages", None) or [])
+                    ),
+                )
+            )
 
         self.game_process = process
         self.post(self._on_game_started, process.pid)
@@ -28563,6 +28967,72 @@ class Win1App:
             cursor="hand2",
             anchor="w",
         ).pack(fill="x", pady=(4, 0), anchor="w")
+
+        lane_var = tk.BooleanVar(value=self._fast_launch_enabled())
+
+        def toggle_fast_lane():
+            self.config["fast_launch"] = bool(lane_var.get())
+            self._save_config()
+            self._launch_prewarm = None
+            self._schedule_launch_prewarm(300)
+            self.say(
+                "快速启动专用线路 // {0}".format(
+                    "开启（跳过联网刷新与启动前文件扫描，预热命中后直连拉起）"
+                    if lane_var.get()
+                    else "关闭（回到每次点火都完整校验的常规线路）"
+                )
+            )
+
+        tk.Checkbutton(
+            jvm_box,
+            text="快速启动专用线路（跳过联网刷新 + 启动前文件扫描，直接拉起）",
+            variable=lane_var,
+            command=toggle_fast_lane,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            activebackground=C_WHITE,
+            activeforeground=C_BLACK,
+            selectcolor=C_WHITE,
+            font=FONT_SMALL,
+            bd=0,
+            highlightthickness=0,
+            takefocus=0,
+            cursor="hand2",
+            anchor="w",
+        ).pack(fill="x", pady=(4, 0), anchor="w")
+
+        cds_var = tk.BooleanVar(value=self._cds_enabled())
+
+        def toggle_cds():
+            self.config["fast_launch_cds"] = bool(cds_var.get())
+            self._save_config()
+            self._launch_prewarm = None
+            self._schedule_launch_prewarm(300)
+            self.say(
+                "AppCDS 类归档 // {0}".format(
+                    "开启（首次正常退出后生成，之后点火直接映射，Forge 提速明显）"
+                    if cds_var.get()
+                    else "关闭（不加 -XX:SharedArchiveFile / -XX:ArchiveClassesAtExit）"
+                )
+            )
+
+        tk.Checkbutton(
+            jvm_box,
+            text="AppCDS 类数据共享（实验性：路径不能带空格，正常退出一次后生效）",
+            variable=cds_var,
+            command=toggle_cds,
+            bg=C_WHITE,
+            fg=C_BLACK,
+            activebackground=C_WHITE,
+            activeforeground=C_BLACK,
+            selectcolor=C_WHITE,
+            font=FONT_SMALL,
+            bd=0,
+            highlightthickness=0,
+            takefocus=0,
+            cursor="hand2",
+            anchor="w",
+        ).pack(fill="x", pady=(2, 0), anchor="w")
         tk.Label(
             jvm_box,
             text="留空 = 只用内存参数；预设来自社区常用 G1 调优，冲突时以你填的为准。",
@@ -28573,6 +29043,20 @@ class Win1App:
             justify="left",
             wraplength=740,
         ).pack(fill="x", pady=(4, 0))
+        tk.Label(
+            jvm_box,
+            text=(
+                "快速启动线路 = 预热命令 + 跳过联网刷新 + 跳过启动前文件扫描，"
+                "命中预热缓存时直接拉起进程；每次点火都会在日志里打印各阶段耗时"
+                "（logs\\launch-perf.log 记录慢阶段）。"
+            ),
+            bg=C_WHITE,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            wraplength=740,
+        ).pack(fill="x", pady=(2, 0))
 
         preview_box = tk.Frame(
             wrap, bg=C_GRAY, bd=1, relief="solid", padx=6, pady=6
