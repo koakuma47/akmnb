@@ -1,7 +1,7 @@
 {
-  "version": "G1.17",
-  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.17/AKM_Launcher_vG1.17.zip",
-  "sha256": "9D3FD1E10CED6C605332AE32E4A776BCE885CFA49B292A2E3D9ADBE6B8D3C5C7",
-  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.17",
-  "notes": "G1.17：装完先试跑，进不去就自动补缺的前置并复跑"
+  "version": "G1.17.1",
+  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.17.1/AKM_Launcher_vG1.17.1.zip",
+  "sha256": "6041E392CC5116DBEB75B11402532E36EFBDF12CD1570D1EE5D51A12B10E1438",
+  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.17.1",
+  "notes": "G1.17.1：修体检装完不自动试跑 / 误报没有游戏（试跑版本挑选放宽 + 日志关键行）"
 }
