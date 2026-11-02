@@ -80,7 +80,7 @@ except Exception:  # pragma: no cover - tkinter always ships with CPython on Win
 # ---------------------------------------------------------------------------
 
 APP_NAME = "AKM Launcher"
-APP_VERSION = "G1.17"
+APP_VERSION = "G1.17.1"
 
 # ---------------------------------------------------------------------------
 # Internationalisation (zh / en / ja / ru / ar)
@@ -4206,6 +4206,32 @@ def parse_missing_mods(text, ignore=None):
         if fallback:
             add(fallback[-1][1] or fallback[-1][0], "", line.strip())
     return sorted(found.values(), key=lambda item: item["id"])
+
+
+def probe_error_excerpt(text, limit=6, width=150):
+    """从试跑日志里挑几行关键报错，直接显示在弹窗 / 聊天区里。"""
+    keys = (
+        "ERROR",
+        "Missing",
+        "missing",
+        "requires",
+        "Incompatible",
+        "broken mod state",
+        "Exception",
+        "FAILED",
+    )
+    lines = []
+    for line in str(text or "").splitlines():
+        clean = line.strip()
+        if not clean or not any(key in clean for key in keys):
+            continue
+        if len(clean) > width:
+            clean = clean[:width] + "…"
+        if clean not in lines:
+            lines.append(clean)
+        if len(lines) >= limit:
+            break
+    return lines
 
 
 def _stop_probe_process(process, grace=25):
@@ -24099,45 +24125,68 @@ class Win1App:
             raise LauncherError("试跑失败：启动命令为空")
         return list(command)
 
-    def _probe_version_for(self, mc_version, loader):
-        """找一个能试跑指定 MC 版本 / 加载器的已安装版本 id（找不到返回空）。"""
-        target = str(mc_version or "").strip()
-        loader = str(loader or "").strip().lower()
-        selected = str(self.config.get("launch_version") or "").strip()
-        candidates = []
+    def _installed_version_ids(self):
+        """mc 目录里真正装好的版本 id（mll 读不全时按 versions/*/*.json 兜底）。"""
+        ids = []
         try:
             import minecraft_launcher_lib as mll
 
-            candidates = [
-                str(item.get("id") or "")
-                for item in mll.utils.get_installed_versions(self.mc_dir)
-            ]
+            for item in mll.utils.get_installed_versions(self.mc_dir):
+                key = str(item.get("id") or "").strip()
+                if key and key not in ids:
+                    ids.append(key)
         except Exception:
-            candidates = []
-        if selected and selected not in candidates:
-            candidates.insert(0, selected)
+            pass
+        versions_dir = os.path.join(self.mc_dir, "versions")
+        try:
+            for name in os.listdir(versions_dir):
+                if not name or name in ids:
+                    continue
+                if os.path.isfile(os.path.join(versions_dir, name, name + ".json")):
+                    ids.append(name)
+        except OSError:
+            pass
+        return ids
+
+    def _probe_version_for(self, mc_version, loader):
+        """挑一个已安装版本用于试跑。
+
+        体检里的「目标 MC / 加载器」是**升级目标**，真正装好的往往是别的版本，
+        所以不能硬卡条件：先认当前选中的版本，再按「同 MC > 同加载器 > 任意」排。
+        """
+        target = str(mc_version or "").strip()
+        loader = str(loader or "").strip().lower()
+        if loader in ("任意", "any", "auto", "*"):
+            loader = ""
+        selected = str(self.config.get("launch_version") or "").strip()
+        ids = self._installed_version_ids()
+        if not ids:
+            return ""
+        if selected and selected in ids:
+            return selected
 
         def parts_of(version_id):
-            return self._version_loader_parts(version_id)
-
-        def matches(version_id):
-            lid, mc, _lv = parts_of(version_id)
+            lid, mc, _lv = self._version_loader_parts(version_id)
             if not mc:
-                # 认不出的 id（纯原版 "1.20.1"）就按 id 本身当 MC 版本
                 mc = str(version_id or "").strip()
                 lid = lid or "vanilla"
-            if loader and lid != loader:
-                return False
-            if target and mc != target:
-                return False
-            return True
+            return lid, mc
 
-        if selected and matches(selected):
-            return selected
-        for version_id in candidates:
-            if matches(version_id):
-                return version_id
-        return ""
+        def score(version_id):
+            lid, mc = parts_of(version_id)
+            same_mc = bool(target) and mc == target
+            same_loader = bool(loader) and lid == loader
+            if same_mc and same_loader:
+                return 0
+            if same_mc:
+                return 1
+            if same_loader:
+                return 2
+            if lid and lid != "vanilla":
+                return 3
+            return 4
+
+        return sorted(ids, key=lambda item: (score(item), item))[0]
 
     def _start_game_process(self, mll, version_id, profile):
         fast_lane = self._fast_launch_enabled()
@@ -26767,6 +26816,8 @@ class Win1App:
                             done, len(failed)
                         )
                     )
+                    if probe_var.get():
+                        run_probe(auto=True, rounds=2)
 
             threading.Thread(target=worker, daemon=True).start()
 
@@ -26992,9 +27043,15 @@ class Win1App:
                 lines.append("补装失败: " + "；".join(failed_all[:3]))
             if missing:
                 lines.append("仍缺: " + "、".join(item["id"] for item in missing[:8]))
+            excerpt = probe_error_excerpt((result or {}).get("text") or "")
+            if excerpt:
+                lines.append("日志关键行:")
+                lines.extend("  " + line for line in excerpt)
             probe_text_var.set("试跑 // 未通过（{0}）".format(shorten_text(reason, 28)))
             set_status("试跑未通过 // " + reason)
             self.say("模组体检 // 试跑未通过: {0}".format(reason))
+            for line in excerpt[:3]:
+                self.say("  " + line)
             messagebox.showwarning(
                 "启动试跑",
                 "试跑没进主菜单。\n\n原因: {0}\n{1}\n\n日志:\n{2}".format(
@@ -27032,11 +27089,24 @@ class Win1App:
                     pass
             version_id = probe_version_now()
             if not version_id:
+                installed = []
+                try:
+                    installed = self._installed_version_ids()
+                except Exception:
+                    installed = []
+                message = "没找到可以试跑的已安装版本 // 游戏目录 {0} // 已装 {1}".format(
+                    self.mc_dir, "、".join(installed[:8]) or "（一个都没有）"
+                )
+                set_status(message)
+                self.say("模组体检 // " + message)
                 if not auto:
                     messagebox.showwarning(
                         "启动试跑",
-                        "没找到可以试跑的已安装版本。\n"
-                        "先在 [ 游戏 ] 里装好原版 + 加载器，再回来试跑。",
+                        "没找到可以试跑的已安装版本。\n\n"
+                        "游戏目录：\n{0}\n\n已安装版本：{1}\n\n"
+                        "先在 [ 游戏 ] 里装好原版 + 加载器，再回来试跑。".format(
+                            self.mc_dir, "、".join(installed[:8]) or "（一个都没有）"
+                        ),
                         parent=win,
                     )
                 return
@@ -27046,6 +27116,22 @@ class Win1App:
             rounds = max(1, int(rounds or 1))
             probe_state["running"] = True
             probe_state["missing"] = []
+            try:
+                picked_loader, picked_mc, _picked_ver = self._version_loader_parts(
+                    version_id
+                )
+            except Exception:
+                picked_loader, picked_mc = "", ""
+            if (target_mc and picked_mc and picked_mc != target_mc) or (
+                loader and picked_loader and picked_loader != loader
+            ):
+                self.say(
+                    "试跑用已装版本 {0}（体检目标是 {1}/{2}，那个还没装，先拿已装的跑）".format(
+                        version_id,
+                        target_mc or "?",
+                        loader_label(loader).upper() if loader else "?",
+                    )
+                )
             try:
                 effective = os.path.normcase(
                     os.path.abspath(self.effective_mods_dir())
