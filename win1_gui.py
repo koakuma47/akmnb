@@ -80,7 +80,7 @@ except Exception:  # pragma: no cover - tkinter always ships with CPython on Win
 # ---------------------------------------------------------------------------
 
 APP_NAME = "AKM Launcher"
-APP_VERSION = "G1.16"
+APP_VERSION = "G1.17"
 
 # ---------------------------------------------------------------------------
 # Internationalisation (zh / en / ja / ru / ar)
@@ -1368,6 +1368,8 @@ DEFAULT_CONFIG = {
     "jvm_fast_start": True,
     "fast_launch": True,
     "fast_launch_cds": False,
+    "audit_probe": True,
+    "audit_probe_timeout": 240,
     "language": "zh",
     "theme": dict(DEFAULT_THEME),
     "ui_style": "vector",
@@ -4120,6 +4122,258 @@ def install_missing_dependency(gap, mc_version, loader, target_dir, timeout=180,
         label=filename,
     )
     return destination
+
+
+# ---------------------------------------------------------------------------
+# 启动试跑：装完模组先开一次游戏，进主菜单算成功；报「缺前置」就顺手补上
+# ---------------------------------------------------------------------------
+
+PROBE_MENU_MARKERS = ("Sound engine started", "sound engine started")
+PROBE_FAIL_MARKERS = (
+    "Missing or unsupported mandatory dependencies",
+    "Missing or unsupported dependencies",
+    "which is missing!",
+    "net.fabricmc.loader.impl.FormattedException",
+    "EarlyLoadingException",
+    "Missing Mods:",
+    "Incompatible mod set",
+    "UnsupportedClassVersionError",
+    "A potential solution has been determined",
+)
+# Forge: Mod ID: 'x', Requested by: 'y', Expected range: ..., Actual version: '<MISSING>'
+PROBE_FORGE_DEP_RE = re.compile(
+    r"Mod ID:\s*'([^']+)'\s*,\s*Requested by:\s*'([^']+)'", re.I
+)
+# 老 Forge / 部分构建：Mod file xxx requires modid 'yyy'
+PROBE_FORGE_REQUIRES_RE = re.compile(r"requires\s+modid\s+'([^']+)'", re.I)
+# 老 Forge：Missing Mods: [a, b]
+PROBE_FORGE_LIST_RE = re.compile(r"Missing Mods?:\s*\[([^\]]+)\]", re.I)
+# Fabric / Quilt：... requires any version of mod 'Y' (y), which is missing!
+PROBE_FABRIC_DEP_RE = re.compile(
+    r"requires[^\n]*?mod\s+'([^']+)'\s*\(([^)]+)\)", re.I
+)
+
+
+def parse_missing_mods(text, ignore=None):
+    """从启动日志里捞出「被要求但没装」的模组 id。
+
+    支持 Forge / NeoForge 的 ``Missing or unsupported mandatory dependencies``
+    块，以及 Fabric / Quilt 的 ``which is missing!`` 行。
+    返回 ``[{"id": "citadel", "required_by": ["Alex's Mobs"], "raw": "..."}]``。
+    """
+    body = str(text or "")
+    if not body:
+        return []
+    skip = set(SYSTEM_MOD_IDS)
+    for item in ignore or ():
+        key = str(item or "").strip().lower()
+        if key:
+            skip.add(key)
+    found = {}
+
+    def add(mod_id, required_by="", raw=""):
+        key = str(mod_id or "").strip()
+        if not key:
+            return
+        low = key.lower()
+        if low in skip:
+            return
+        if not re.fullmatch(r"[A-Za-z0-9_.\-]{2,64}", key):
+            return
+        # Fabric 的 fabric-* 都是 Fabric API 这个 jar 提供的模块
+        if low.startswith(FABRIC_API_MODULE_PREFIX) and low not in FABRIC_API_IDS:
+            low = "fabric-api"
+        entry = found.setdefault(low, {"id": low, "required_by": [], "raw": raw[:200]})
+        name = str(required_by or "").strip()
+        if name and name not in entry["required_by"]:
+            entry["required_by"].append(name)
+
+    for match in PROBE_FORGE_DEP_RE.finditer(body):
+        add(match.group(1), match.group(2), match.group(1))
+    for match in PROBE_FORGE_REQUIRES_RE.finditer(body):
+        add(match.group(1), "", match.group(0))
+    for match in PROBE_FORGE_LIST_RE.finditer(body):
+        for piece in re.split(r"[,;\s]+", match.group(1)):
+            add(piece.strip(" '\""), "", match.group(0))
+    for line in body.splitlines():
+        if "which is missing" not in line and "is missing!" not in line:
+            continue
+        match = PROBE_FABRIC_DEP_RE.search(line)
+        if match:
+            add(match.group(1), "", line.strip())
+            continue
+        fallback = re.findall(r"mod\s+'([^']+)'\s*\(([^)]+)\)", line, re.I)
+        if fallback:
+            add(fallback[-1][1] or fallback[-1][0], "", line.strip())
+    return sorted(found.values(), key=lambda item: item["id"])
+
+
+def _stop_probe_process(process, grace=25):
+    """关掉试跑进程：先礼貌 WM_CLOSE，超时再强杀。"""
+    if process is None:
+        return False
+    if os.name != "nt":
+        try:
+            process.terminate()
+            process.wait(timeout=grace)
+            return True
+        except Exception:
+            return False
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid)],
+            capture_output=True,
+            creationflags=0x08000000,
+        )
+    except Exception:
+        pass
+    try:
+        process.wait(timeout=grace)
+        return True
+    except Exception:
+        pass
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/PID", str(process.pid)],
+            capture_output=True,
+            creationflags=0x08000000,
+        )
+    except Exception:
+        pass
+    try:
+        process.wait(timeout=10)
+    except Exception:
+        pass
+    return False
+
+
+def launch_probe(command, cwd, log_path, timeout=240, cancel=None, settle=15.0):
+    """跑一次游戏，判断能不能进主菜单。
+
+    成功（日志出现 ``Sound engine started``）立刻关掉游戏，不留窗口；
+    失败时用 :func:`parse_missing_mods` 解析缺哪些前置。
+    返回 dict: ``ok / missing / reason / seconds / exit_code / log``。
+    """
+    result = {
+        "ok": False,
+        "missing": [],
+        "reason": "",
+        "seconds": 0.0,
+        "exit_code": None,
+        "log": log_path,
+        "text": "",
+    }
+    started = time.time()
+    try:
+        ensure_dir(os.path.dirname(log_path) or ".")
+        handle = open(log_path, "w", encoding="utf-8", errors="replace")
+    except OSError as exc:
+        result["reason"] = "试跑日志写不进去: {0}".format(exc)
+        return result
+    handle.write(
+        "== AKM launch probe {0} ==\n".format(time.strftime("%Y-%m-%d %H:%M:%S"))
+    )
+    handle.write(" ".join(str(part) for part in command) + "\n\n")
+    handle.flush()
+    flags = 0x08000000 if os.name == "nt" else 0
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            creationflags=flags,
+        )
+    except OSError as exc:
+        try:
+            handle.close()
+        except Exception:
+            pass
+        result["reason"] = "试跑启动失败: {0}".format(exc)
+        return result
+
+    text = ""
+    offset = 0
+    fail_seen_at = 0.0
+    finished_at = None
+    try:
+        while True:
+            if cancel is not None and cancel.is_set():
+                result["reason"] = "试跑已终止"
+                finished_at = time.time()
+                break
+            try:
+                size = os.path.getsize(log_path)
+                if size > offset:
+                    with open(log_path, "rb") as reader:
+                        reader.seek(offset)
+                        text += reader.read(size - offset).decode("utf-8", "replace")
+                    offset = size
+                    if len(text) > 900000:
+                        text = text[-900000:]
+            except OSError:
+                pass
+            if any(marker in text for marker in PROBE_MENU_MARKERS):
+                finished_at = time.time()
+                gaps = parse_missing_mods(text)
+                if gaps:
+                    # 进是进去了，但有模组被 Forge 标成损坏：照样算没装对
+                    result["missing"] = gaps
+                    result["reason"] = "能进主菜单，但缺前置: " + "、".join(
+                        item["id"] for item in gaps[:8]
+                    )
+                    break
+                if text.count("broken mod state") >= 3:
+                    result["reason"] = (
+                        "能进主菜单，但有模组处于损坏状态（日志没写具体缺哪个前置）"
+                    )
+                    break
+                result["ok"] = True
+                result["reason"] = "已进入主菜单"
+                break
+            if not fail_seen_at and any(
+                marker in text for marker in PROBE_FAIL_MARKERS
+            ):
+                fail_seen_at = time.time()
+            # Forge 的「缺前置」是弹屏而不是退出：读完异常栈就收工
+            if fail_seen_at and time.time() - fail_seen_at >= settle:
+                result["reason"] = "启动报错（缺前置 / 不兼容）"
+                finished_at = time.time()
+                break
+            code = process.poll()
+            if code is not None:
+                result["exit_code"] = code
+                finished_at = time.time()
+                break
+            if time.time() - started > max(30, int(timeout or 0)):
+                result["reason"] = "试跑超时（{0} 秒没进主菜单）".format(int(timeout))
+                finished_at = time.time()
+                break
+            time.sleep(0.6)
+    finally:
+        # 先记下判定时间，再关游戏（关窗口的几十秒不该算进启动耗时）
+        result["seconds"] = max(0.0, (finished_at or time.time()) - started)
+        if process.poll() is None:
+            _stop_probe_process(process)
+        try:
+            handle.close()
+        except Exception:
+            pass
+        result["text"] = text
+        if not result["ok"]:
+            result["missing"] = parse_missing_mods(text)
+            if result["missing"]:
+                result["reason"] = "缺少前置: " + "、".join(
+                    item["id"] for item in result["missing"][:8]
+                )
+            elif not result["reason"]:
+                if result["exit_code"] is not None:
+                    result["reason"] = "游戏没进主菜单就退出了（退出码 {0}）".format(
+                        result["exit_code"]
+                    )
+                else:
+                    result["reason"] = "游戏没进主菜单"
+    return result
 
 
 def shell_thumbnail_png(source_path, size=ICON_SIZE):
@@ -23799,6 +24053,92 @@ class Win1App:
         ).start()
         return paths
 
+    def build_probe_command(self, version_id):
+        """组装「启动试跑」命令：和正常点火同一套参数，但不写正式启动日志。"""
+        try:
+            import minecraft_launcher_lib as mll
+        except Exception:
+            raise LauncherError("缺少 minecraft-launcher-lib，无法试跑") from None
+        window = self.config.get("window") or {}
+        try:
+            width = str(int(window.get("width") or 854))
+            height = str(int(window.get("height") or 480))
+        except (TypeError, ValueError):
+            width, height = "854", "480"
+        memory = normalize_memory_config(self.config.get("memory"), total_ram_mb())
+        _component, java_required = self._version_java_requirement(version_id)
+        java_path = str(self.config.get("java") or "").strip()
+        java_executable = find_java_executable(
+            self.mc_dir, java_path, 0 if java_path else java_required
+        )
+        if not java_executable:
+            raise LauncherError("试跑失败：没有可用的 Java（设置里指定 javaw.exe）")
+        java_actual = java_major_version(java_executable)
+        if java_required and java_actual and java_actual < java_required:
+            raise LauncherError(
+                "试跑失败：该版本需要 Java {0}，当前是 Java {1}".format(
+                    java_required, java_actual
+                )
+            )
+        profile = self._current_profile()
+        options = {
+            "username": profile["name"],
+            "uuid": profile["uuid"],
+            "token": profile["token"],
+            "launcherName": "AKM",
+            "launcherVersion": APP_VERSION,
+            "gameDirectory": self.ensure_isolation_dirs(),
+            "customResolution": True,
+            "resolutionWidth": width,
+            "resolutionHeight": height,
+            "jvmArguments": self._memory_jvm_arguments(memory, java_executable),
+            "executablePath": java_executable,
+        }
+        command = mll.command.get_minecraft_command(version_id, self.mc_dir, options)
+        if not command:
+            raise LauncherError("试跑失败：启动命令为空")
+        return list(command)
+
+    def _probe_version_for(self, mc_version, loader):
+        """找一个能试跑指定 MC 版本 / 加载器的已安装版本 id（找不到返回空）。"""
+        target = str(mc_version or "").strip()
+        loader = str(loader or "").strip().lower()
+        selected = str(self.config.get("launch_version") or "").strip()
+        candidates = []
+        try:
+            import minecraft_launcher_lib as mll
+
+            candidates = [
+                str(item.get("id") or "")
+                for item in mll.utils.get_installed_versions(self.mc_dir)
+            ]
+        except Exception:
+            candidates = []
+        if selected and selected not in candidates:
+            candidates.insert(0, selected)
+
+        def parts_of(version_id):
+            return self._version_loader_parts(version_id)
+
+        def matches(version_id):
+            lid, mc, _lv = parts_of(version_id)
+            if not mc:
+                # 认不出的 id（纯原版 "1.20.1"）就按 id 本身当 MC 版本
+                mc = str(version_id or "").strip()
+                lid = lid or "vanilla"
+            if loader and lid != loader:
+                return False
+            if target and mc != target:
+                return False
+            return True
+
+        if selected and matches(selected):
+            return selected
+        for version_id in candidates:
+            if matches(version_id):
+                return version_id
+        return ""
+
     def _start_game_process(self, mll, version_id, profile):
         fast_lane = self._fast_launch_enabled()
         now = time.time()
@@ -25704,6 +26044,24 @@ class Win1App:
         # CurseForge 探测是逐个 slug 猜的，76 个模组时能多花十几秒；
         # 默认关掉，需要找「原版没有但 CF 有移植」时再勾
         cf_var = tk.BooleanVar(value=False)
+        # 装完先开一次游戏：进主菜单算成功，报缺前置就自动补装再试
+        probe_var = tk.BooleanVar(
+            value=str(self.config.get("audit_probe", True)).lower()
+            not in ("0", "false", "no")
+        )
+        probe_text_var = tk.StringVar(value="试跑 // 还没跑过")
+        probe_state = {"missing": [], "result": None, "running": False}
+
+        def toggle_probe():
+            self.config["audit_probe"] = bool(probe_var.get())
+            self._save_config()
+            self.say(
+                "装完自动试跑 // {0}".format(
+                    "开启（进主菜单才算过，缺前置自动补装）"
+                    if probe_var.get()
+                    else "关闭"
+                )
+            )
 
         def set_status(text):
             try:
@@ -26390,6 +26748,9 @@ class Win1App:
                         ),
                         parent=win,
                     )
+                    if probe_var.get():
+                        # 装完先开一次：能进主菜单才算真的装对了
+                        run_probe(auto=True, rounds=2)
                     return
                 if failed:
                     messagebox.showwarning(
@@ -26536,6 +26897,8 @@ class Win1App:
                             len(done)
                         )
                     )
+                    if probe_var.get():
+                        run_probe(auto=True, rounds=2)
 
             def worker():
                 done = []
@@ -26568,6 +26931,228 @@ class Win1App:
                 self.post(finish_gaps, done, failed, done_ids)
 
             threading.Thread(target=worker, daemon=True).start()
+
+        def finish_probe(result, error, history):
+            try:
+                alive = bool(win.winfo_exists())
+            except Exception:
+                alive = False
+            if not alive:
+                log_debug("probe finished after the audit window was closed")
+                try:
+                    probe_state["running"] = False
+                except Exception:
+                    pass
+                return
+            probe_state["running"] = False
+            probe_state["result"] = result
+            probe_state["missing"] = list((result or {}).get("missing") or [])
+            installed_all = []
+            failed_all = []
+            for item in history or []:
+                installed_all.extend(item.get("installed") or [])
+                failed_all.extend(item.get("failed") or [])
+            if installed_all:
+                state["paths"] = [
+                    path for path in state["paths"] if os.path.isfile(path)
+                ] + [path for path in installed_all if os.path.isfile(path)]
+            try:
+                refresh_action_labels()
+            except Exception:
+                pass
+            if result and result.get("ok"):
+                text = "试跑成功 // {0:.0f} 秒进入主菜单{1}".format(
+                    float(result.get("seconds") or 0),
+                    " // 途中补装 {0} 个前置".format(len(installed_all))
+                    if installed_all
+                    else "",
+                )
+                probe_text_var.set(
+                    "试跑 // 通过（{0:.0f}s）".format(result.get("seconds") or 0)
+                )
+                set_status(text)
+                self.say("模组体检 // " + text)
+                messagebox.showinfo(
+                    "试跑成功",
+                    text + "\n\n日志：\n" + str(result.get("log") or "-"),
+                    parent=win,
+                )
+                return
+            reason = error or (result or {}).get("reason") or "未知原因"
+            missing = probe_state["missing"]
+            lines = []
+            if history:
+                lines.append("共试跑 {0} 轮".format(len(history)))
+            if installed_all:
+                lines.append(
+                    "已补装: "
+                    + "、".join(os.path.basename(path) for path in installed_all[:6])
+                )
+            if failed_all:
+                lines.append("补装失败: " + "；".join(failed_all[:3]))
+            if missing:
+                lines.append("仍缺: " + "、".join(item["id"] for item in missing[:8]))
+            probe_text_var.set("试跑 // 未通过（{0}）".format(shorten_text(reason, 28)))
+            set_status("试跑未通过 // " + reason)
+            self.say("模组体检 // 试跑未通过: {0}".format(reason))
+            messagebox.showwarning(
+                "启动试跑",
+                "试跑没进主菜单。\n\n原因: {0}\n{1}\n\n日志:\n{2}".format(
+                    reason,
+                    "\n".join(lines),
+                    (result or {}).get("log") or "-",
+                ),
+                parent=win,
+            )
+            try:
+                render()
+            except Exception:
+                pass
+
+        def probe_version_now():
+            target_mc = str(target_var.get() or "").strip()
+            loader = (loader_var.get() or self.mod_loader or "fabric").lower()
+            return self._probe_version_for(target_mc, loader)
+
+        def run_probe(auto=False, rounds=2):
+            """装完先开一次游戏：进主菜单算过，缺前置就补装再试。"""
+            if probe_state["running"] or state["busy"]:
+                if not auto:
+                    set_status("当前有任务在跑，等它结束再试跑")
+                return
+            if self.game_process is not None:
+                try:
+                    if self.game_process.poll() is None:
+                        if not auto:
+                            messagebox.showinfo(
+                                "启动试跑", "游戏正在运行，先关掉再试跑。", parent=win
+                            )
+                        return
+                except Exception:
+                    pass
+            version_id = probe_version_now()
+            if not version_id:
+                if not auto:
+                    messagebox.showwarning(
+                        "启动试跑",
+                        "没找到可以试跑的已安装版本。\n"
+                        "先在 [ 游戏 ] 里装好原版 + 加载器，再回来试跑。",
+                        parent=win,
+                    )
+                return
+            target_mc = str(target_var.get() or "").strip()
+            loader = (loader_var.get() or self.mod_loader or "fabric").lower()
+            mods_dir = current_target_dir()
+            rounds = max(1, int(rounds or 1))
+            probe_state["running"] = True
+            probe_state["missing"] = []
+            try:
+                effective = os.path.normcase(
+                    os.path.abspath(self.effective_mods_dir())
+                )
+                chosen = os.path.normcase(os.path.abspath(mods_dir))
+            except Exception:
+                effective, chosen = "", ""
+            if effective and chosen and effective != chosen:
+                self.say(
+                    "注意：安装目录不是当前版本的 mods，试跑只能看到 {0}".format(
+                        self.effective_mods_dir()
+                    )
+                )
+            state["cancel"] = threading.Event()
+            cancel = state["cancel"]
+            probe_text_var.set("试跑 // 正在拉起 {0} ...".format(version_id))
+            set_status("启动试跑 // 正在拉起游戏（进主菜单就算成功）...")
+            self.say("模组体检 // 开始启动试跑: {0}".format(version_id))
+            threading.Thread(
+                target=probe_worker,
+                args=(version_id, target_mc, loader, mods_dir, rounds, cancel),
+                name="akm-probe",
+                daemon=True,
+            ).start()
+
+        def probe_worker(version_id, target_mc, loader, mods_dir, rounds, cancel):
+            history = []
+            final = None
+            try:
+                for attempt in range(1, rounds + 1):
+                    if cancel.is_set():
+                        break
+                    self.post(
+                        probe_text_var.set,
+                        "试跑 {0}/{1} // 拉游戏中".format(attempt, rounds),
+                    )
+                    try:
+                        command = self.build_probe_command(version_id)
+                    except Exception as exc:  # noqa: BLE001
+                        self.post(
+                            finish_probe, None, "试跑无法启动: {0}".format(exc), history
+                        )
+                        return
+                    log_path = os.path.join(
+                        LOG_DIR,
+                        "probe-{0}.log".format(
+                            datetime.now().strftime("%Y%m%d-%H%M%S")
+                        ),
+                    )
+                    result = launch_probe(
+                        command,
+                        self.mc_dir,
+                        log_path,
+                        timeout=int(self.config.get("audit_probe_timeout") or 240),
+                        cancel=cancel,
+                    )
+                    final = result
+                    record = {
+                        "attempt": attempt,
+                        "result": result,
+                        "installed": [],
+                        "failed": [],
+                    }
+                    history.append(record)
+                    if result["ok"]:
+                        self.post(finish_probe, final, "", history)
+                        return
+                    missing = list(result.get("missing") or [])
+                    if not missing:
+                        self.post(finish_probe, final, result.get("reason"), history)
+                        return
+                    self.post(
+                        probe_text_var.set,
+                        "缺前置 {0} 个 // 正在补装".format(len(missing)),
+                    )
+                    for gap in missing:
+                        if cancel.is_set():
+                            break
+                        try:
+                            path = install_missing_dependency(
+                                {
+                                    "id": gap["id"],
+                                    "required_by": gap.get("required_by") or [],
+                                },
+                                target_mc,
+                                loader,
+                                mods_dir,
+                            )
+                            record["installed"].append(path)
+                        except Exception as exc:  # noqa: BLE001
+                            record["failed"].append(
+                                "{0}: {1}".format(gap["id"], str(exc)[:70])
+                            )
+                    if record["failed"] or not record["installed"]:
+                        self.post(finish_probe, final, "", history)
+                        return
+                self.post(
+                    finish_probe,
+                    final,
+                    "补装 {0} 轮后仍未进主菜单".format(len(history)),
+                    history,
+                )
+            except Exception:
+                log_debug("launch probe failed:\n" + traceback.format_exc())
+                self.post(
+                    finish_probe, final, "试跑出错（详见 logs\\debug.log）", history
+                )
 
         def offer_cf_ports(ports, auto=False):
             if not ports or state["busy"]:
@@ -27216,8 +27801,50 @@ class Win1App:
             side="right"
         )
 
+        probe_row = tk.Frame(wrap, bg=C_GRAY, bd=1, relief="solid", padx=4, pady=3)
+        probe_row.grid(row=11, column=0, sticky="ew", pady=(6, 0))
+        tk.Checkbutton(
+            probe_row,
+            text="装完自动试跑",
+            variable=probe_var,
+            command=toggle_probe,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            activebackground=C_GRAY,
+            activeforeground=C_BLACK,
+            selectcolor=C_WHITE,
+            font=FONT_SMALL,
+            bd=0,
+            highlightthickness=0,
+            takefocus=0,
+            cursor="hand2",
+        ).pack(side="left", padx=(2, 6))
+        self._mk_button(
+            probe_row,
+            "[ 启动试跑 ]",
+            lambda: run_probe(auto=False, rounds=2),
+            font=FONT_SMALL,
+        ).pack(side="left", padx=(0, 6))
+        tk.Label(
+            probe_row,
+            textvariable=probe_text_var,
+            bg=C_GRAY,
+            fg=C_BLACK,
+            font=FONT_SMALL,
+            anchor="w",
+        ).pack(side="left", fill="x", expand=True, padx=(2, 4))
+
         def close():
             disable_file_drop(win)
+            # 关窗口时把正在跑的试跑也停掉，别留一个后台游戏进程
+            try:
+                state["cancel"].set()
+            except Exception:
+                pass
+            try:
+                probe_state["running"] = False
+            except Exception:
+                pass
             self._audit_win = None
             try:
                 win.destroy()
