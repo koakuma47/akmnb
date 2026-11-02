@@ -1,7 +1,7 @@
 {
-  "version": "G1.16",
-  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.16/AKM_Launcher_vG1.16.zip",
-  "sha256": "A0A82456E689FCED35E2FAE2655EA21F497D50E0718DDCA7808532120AD16652",
-  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.16",
-  "notes": "G1.16：快速启动专用线路 —— 点火准备 0.81s 拉起进程 + 启动耗时看得见 + 闪退原因提示"
+  "version": "G1.17",
+  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.17/AKM_Launcher_vG1.17.zip",
+  "sha256": "9D3FD1E10CED6C605332AE32E4A776BCE885CFA49B292A2E3D9ADBE6B8D3C5C7",
+  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.17",
+  "notes": "G1.17：装完先试跑，进不去就自动补缺的前置并复跑"
 }
