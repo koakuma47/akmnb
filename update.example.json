@@ -1,7 +1,7 @@
 {
-  "version": "G1.17.1",
-  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.17.1/AKM_Launcher_vG1.17.1.zip",
-  "sha256": "6041E392CC5116DBEB75B11402532E36EFBDF12CD1570D1EE5D51A12B10E1438",
-  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.17.1",
-  "notes": "G1.17.1：修体检装完不自动试跑 / 误报没有游戏（试跑版本挑选放宽 + 日志关键行）"
+  "version": "G1.18",
+  "url": "https://github.com/koakuma47/akmnb/releases/download/vG1.18/AKM_Launcher_vG1.18.zip",
+  "sha256": "CC730518DD3E3FFC0509E21E9232762FFB391779FA6136307C9BF7F2E4F46713",
+  "page": "https://github.com/koakuma47/akmnb/releases/tag/vG1.18",
+  "notes": "G1.18：Forge/NeoForge 缺 fabric-api 时自动补装信雅互联 + Forgified Fabric API"
 }
